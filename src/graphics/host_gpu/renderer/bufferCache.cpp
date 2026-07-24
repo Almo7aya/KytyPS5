@@ -1031,11 +1031,6 @@ void BufferCache::FillBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t si
 			std::fill(dst, dst + size / sizeof(uint32_t), value);
 			return;
 		}
-		if (image_overlap) {
-			EXIT("BufferCache: GPU fill aliases image pages, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     vaddr, size);
-		}
 		if (texture_region.metadata_bytes) {
 			LOGF("BufferCache: GPU fill overlaps virtual metadata, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 "\n",
@@ -1044,6 +1039,8 @@ void BufferCache::FillBuffer(CommandBuffer* command, uint64_t vaddr, uint64_t si
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
 		}
+		// ObtainBuffer performs the raw buffer/image ownership transition below. It can
+		// invalidate every clean sampled alias while retaining the strict target checks.
 	}
 	EXIT_IF(command == nullptr);
 	const auto [dst, dst_offset] = ObtainBuffer(*command, vaddr, size, true, false);

@@ -383,6 +383,21 @@ enum class BufferImageWrite : uint8_t {
 	Unsupported
 };
 
+[[nodiscard]] inline constexpr bool IsHostWriteRefreshable(BufferImageBinding binding,
+                                                           bool buffer_modified) noexcept {
+	// Sampled images can merge CPU-dirty ranges into their buffer-cache source before
+	// refreshing. Targets require clean guest backing for a direct host write.
+	switch (binding) {
+		case BufferImageBinding::Texture: return true;
+		case BufferImageBinding::RenderTarget:
+		case BufferImageBinding::DepthTarget: return !buffer_modified;
+		case BufferImageBinding::StorageTexture:
+		case BufferImageBinding::VideoOut:
+		case BufferImageBinding::Unsupported: return false;
+	}
+	return false;
+}
+
 [[nodiscard]] inline constexpr bool
 HasGuestCurrentImageOwnership(bool image_gpu_modified, bool buffer_modified, bool cpu_dirty,
                               bool tracker_gpu_modified) noexcept {
@@ -789,6 +804,15 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 		case BufferImageBinding::Unsupported: return BufferImageWrite::Unsupported;
 	}
 	return BufferImageWrite::Unsupported;
+}
+
+[[nodiscard]] inline constexpr bool CanFanOutBufferImageWrite(BufferImageWrite first,
+                                                              BufferImageWrite next) noexcept {
+	// Sampled images may have multiple cached views of the same guest allocation. A raw
+	// buffer overwrite invalidates every clean view. Target/storage transitions may require
+	// a unique image for synchronization and therefore remain intentionally ambiguous.
+	return first == BufferImageWrite::InvalidateTexture &&
+	       next == BufferImageWrite::InvalidateTexture;
 }
 
 [[nodiscard]] inline StorageBufferRebind

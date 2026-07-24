@@ -1416,6 +1416,96 @@ public:
             "VirtualFree failed");
     std::printf("[host]    %-32s ok\n", name);
   }
+
+  void CheckSampledAliasWriteTransitions() {
+    constexpr const char *name = "SampledAliasWriteTransitions";
+    constexpr uintptr_t base = 0x0000000200120000ull;
+    constexpr uint64_t allocation_size = 0x8000;
+    auto *memory = static_cast<uint8_t *>(
+        VirtualAlloc(reinterpret_cast<void *>(base), allocation_size,
+                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(name, "allocation", memory == reinterpret_cast<void *>(base),
+            "fixed VirtualAlloc failed");
+    std::memset(memory, 0, allocation_size);
+
+    EnsureRuntimeContext();
+    ResourceMutex resource_mutex;
+    PageManager page_manager(RejectUnexpectedPageFault, nullptr);
+    BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
+    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
+                               resource_mutex);
+    buffer_cache.SetTextureCache(texture_cache);
+    page_manager.OnGpuMap(base, allocation_size);
+
+    constexpr auto format =
+        Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+    constexpr auto linear = Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
+    ImageInfo sampled{};
+    sampled.address = base;
+    sampled.format = format;
+    sampled.width = 64;
+    sampled.height = 80;
+    sampled.pitch = TileGetTexturePitch(format, sampled.width, 1, linear);
+    sampled.tile = linear;
+    sampled.type =
+        Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+    TileSizeAlign layout{};
+    TileGetTextureTotalSize(format, sampled.width, sampled.height,
+                            sampled.depth, sampled.pitch, sampled.levels,
+                            linear, false, layout);
+    sampled.size = layout.size;
+    Require(name, "fixture",
+            sampled.size > BufferCache::CACHING_PAGE_SIZE &&
+                sampled.size <= allocation_size &&
+                sampled.size % TRACKER_PAGE_SIZE == 0 &&
+                sampled.address % TRACKER_PAGE_SIZE == 0,
+            "sampled alias fixture does not span cache and tracker pages");
+
+    ImageInfo alias = sampled;
+    alias.swizzle = DstSel(4, 5, 6, 7);
+    {
+      CommandBuffer command;
+      command.Begin();
+      (void)buffer_cache.ObtainBuffer(command, base, sampled.size, false,
+                                      true);
+      (void)texture_cache.FindTexture(command, sampled, false);
+      (void)texture_cache.FindTexture(command, alias, false);
+
+      constexpr uint64_t gpu_write_offset = 0x700;
+      constexpr uint64_t host_write_offset = TRACKER_PAGE_SIZE + 0x708;
+      buffer_cache.FillBuffer(&command, base + gpu_write_offset,
+                              sizeof(uint32_t), 0xdeadbeefu);
+      command.End();
+      command.Execute();
+      command.WaitForFence();
+
+      texture_cache.PrepareHostWrite(base + host_write_offset,
+                                     sizeof(uint32_t));
+      constexpr uint32_t marker = 0x1234abcdu;
+      *reinterpret_cast<uint32_t *>(memory + host_write_offset) = marker;
+      Require(name, "host write",
+              *reinterpret_cast<uint32_t *>(memory + host_write_offset) ==
+                  marker,
+              "buffer-backed sampled host write was not published");
+
+      CommandBuffer refresh;
+      refresh.Begin();
+      (void)texture_cache.FindTexture(refresh, sampled, false);
+      (void)texture_cache.FindTexture(refresh, alias, false);
+      refresh.End();
+      refresh.Execute();
+      refresh.WaitForFence();
+      Require(name, "refresh",
+              !texture_cache.QueryRegion(base, sampled.size).gpu_image_bytes,
+              "refreshed sampled aliases retained stale GPU ownership");
+
+      texture_cache.UnmapMemory(base, allocation_size);
+      page_manager.OnGpuUnmap(base, allocation_size);
+    }
+    Require(name, "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
+            "VirtualFree failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
 #endif
 
   Buffer CreateStorageBuffer(const char *shader_name,
@@ -12214,6 +12304,16 @@ void CheckBufferImageWrites() {
     Require("BufferImageWrite", test.name, actual == test.expected,
             "buffer/image write classification mismatch");
   }
+  Require(
+      "BufferImageWrite", "sampled alias fanout",
+      CanFanOutBufferImageWrite(BufferImageWrite::InvalidateTexture,
+                                BufferImageWrite::InvalidateTexture) &&
+          !CanFanOutBufferImageWrite(BufferImageWrite::InvalidateTexture,
+                                     BufferImageWrite::SynchronizeRenderTarget) &&
+          !CanFanOutBufferImageWrite(BufferImageWrite::InvalidateRenderTarget,
+                                     BufferImageWrite::InvalidateRenderTarget),
+      "raw writes did not distinguish sampled-view fanout from ambiguous "
+      "target synchronization");
   Require("BufferImageWrite", "storage containing overwrite",
           ClassifyBufferImageWrite(
               storage_address - 0x80000, 0x100000, storage_address,
@@ -12678,6 +12778,13 @@ void CheckImageOverlapResolution() {
   constexpr uint64_t fill_size = sizeof(uint32_t);
   constexpr uint64_t texture_address = 0x73771000;
   constexpr uint64_t texture_size = 0x4000;
+  Require(
+      "ImageOverlapResolution", "buffer-backed sampled host write",
+      IsHostWriteRefreshable(BufferImageBinding::Texture, true) &&
+          !IsHostWriteRefreshable(BufferImageBinding::RenderTarget, true) &&
+          !IsHostWriteRefreshable(BufferImageBinding::StorageTexture, true),
+      "host-write refresh policy rejected a sampled buffer source or admitted "
+      "an unsupported target");
   Require("ImageOverlapResolution", "host fill sampled image",
           ClassifyHostWriteOverlap(fill_address, fill_size, texture_address,
                                    texture_size, true, false,
@@ -14214,6 +14321,7 @@ int main(int argc, char **argv) {
     CheckQueryRegionAggregation();
     VulkanHarness vulkan;
     vulkan.CheckQueryRegionImageClassification();
+    vulkan.CheckSampledAliasWriteTransitions();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -14337,6 +14445,7 @@ int main(int argc, char **argv) {
   vulkan.CheckCommandPoolGrowth();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckQueryRegionImageClassification();
+  vulkan.CheckSampledAliasWriteTransitions();
   vulkan.CheckMutableStorageSrgbView();
   vulkan.CheckMutableRenderTargetBgraStorageView();
   vulkan.CheckRenderTargetViewCache();

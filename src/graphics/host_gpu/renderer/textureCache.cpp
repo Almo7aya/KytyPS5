@@ -2878,10 +2878,8 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
 			// CPU-current depth targets use the same tracked guest refresh path as sampled and
 			// color images. GPU-owned targets and metadata aliases remain unsupported below.
-			const bool host_refreshable = (cached->kind == CachedImage::Kind::Texture ||
-			                               cached->kind == CachedImage::Kind::RenderTarget ||
-			                               cached->kind == CachedImage::Kind::DepthTarget) &&
-			                              !cached->buffer_modified;
+			const bool host_refreshable =
+			    IsHostWriteRefreshable(cached->BufferBinding(), cached->buffer_modified);
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,
 			                                 cached->gpu_modified, metadata_overlap)) {
@@ -3155,8 +3153,8 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		m_metadata_tracker.UntrackMemory(it->first, it->second.size);
 		it = m_surface_metas.erase(it);
 	}
-	auto             match  = m_images.end();
-	BufferImageWrite action = BufferImageWrite::None;
+	std::vector<CachedImage*> matches;
+	BufferImageWrite          action = BufferImageWrite::None;
 	for (auto it = m_images.begin(); it != m_images.end(); ++it) {
 		auto& cached = **it;
 		if (!cached.OverlapsRange(vaddr, size, false)) {
@@ -3165,22 +3163,32 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		const auto next = ClassifyBufferImageWrite(vaddr, size, cached.Address(), cached.Size(),
 		                                           cached.BufferBinding(), cached.gpu_modified,
 		                                           formatted_buffer_write, cached.buffer_modified);
-		if (match != m_images.end() || next == BufferImageWrite::None ||
-		    next == BufferImageWrite::Unsupported) {
+		if (next == BufferImageWrite::None) {
+			continue;
+		}
+		const bool ambiguous =
+		    !matches.empty() && !CanFanOutBufferImageWrite(action, next);
+		if (next == BufferImageWrite::Unsupported || ambiguous) {
 			EXIT("TextureCache: unsupported GPU invalidation alias, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " cached_kind=%u cached=0x%016" PRIx64 "+0x%016" PRIx64
 			     " gpu_modified=%d buffer_modified=%d formatted=%d ambiguous=%d\n",
 			     vaddr, size, static_cast<uint32_t>(cached.kind), cached.Address(), cached.Size(),
 			     cached.gpu_modified, cached.buffer_modified, formatted_buffer_write,
-			     match != m_images.end());
+			     ambiguous);
 		}
-		match  = it;
+		matches.push_back(&cached);
 		action = next;
 	}
-	if (match == m_images.end()) {
+	if (matches.empty()) {
 		return false;
 	}
-	auto& cached = **match;
+	if (matches.size() > 1) {
+		for (auto* cached: matches) {
+			cached->buffer_modified = true;
+		}
+		return true;
+	}
+	auto& cached = *matches.front();
 	switch (action) {
 		case BufferImageWrite::InvalidateTexture:
 		case BufferImageWrite::InvalidateVideoOut:
