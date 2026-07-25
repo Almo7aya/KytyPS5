@@ -11817,9 +11817,7 @@ void CheckStorageTextureAccessPermissions() {
   page_manager.OnGpuMap(address, allocation_size);
   texture_cache.RegisterMeta(address, 0x8000);
 
-  if (std::strcmp(kind, "metadata-size") == 0) {
-    texture_cache.RegisterMeta(address, 0x10000);
-  } else if (std::strcmp(kind, "texture") == 0) {
+  if (std::strcmp(kind, "texture") == 0) {
     ImageInfo info{};
     info.address = address;
     info.size = 0x1000;
@@ -11919,7 +11917,7 @@ void CheckMetaOverlapDeaths() {
   Require("MetaOverlap", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
           "GetModuleFileName failed");
-  for (const char *kind : {"metadata-size", "texture", "render-target",
+  for (const char *kind : {"texture", "render-target",
                            "depth-target", "copy-stale"}) {
     std::string command =
         std::string("\"") + path + "\" --meta-overlap-death " + kind;
@@ -11994,6 +11992,59 @@ void CheckOverlappingMetadataViews() {
   Require("OverlappingMetadataViews", "free",
           VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
   std::printf("[host]    %-32s ok\n", "OverlappingMetadataViews");
+}
+
+void CheckMetadataBackingReplacement() {
+  GraphicContext context{};
+  constexpr uintptr_t base = 0x0000000200010000ull;
+  constexpr uint64_t allocation_size = 0x20000;
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), allocation_size,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Require("MetadataBackingReplacement", "allocation",
+          memory == reinterpret_cast<void *>(base),
+          "fixed VirtualAlloc failed");
+
+  ResourceMutex resource_mutex;
+  CacheFaultContext fault_context;
+  PageManager page_manager(CacheFault, &fault_context);
+  BufferCache buffer_cache(context, page_manager, resource_mutex);
+  TextureCache texture_cache(context, page_manager, buffer_cache,
+                             resource_mutex);
+  fault_context.texture = &texture_cache;
+  buffer_cache.SetTextureCache(texture_cache);
+  page_manager.OnGpuMap(base, allocation_size);
+
+  // Register a metadata surface, then re-register the same address for a
+  // differently shaped surface (different per-layer slice size). The guest
+  // reuses metadata allocations this way; the stale registration must be
+  // replaced rather than aborting the emulator.
+  texture_cache.RegisterMeta(base, 0x8000);
+  Require("MetadataBackingReplacement", "initial",
+          texture_cache.IsMetaRange(base, 0x8000),
+          "initial metadata registration was not retained");
+  texture_cache.RegisterMeta(base, 0x10000);
+  Require("MetadataBackingReplacement", "replace",
+          texture_cache.IsMetaRange(base, 0x10000) &&
+              !texture_cache.IsMetaRange(base, 0x8000),
+          "incompatible re-registration did not replace the stale surface");
+
+  // A layered replacement must also swap identity cleanly, exposing the new
+  // slice count. A fresh registration starts uncleared, so clear it first, then
+  // confirm all three slices are individually addressable and cleared.
+  texture_cache.RegisterMeta(base, 0x18000, 3);
+  Require("MetadataBackingReplacement", "layered",
+          texture_cache.IsMetaRange(base, 0x18000) && texture_cache.ClearMeta(base) &&
+              texture_cache.IsMetaCleared(base, 0) &&
+              texture_cache.IsMetaCleared(base, 1) &&
+              texture_cache.IsMetaCleared(base, 2),
+          "layered replacement did not expose the new slice layout");
+
+  texture_cache.UnmapMemory(base, allocation_size);
+  page_manager.OnGpuUnmap(base, allocation_size);
+  Require("MetadataBackingReplacement", "free",
+          VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+  std::printf("[host]    %-32s ok\n", "MetadataBackingReplacement");
 }
 
 void CheckQueryRegionAggregation() {
@@ -12384,6 +12435,59 @@ void CheckBufferImageWrites() {
           ClassifyDepthTargetOverlap(old_depth, true, false, cleared_depth) ==
               DepthOverlap::Unsupported,
           "loaded depth reinterpretation discarded live native contents");
+  // Allocation-pool reuse: a smaller, differently shaped depth target with stencil + HTile that
+  // load-clears every plane it uses discards the abandoned larger target sharing its bases.
+  DepthTargetInfo pool_owner{};
+  pool_owner.address = 0x4a5c90000ull;
+  pool_owner.size = 0x870000;
+  pool_owner.stencil_address = 0x4a6600000ull;
+  pool_owner.stencil_size = 0x280000;
+  pool_owner.htile_address = 0x4a68b0000ull;
+  pool_owner.htile_size = 0x30000;
+  pool_owner.width = pool_owner.height = 1080;
+  pool_owner.pitch = 1920;
+  pool_owner.bytes_per_element = 4;
+  pool_owner.layers = 1;
+  pool_owner.samples = 1;
+  DepthTargetInfo pool_reuse = pool_owner;
+  pool_reuse.size = 0xc0000;
+  pool_reuse.stencil_size = 0x40000;
+  pool_reuse.htile_size = 0x8000;
+  pool_reuse.width = pool_reuse.height = 270;
+  pool_reuse.pitch = 512;
+  pool_reuse.depth_load_clear = true;
+  pool_reuse.stencil_load_clear = true;
+  Require("BufferImageWrite", "cleared depth pool discard",
+          ClassifyDepthTargetOverlap(pool_owner, true, false, pool_reuse) ==
+              DepthOverlap::DiscardStaleTarget,
+          "cleared depth pool reuse did not discard the abandoned larger target");
+  auto pool_reuse_loaded_stencil = pool_reuse;
+  pool_reuse_loaded_stencil.stencil_load_clear = false;
+  Require("BufferImageWrite", "loaded stencil pool discard",
+          ClassifyDepthTargetOverlap(pool_owner, true, false,
+                                     pool_reuse_loaded_stencil) ==
+              DepthOverlap::Unsupported,
+          "pool reuse discarded live stencil contents without a clear");
+  Require("BufferImageWrite", "buffer-dirty pool discard",
+          ClassifyDepthTargetOverlap(pool_owner, true, true, pool_reuse) ==
+              DepthOverlap::Unsupported,
+          "pool reuse discarded a buffer-modified target");
+  // A larger replacement at the same bases is also pool reuse: the old target is fully abandoned
+  // by the clear, so the discard is valid whether the new target grows or shrinks.
+  auto pool_reuse_grown = pool_reuse;
+  pool_reuse_grown.size = pool_owner.size + 0x10000;
+  pool_reuse_grown.stencil_size = pool_owner.stencil_size + 0x10000;
+  pool_reuse_grown.width = pool_reuse_grown.height = 1200;
+  Require("BufferImageWrite", "grown pool discard",
+          ClassifyDepthTargetOverlap(pool_owner, true, false, pool_reuse_grown) ==
+              DepthOverlap::DiscardStaleTarget,
+          "cleared depth pool reuse rejected a larger replacement at the same bases");
+  auto pool_reuse_shifted = pool_reuse;
+  pool_reuse_shifted.address = pool_owner.address + 0x1000;
+  Require("BufferImageWrite", "shifted-base pool discard",
+          ClassifyDepthTargetOverlap(pool_owner, true, false, pool_reuse_shifted) ==
+              DepthOverlap::Unsupported,
+          "pool reuse admitted a plane that did not share the cached base");
   RenderTargetInfo old_color{};
   old_color.address = 0x4a5cb0000ull;
   old_color.size = 0x10000;
@@ -12401,6 +12505,43 @@ void CheckBufferImageWrites() {
                   RenderTargetOverlap::Unsupported,
           "clean equal-base color allocation did not preserve GPU-owned format "
           "failures");
+  // Allocation-pool reuse over a still-GPU-modified color target: a smaller,
+  // differently shaped render target at the same base may retire the stale one,
+  // but only after its color is materialized back to guest memory. A genuine
+  // footprint (byte-size) change is what distinguishes this from an in-place
+  // reinterpretation, which must stay unsupported while GPU-owned.
+  auto pool_reuse_color = old_color;
+  pool_reuse_color.size = 0x4000;
+  pool_reuse_color.width = pool_reuse_color.height = pool_reuse_color.pitch = 64;
+  Require("BufferImageWrite", "materialize color pool reuse",
+          ClassifyRenderTargetOverlap(old_color, true, false, true, true,
+                                      pool_reuse_color) ==
+                  RenderTargetOverlap::MaterializeRetireTarget &&
+              ClassifyRenderTargetOverlap(old_color, false, false, false, true,
+                                          pool_reuse_color) ==
+                  RenderTargetOverlap::RetireTarget,
+          "gpu-modified color pool reuse did not route through a materialized "
+          "retirement");
+  Require("BufferImageWrite", "buffer-dirty color pool reuse",
+          ClassifyRenderTargetOverlap(old_color, true, true, true, true,
+                                      pool_reuse_color) ==
+              RenderTargetOverlap::Unsupported,
+          "color pool reuse materialized a target with a pending buffer copy");
+  // Dynamic-resolution scaling: same allocation, same byte layout (format, pitch,
+  // tiling, bpe), only the rendered width/height changes. The guest-memory
+  // round-trip is lossless, so a GPU-owned target materializes and retires; a
+  // same-footprint format reinterpretation (checked above) must not.
+  auto dynamic_res_color = old_color;
+  dynamic_res_color.width = 96;
+  dynamic_res_color.height = 100;
+  Require("BufferImageWrite", "materialize color dynamic resolution",
+          ClassifyRenderTargetOverlap(old_color, true, false, true, true,
+                                      dynamic_res_color) ==
+                  RenderTargetOverlap::MaterializeRetireTarget &&
+              ClassifyRenderTargetOverlap(old_color, false, false, false, true,
+                                          dynamic_res_color) ==
+                  RenderTargetOverlap::RetireTarget,
+          "same-layout render-target re-extent did not reuse the allocation");
   auto pool_depth = old_depth;
   pool_depth.stencil_address = old_depth.address + 0x20000;
   pool_depth.stencil_size = old_depth.size;
@@ -14419,6 +14560,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureAccessPermissions();
   CheckMetaOverlapDeaths();
   CheckOverlappingMetadataViews();
+  CheckMetadataBackingReplacement();
   CheckGpuMetadataReuse();
   CheckMetadataReuseDescriptors();
   CheckImageOverlapResolution();

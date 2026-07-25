@@ -1200,6 +1200,7 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 			case RenderTargetOverlap::RetireStorage:
 			case RenderTargetOverlap::PreserveStorage:
 			case RenderTargetOverlap::ExpandTarget:
+			case RenderTargetOverlap::MaterializeRetireTarget:
 			case RenderTargetOverlap::Unsupported:
 				EXIT("TextureCache: unsupported sampled/render-target alias, sampled=0x%016" PRIx64
 				     "+0x%016" PRIx64 " target=0x%016" PRIx64 "+0x%016" PRIx64
@@ -1856,6 +1857,7 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	}
 	std::vector<CachedImage*>                 retire;
 	std::vector<std::shared_ptr<CachedImage>> recreated_depth_sources;
+	std::vector<std::shared_ptr<CachedImage>> materialized_target_sources;
 	std::shared_ptr<CachedImage>              native_image_source;
 	for (const auto& entry: m_images) {
 		auto& cached = *entry;
@@ -1928,6 +1930,14 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 					recreated_depth_sources.push_back(entry);
 				}
 				break;
+			case RenderTargetOverlap::MaterializeRetireTarget:
+				// Allocation-pool reuse over a still-GPU-modified color target: download its color to
+				// guest memory (below) so the reused region loses nothing, then retire it clean.
+				supported = cached.kind == CachedImage::Kind::RenderTarget;
+				if (supported) {
+					materialized_target_sources.push_back(entry);
+				}
+				break;
 			case RenderTargetOverlap::None:
 			case RenderTargetOverlap::Unsupported: break;
 		}
@@ -1950,6 +1960,12 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	for (const auto& cached: recreated_depth_sources) {
 		// The exact guest range owns the current bytes. Clear a stale buffer marker only after
 		// source-coherence validation so retirement can replace the obsolete Vulkan shape.
+		cached->buffer_modified = false;
+	}
+	MaterializeImagesToGuestLocked(materialized_target_sources);
+	for (const auto& cached: materialized_target_sources) {
+		// Same contract as the recreated depth sources: the download published the current bytes to
+		// guest memory, so the stale color target now retires through the clean path.
 		cached->buffer_modified = false;
 	}
 	RetireDepthMetadataLocked(retire);
@@ -2192,6 +2208,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 	std::shared_ptr<CachedImage>              discarded_depth_source;
 	std::shared_ptr<CachedImage>              retired_storage_source;
 	std::vector<std::shared_ptr<CachedImage>> recreated_target_sources;
+	std::vector<std::shared_ptr<CachedImage>> discarded_pool_sources;
 	for (const auto& entry: m_images) {
 		auto&      cached = *entry;
 		const bool overlaps =
@@ -2273,7 +2290,8 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			case DepthOverlap::RetireStorage:
 				supported = cached.kind == CachedImage::Kind::StorageTexture &&
 				            retired_storage_source == nullptr && native_depth_source == nullptr &&
-				            discarded_depth_source == nullptr && recreated_target_sources.empty();
+				            discarded_depth_source == nullptr && recreated_target_sources.empty() &&
+				            discarded_pool_sources.empty();
 				if (supported) {
 					retired_storage_source = entry;
 				}
@@ -2281,7 +2299,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			case DepthOverlap::ExpandTarget:
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            native_depth_source == nullptr && retired_storage_source == nullptr &&
-				            recreated_target_sources.empty();
+				            recreated_target_sources.empty() && discarded_pool_sources.empty();
 				if (supported) {
 					native_depth_source = entry;
 				}
@@ -2290,16 +2308,28 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            discarded_depth_source == nullptr && native_depth_source == nullptr;
 				supported = supported && retired_storage_source == nullptr &&
-				            recreated_target_sources.empty();
+				            recreated_target_sources.empty() && discarded_pool_sources.empty();
 				if (supported) {
 					discarded_depth_source = entry;
+				}
+				break;
+			case DepthOverlap::DiscardStaleTarget:
+				// Allocation-pool reuse: retire the abandoned target outright. It must be the only
+				// kind of transition selected this pass, but several stale targets may share the
+				// reused allocation and are each dropped.
+				supported = cached.kind == CachedImage::Kind::DepthTarget &&
+				            native_depth_source == nullptr && discarded_depth_source == nullptr &&
+				            retired_storage_source == nullptr && sampled_depth_source == nullptr &&
+				            recreated_target_sources.empty();
+				if (supported) {
+					discarded_pool_sources.push_back(entry);
 				}
 				break;
 			case DepthOverlap::RecreateTarget:
 				supported = (cached.kind == CachedImage::Kind::DepthTarget ||
 				             cached.kind == CachedImage::Kind::RenderTarget) &&
 				            native_depth_source == nullptr && discarded_depth_source == nullptr &&
-				            retired_storage_source == nullptr;
+				            retired_storage_source == nullptr && discarded_pool_sources.empty();
 				if (supported) {
 					recreated_target_sources.push_back(entry);
 				}
@@ -2323,6 +2353,17 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			                                           retired_storage_source->info.size);
 			retired_storage_source->gpu_modified = false;
 		}
+	}
+	for (const auto& source: discarded_pool_sources) {
+		// The guest abandoned this target by rebinding a cleared surface over its allocation. Drop
+		// GPU ownership across every tracked plane (depth and, when present, stencil) so the reused
+		// region carries no stale GPU-modified pages once the smaller replacement takes over, and so
+		// the target retires through the clean path rather than a content-preserving transition.
+		for (uint32_t range = 0; range < source->RangeCount(); range++) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(source->Address(range), source->Size(range));
+		}
+		source->gpu_modified = false;
+		command.RetainResourceUntilFence(source);
 	}
 	const auto* transition_source =
 	    native_depth_source != nullptr
@@ -3397,15 +3438,33 @@ void TextureCache::RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers) 
 	if (existing != m_surface_metas.end()) {
 		const auto slice_size     = size / layers;
 		const auto old_slice_size = existing->second.size / existing->second.layers;
-		if (slice_size != old_slice_size ||
-		    (size > existing->second.size) != (layers > existing->second.layers)) {
-			EXIT("TextureCache: incompatible metadata backing growth\n");
+		const bool compatible_growth =
+		    slice_size == old_slice_size &&
+		    (size > existing->second.size) == (layers > existing->second.layers);
+		if (compatible_growth) {
+			if (layers <= existing->second.layers) {
+				return;
+			}
+			range_vaddr += existing->second.size;
+			range_size -= existing->second.size;
+		} else {
+			// The guest reused this metadata address for a differently shaped surface: the
+			// per-layer slice size changed, so the old registration is not an ancestor of the
+			// new one and cannot be grown in place. Discard the stale registration (clearing any
+			// GPU-modified tracking for its range) and fall through to register the new surface
+			// over its full range, exactly as a first-time registration would.
+			LOGF("TextureCache: replacing incompatible metadata registration, "
+			     "requested=0x%016" PRIx64 "+0x%016" PRIx64 " layers=%u existing_size=0x%016" PRIx64
+			     " layers=%u\n",
+			     vaddr, size, layers, existing->second.size, existing->second.layers);
+			if (existing->second.gpu_modified) {
+				m_metadata_tracker.ForEachDownloadRange<true>(
+				    vaddr, existing->second.size, [](uint64_t, uint64_t) noexcept {});
+			}
+			m_metadata_tracker.UntrackMemory(vaddr, existing->second.size);
+			m_surface_metas.erase(existing);
+			existing = m_surface_metas.end();
 		}
-		if (layers <= existing->second.layers) {
-			return;
-		}
-		range_vaddr += existing->second.size;
-		range_size -= existing->second.size;
 	}
 	for (const auto& [address, meta]: m_surface_metas) {
 		if (address != vaddr &&

@@ -343,6 +343,7 @@ enum class DepthOverlap : uint8_t {
 	RetireStorage,
 	ExpandTarget,
 	DiscardTarget,
+	DiscardStaleTarget,
 	RecreateTarget,
 	Unsupported
 };
@@ -354,6 +355,7 @@ enum class RenderTargetOverlap : uint8_t {
 	PreserveStorage,
 	ExpandTarget,
 	RetireTarget,
+	MaterializeRetireTarget,
 	Unsupported
 };
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
@@ -1103,11 +1105,36 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	    cached.layers != requested.layers || cached.samples != requested.samples;
 	const bool new_allocation = cached.address != requested.address ||
 	                            cached.size != requested.size || pool_storage_shape_changed;
-	return page_isolated && new_allocation && guest_source_current &&
-	               HasGuestCurrentImageOwnership(cached_gpu_modified, cached_buffer_modified, false,
-	                                             tracker_gpu_modified)
-	           ? RenderTargetOverlap::RetireTarget
-	           : RenderTargetOverlap::Unsupported;
+	if (page_isolated && new_allocation && guest_source_current) {
+		if (HasGuestCurrentImageOwnership(cached_gpu_modified, cached_buffer_modified, false,
+		                                  tracker_gpu_modified)) {
+			return RenderTargetOverlap::RetireTarget;
+		}
+		// The cached target still holds GPU-produced color. Reuse can still proceed, but only after
+		// that color is materialized back to guest memory so nothing is lost if the guest later reads
+		// the region. Require consistent GPU ownership (the tracker agrees and no buffer copy is
+		// pending) so the download in MaterializeImagesToGuestLocked is well-defined.
+		//
+		// The guest-memory round-trip is only lossless when the byte layout is unchanged. Two shapes
+		// qualify: (a) a genuine footprint change — the base or byte size differs, i.e. a different
+		// allocation entirely; and (b) a same-footprint re-extent that keeps format, pitch, tiling,
+		// bytes-per-element, levels, layers and samples identical and only changes width/height
+		// (dynamic-resolution scaling). An in-place format or tiling reinterpretation instead keeps
+		// the footprint but changes the layout, so its download and upload would use mismatched
+		// layouts — that stays unsupported.
+		const bool footprint_changed =
+		    cached.address != requested.address || cached.size != requested.size;
+		const bool same_byte_layout =
+		    cached.format == requested.format && cached.pitch == requested.pitch &&
+		    cached.bytes_per_element == requested.bytes_per_element &&
+		    cached.tile_mode == requested.tile_mode && cached.levels == requested.levels &&
+		    cached.layers == requested.layers && cached.samples == requested.samples;
+		if ((footprint_changed || same_byte_layout) && cached_gpu_modified && tracker_gpu_modified &&
+		    !cached_buffer_modified) {
+			return RenderTargetOverlap::MaterializeRetireTarget;
+		}
+	}
+	return RenderTargetOverlap::Unsupported;
 }
 
 [[nodiscard]] inline DepthOverlap ClassifyDepthTargetOverlap(const DepthTargetInfo& cached,
@@ -1162,9 +1189,31 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	                        cached.bytes_per_element == requested.bytes_per_element &&
 	                        cached.tile_mode == requested.tile_mode && cached.layers == 1 &&
 	                        requested.layers == 1 && cached.samples == 1 && requested.samples == 1;
-	return exact_plane_rebind && same_shape && !cached_buffer_modified
-	           ? DepthOverlap::RecreateTarget
-	           : DepthOverlap::Unsupported;
+	if (exact_plane_rebind && same_shape && !cached_buffer_modified) {
+		return DepthOverlap::RecreateTarget;
+	}
+	// Allocation-pool reuse: the guest rebinds a differently shaped depth target over an existing
+	// one at the same plane base addresses and load-clears every plane it uses. The clear abandons
+	// the old contents — even GPU-resident ones — so the stale target can be discarded wholesale and
+	// the replacement created fresh, whether the new target is smaller or larger than the old one
+	// (the discard drops the old target's whole tracked range either way). Every plane the new
+	// target uses must reuse the cached plane's base; planes the new target drops are simply
+	// released. This differs from DiscardTarget (an exact same-size swap that transitions ownership)
+	// and stays single-sample/single-layer to avoid reasoning about per-slice tails.
+	const auto plane_same_base = [](uint64_t cached_address, uint64_t requested_address,
+	                                uint64_t requested_size) {
+		return requested_address == 0
+		           ? true
+		           : cached_address == requested_address && requested_size != 0;
+	};
+	const bool cleared_pool_discard =
+	    requested.depth_load_clear &&
+	    (requested.stencil_address == 0 || requested.stencil_load_clear) && !cached_buffer_modified &&
+	    cached.samples == requested.samples && cached.layers == 1 && requested.layers == 1 &&
+	    plane_same_base(cached.address, requested.address, requested.size) &&
+	    plane_same_base(cached.stencil_address, requested.stencil_address, requested.stencil_size) &&
+	    plane_same_base(cached.htile_address, requested.htile_address, requested.htile_size);
+	return cleared_pool_discard ? DepthOverlap::DiscardStaleTarget : DepthOverlap::Unsupported;
 }
 
 [[nodiscard]] inline bool CanRecreateDepthForRenderTarget(const DepthTargetInfo& depth,
