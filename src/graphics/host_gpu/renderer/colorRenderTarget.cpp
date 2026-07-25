@@ -255,6 +255,30 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		target.levels            = levels;
 		target.layers            = view.image_layers;
 		target.samples           = samples;
+		// Dynamic-resolution sharing: the guest re-renders one tiled allocation at varying
+		// sub-resolutions (same base/pitch/format/tile, only width/height change). Canonicalize the
+		// cached target to the full tile-aligned backing extent (width = pitch, height = the padded
+		// row count) so every such draw maps to a single Vulkan image that is reused via the per-draw
+		// viewport, instead of forcing a materialize + recreate GPU stall on each resolution change.
+		// The per-draw view_extent above still drives the framebuffer/viewport, so rendering clips to
+		// the smaller logical extent. Guarded to the mainstream single-level/sample/layer tiled case
+		// and applied only when the canonical extent round-trips through the tiler to the same byte
+		// size, so SynchronizeColorImageToBufferLocked (which recomputes from these dims) stays
+		// consistent.
+		if (tile && !standard64 && levels == 1 && samples == 1 && view.image_layers == 1 &&
+		    pitch != 0 && bytes_per_element != 0 &&
+		    size % (static_cast<uint64_t>(pitch) * bytes_per_element) == 0) {
+			const auto canonical_height =
+			    static_cast<uint32_t>(size / (static_cast<uint64_t>(pitch) * bytes_per_element));
+			TileSizeAlign canonical_layout {};
+			if (canonical_height >= height && pitch >= width &&
+			    TileGetRenderTargetSize(pitch, canonical_height, pitch, bytes_per_element,
+			                            canonical_layout, rt.attrib.num_fragments) &&
+			    canonical_layout.size == size) {
+				target.width  = pitch;
+				target.height = canonical_height;
+			}
+		}
 		auto& texture_cache      = GetRenderContext().GetTextureCache();
 		auto& buffer_vulkan      = texture_cache.FindRenderTarget(buffer, target);
 		r.type                   = RenderColorType::RenderTexture;

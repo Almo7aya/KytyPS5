@@ -581,8 +581,8 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 			} else {
 				if (!(storage ? IsSupportedStorageImageResource(resource)
 				              : IsSupportedSampledColorResource(resource)) ||
-				    image->type != VulkanImageType::RenderTexture || width != image->extent.width ||
-				    height != image->extent.height ||
+				    image->type != VulkanImageType::RenderTexture || width > image->extent.width ||
+				    height > image->extent.height ||
 				    (storage ? levels != image->mip_levels || base_level != 0
 				             : levels != image->mip_levels || base_level >= levels) ||
 				    target_view.type ==
