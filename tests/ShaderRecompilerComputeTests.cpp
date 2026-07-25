@@ -10759,6 +10759,20 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+ShaderRecompiler::IR::ImageResource MetalSlugStandard4KBStorageTextureResource() {
+  // Write-only 2D (non-uint) storage image: Metal Slug Tactics compute output.
+  // kind=StorageImage, dimension=Dim2D, read=false, written=true.
+  return BasicBgraStorageTextureResource();
+}
+
+ShaderTextureResource MetalSlugStandard4KBStorageTextureDescriptor() {
+  // Metal Slug Tactics: compute shader writing a Standard4KB-tiled 2D storage
+  // image, 435x281, format 71, tile=5 (kStandard4KB), write-only, swizzle 0xfac.
+  // Raw descriptor dwords captured from the guest at descriptors.cpp:421.
+  return {{0x04ac5ea0u, 0x84700000u, 0x0046006cu, 0x90500facu, 0x00000000u,
+           0x00700000u, 0x00000000u, 0x00000000u}};
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -10798,7 +10812,7 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "tile") == 0) {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
-        (Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) << 20u);
+        (Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) << 20u);
   } else if (std::strcmp(kind, "mip") == 0) {
     descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "swizzle") == 0) {
@@ -11022,6 +11036,20 @@ void CheckBasicStorageTextureDescriptor() {
               DstSel(4, 4, 4, 4)),
           "single-channel replicated destination selection was rejected");
 
+  const auto std4kb = MetalSlugStandard4KBStorageTextureDescriptor();
+  Require("BasicStorageTexture", "Metal Slug Standard4KB descriptor",
+          std4kb.Base40() == 0x4ac5ea000ull && std4kb.Width5() + 1u == 435 &&
+              std4kb.Height5() + 1u == 281 && std4kb.Depth() + 1u == 1 &&
+              std4kb.BaseArray5() == 0 && std4kb.Format() == 71 &&
+              std4kb.Type() ==
+                  Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+              std4kb.TileMode() ==
+                  Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
+              std4kb.DstSelXYZW() == 0xfac,
+          "Metal Slug 4KB-tiled storage descriptor fixture is malformed");
+  ValidateStorageTexture(MetalSlugStandard4KBStorageTextureResource(), std4kb,
+                         0xfc000);
+
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -11151,6 +11179,128 @@ void CheckStorageTextureLinearReadbackLayout() {
               transfer.tile_mode == info.tile && linear_size == info.size,
           "normalized storage readback lost the exact PS5 linear image layout");
   std::printf("[host]    %-32s ok\n", "StorageTextureLinearReadback");
+}
+
+void CheckStorageTextureStandard4KBReadbackLayout() {
+  constexpr const char *name = "StorageTextureStandard4KBReadback";
+  constexpr uint32_t format = 71;  // Metal Slug Tactics compute storage format
+  constexpr uint32_t width = 435;
+  constexpr uint32_t height = 281;
+  constexpr uint32_t tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB);
+  Require(name, "format support",
+          Prospero::IsSupportedTextureFormat(format) &&
+              TileIsStandard4KBTextureSupported(format),
+          "Metal Slug storage format is not a supported Standard4KB format");
+  const uint32_t bpe = Prospero::NumBytesPerElement(format);
+  const uint32_t pitch = TileGetTexturePitch(format, width, 1, tile);
+  TileSizeAlign total{};
+  TileGetTextureTotalSize(format, width, height, 1, pitch, 1, tile, false,
+                          total);
+  Require(name, "guest size", total.size == 0xfc000,
+          "Standard4KB storage guest layout changed for the Metal Slug surface");
+
+  // The readback path (DownloadColorImage) routes a Standard4KB storage image
+  // through the same transfer-info + GPU-tile-plan pipeline used for
+  // render-target-tiled storage.  Reproduce that pipeline here.
+  ImageInfo info{};
+  info.address = 0x4ac5ea000ull;
+  info.size = total.size;
+  info.format = format;
+  info.width = width;
+  info.height = height;
+  info.pitch = pitch;
+  info.levels = 1;
+  info.tile = tile;
+  info.swizzle = 0xfac;
+  info.depth = 1;
+  info.type = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+  const auto transfer =
+      MakeColorImageTransferInfo(info, TextureGetFormat(format), bpe);
+  Require(name, "transfer routing",
+          transfer.address == info.address && transfer.size == info.size &&
+              transfer.width == width && transfer.height == height &&
+              transfer.pitch == pitch && transfer.bytes_per_element == bpe &&
+              transfer.tile_mode == tile,
+          "Standard4KB storage readback lost the guest tiled layout");
+
+  const auto layout = TextureCalcUploadLayout(
+      format, width, height, 1, 1, pitch, tile, total.size, false, false, name);
+  const auto regions = TextureBuildUploadRegions(
+      layout, TextureGetFormat(format), width, height, 1, 1, false, false,
+      TextureUploadDestination::MipLevels);
+  std::vector<GpuTileInfo> infos;
+  const bool built =
+      TextureBuildGpuTileInfos(total.size, regions, layout, format, 1, 1, infos);
+  Require(name, "tile plan",
+          built && infos.size() == 1 &&
+              (infos[0].family == TileBlockFamily::Standard4KB ||
+               infos[0].family == TileBlockFamily::Standard4KB3D) &&
+              infos[0].bytes_per_element == bpe && infos[0].width == width &&
+              infos[0].height == height && infos[0].depth == 1 &&
+              infos[0].tiled_size == total.size,
+          "Standard4KB storage readback produced the wrong GPU tile plan");
+
+  // Independent CPU round-trip through the built plan, using the guest block
+  // math: tile a known linear pattern, detile it, and require identity.  A
+  // wrong family or geometry escapes the surface or collides, so the round-trip
+  // catches a mis-shaped plan even without a GPU.
+  const GpuTileInfo &plan = infos[0];
+  TileBlockLayout block{};
+  Require(name, "reference block",
+          TileGetBlockLayout(plan.family, plan.bytes_per_element, block),
+          "CPU reference rejected the built tile plan");
+  const uint32_t tiled_width =
+      plan.tiled_width != 0 ? plan.tiled_width : plan.pitch;
+  const uint64_t columns =
+      (tiled_width + block.block_width - 1u) / block.block_width;
+  std::vector<uint8_t> linear(total.size, 0);
+  std::vector<uint8_t> tiled(total.size, 0);
+  std::vector<uint8_t> result(total.size, 0);
+  for (size_t i = 0; i < linear.size(); ++i) {
+    linear[i] = static_cast<uint8_t>((i * 2654435761ull) >> 24);
+  }
+  auto move = [&](bool to_tiled, std::vector<uint8_t> &dst,
+                  const std::vector<uint8_t> &src) {
+    for (uint32_t y = 0; y < plan.height; ++y) {
+      for (uint32_t x = 0; x < plan.width; ++x) {
+        const uint32_t bx = x / block.block_width;
+        const uint32_t by = y / block.block_height;
+        const uint32_t lx = x % block.block_width;
+        const uint32_t ly = y % block.block_height;
+        uint32_t local = 0, block_xor = 0;
+        Require(name, "reference offset",
+                TileGetBlockOffset(block, lx, ly, 0, local) &&
+                    TileGetBlockXor(block, bx, by, plan.surface_z, block_xor),
+                "CPU reference address lookup failed");
+        const uint64_t block_index =
+            static_cast<uint64_t>(by) * columns + bx;
+        const uint64_t t = plan.tiled_offset + block_index * block.block_size +
+                           (local ^ block_xor);
+        const uint64_t l = plan.linear_offset +
+                           static_cast<uint64_t>(y) * plan.pitch * bpe +
+                           static_cast<uint64_t>(x) * bpe;
+        Require(name, "reference range",
+                t + bpe <= total.size && l + bpe <= total.size,
+                "CPU reference address escaped the tiled surface");
+        if (to_tiled) {
+          std::memcpy(dst.data() + t, src.data() + l, bpe);
+        } else {
+          std::memcpy(dst.data() + l, src.data() + t, bpe);
+        }
+      }
+    }
+  };
+  move(true, tiled, linear);
+  move(false, result, tiled);
+  for (uint32_t y = 0; y < height; ++y) {
+    Require(name, "round trip",
+            std::memcmp(result.data() + static_cast<uint64_t>(y) * pitch * bpe,
+                        linear.data() + static_cast<uint64_t>(y) * pitch * bpe,
+                        static_cast<size_t>(width) * bpe) == 0,
+            "Standard4KB storage tile/detile round-trip corrupted a row");
+  }
+  std::printf("[host]    %-32s ok\n", "StorageTextureStandard4KBReadback");
 }
 
 void CheckStorageImageSwizzleSpecializationId() {
@@ -14496,6 +14646,11 @@ int main(int argc, char **argv) {
     CheckBufferCacheRangeMerge();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--storage-standard4kb-only") == 0) {
+    CheckBasicStorageTextureDescriptor();
+    CheckStorageTextureStandard4KBReadbackLayout();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--storage-bgra-only") == 0) {
     CheckSampledColorViews();
     CheckBasicStorageTextureDescriptor();
@@ -14549,6 +14704,7 @@ int main(int argc, char **argv) {
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
   CheckStorageTextureLinearReadbackLayout();
+  CheckStorageTextureStandard4KBReadbackLayout();
   CheckStorageImageSwizzleSpecializationId();
   CheckColorResolveLayers();
   CheckStandard64RenderTargetTileRoundTrip();

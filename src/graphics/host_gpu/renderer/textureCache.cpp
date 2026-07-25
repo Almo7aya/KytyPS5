@@ -666,7 +666,9 @@ struct TextureCache::ReadbackWorker {
 		const bool linear = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
 		const bool tiled_storage =
-		    storage && info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+		    storage &&
+		    (info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
+		     info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB));
 		bool single_layer_storage = false;
 		if (storage) {
 			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
@@ -1613,6 +1615,7 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	    info.view_levels != 1 || info.base_array != 0 || !supported_type ||
 	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
 	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
 	     !supported_depth_tile) ||
 	    !IsSupportedStorageSwizzle(info.format, info.swizzle)) {
 		EXIT("TextureCache: unsupported storage-image request, command=%p "
