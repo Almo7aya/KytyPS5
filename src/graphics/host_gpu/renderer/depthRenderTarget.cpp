@@ -138,7 +138,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		return;
 	}
 	// Depth/stencil test or clear state can remain enabled after every backing address is unbound
-	// (Teardown leaves DB_Z_INFO/zfunc programmed with z_read_base_addr == 0). With no depth,
+	// (DB_Z_INFO / zfunc stay programmed while z_read_base_addr == 0). With no depth,
 	// stencil, or HTile address there is nothing to test, write, or clear, so drop the attachment
 	// instead of treating the leftover register state as fatal.
 	if (z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
@@ -174,7 +174,7 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	// attachment exposes the same logical depth values regardless of driver compression), and the
 	// depth footprint validation below independently checks the resolved pitch/size, so a real
 	// layout mismatch is still caught. embedded_sample_locations only shifts subpixel sample
-	// positions. Teardown programs all three on its main compressed depth buffer.
+	// positions.
 	if ((stencil_active && !has_stencil) || rc.resummarize_enable || rc.copy_centroid ||
 	    rc.copy_sample != 0 || z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
 	    z.z_info.partially_resident || z.stencil_info.partially_resident ||

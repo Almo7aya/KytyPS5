@@ -99,8 +99,9 @@ public:
 	                           uint32_t base_layer, uint32_t layer_count);
 	[[nodiscard]] vk::ImageView GetStorageTextureSampledView(StorageTextureVulkanImage& image,
 	                                                         const ImageInfo&           info);
-	[[nodiscard]] vk::ImageView GetStorageTextureStorageView(StorageTextureVulkanImage& image,
-	                                                         uint32_t                   base_level);
+	[[nodiscard]] vk::ImageView GetStorageTextureStorageView(
+	    StorageTextureVulkanImage& image, uint32_t base_level, uint32_t base_array = 0,
+	    vk::ImageViewType view_type = vk::ImageViewType::e2D);
 	[[nodiscard]] DepthStencilVulkanImage*
 	FindDepthTargetByRange(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                       bool allow_containing_sampled = false);

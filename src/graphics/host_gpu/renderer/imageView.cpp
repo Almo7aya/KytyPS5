@@ -376,17 +376,27 @@ vk::ImageView TextureCache::GetStorageTextureSampledView(StorageTextureVulkanIma
 }
 
 vk::ImageView TextureCache::GetStorageTextureStorageView(StorageTextureVulkanImage& image,
-                                                         uint32_t                   base_level) {
-	if (image.image == nullptr || base_level >= (image.mip_levels)) {
-		EXIT("TextureCache: invalid storage-texture mip view, image=%p level=%u levels=%u\n",
-		     static_cast<const void*>(&image), base_level, image.mip_levels);
+                                                         uint32_t base_level, uint32_t base_array,
+                                                         vk::ImageViewType view_type) {
+	if (image.image == nullptr || base_level >= image.mip_levels || base_array >= image.layers) {
+		EXIT("TextureCache: invalid storage-texture view, image=%p level=%u levels=%u base_array=%u "
+		     "layers=%u\n",
+		     static_cast<const void*>(&image), base_level, image.mip_levels, base_array,
+		     image.layers);
 	}
-	if (base_level == 0) {
+	if (base_level == 0 && base_array == 0) {
+		// VIEW_DEFAULT already matches the allocation shape (e3D / e2DArray / e2D), so it is the
+		// correct whole-mip-0 storage view.
 		return image.image_view[VulkanImage::VIEW_DEFAULT];
 	}
-	return GetImageView(image, {image.format, vk::ImageViewType::e2D,
-	                            vk::ImageAspectFlagBits::eColor, base_level, 1, 0, 1,
-	                            DstSel(4, 5, 6, 7), vk::ImageUsageFlagBits::eStorage});
+	// A non-zero base level or array layer needs a fresh view; its type must match the default view
+	// so it satisfies the shader's image binding. An array shape starts at the selected layer and
+	// covers the remaining layers of the selected mip; 2D and 3D shapes are single-layer views.
+	const uint32_t layer_count =
+	    view_type == vk::ImageViewType::e2DArray ? image.layers - base_array : 1u;
+	return GetImageView(image, {image.format, view_type, vk::ImageAspectFlagBits::eColor, base_level,
+	                            1, base_array, layer_count, DstSel(4, 5, 6, 7),
+	                            vk::ImageUsageFlagBits::eStorage});
 }
 
 } // namespace Libs::Graphics

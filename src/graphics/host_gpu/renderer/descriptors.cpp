@@ -153,7 +153,11 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer& command
 	auto binding = GetRenderContext().GetBufferCache().ObtainBuffer(
 	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
 	if (binding.offset % alignment != 0) {
-		EXIT("storage buffer binding is not device-aligned\n");
+		EXIT("storage buffer binding is not device-aligned, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=%llu stride=%u records=%u "
+		     "formatted=%d\n",
+		     address, size, static_cast<uint64_t>(binding.offset),
+		     static_cast<unsigned long long>(alignment), stride, records, resource.formatted);
 	}
 	result.buffer = &binding.buffer;
 	result.offset = binding.offset;
@@ -366,12 +370,13 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
-	const bool supported_mip_view = descriptor.BaseLevel() == 0 || is_2d;
+	const bool supported_mip_view =
+	    descriptor.BaseLevel() == 0 || is_2d || is_2d_array || is_3d;
 	return (is_2d || is_2d_array || is_3d) && supported_tile && supported_mip_view &&
 	       descriptor.BaseLevel() == descriptor.LastLevel() &&
 	       descriptor.LastLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&
-	       descriptor.BaseArray5() == 0 && supported_swizzle && descriptor.BCSwizzle() == 0 &&
-	       !descriptor.MsaaDepth();
+	       (descriptor.BaseArray5() == 0 || is_2d_array) && supported_swizzle &&
+	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
 static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descriptor) {
@@ -386,7 +391,9 @@ static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descr
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
-	       descriptor.fields[3] == expected_field3 && descriptor.fields[4] == descriptor.Depth() &&
+	       descriptor.fields[3] == expected_field3 &&
+	       descriptor.fields[4] ==
+	           (descriptor.Depth() | (static_cast<uint32_t>(descriptor.BaseArray5()) << 16u)) &&
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected &&
 	       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 }
@@ -706,8 +713,15 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 		if (storage) {
 			image      = &texture_cache.FindStorageTexture(command_buffer, info);
 			view       = VulkanImage::VIEW_DEFAULT;
+			const auto storage_view_type =
+			    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D
+			        ? vk::ImageViewType::e3D
+			    : resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+			        ? vk::ImageViewType::e2DArray
+			        : vk::ImageViewType::e2D;
 			image_view = texture_cache.GetStorageTextureStorageView(
-			    *static_cast<StorageTextureVulkanImage*>(image), base_level);
+			    *static_cast<StorageTextureVulkanImage*>(image), base_level, info.base_array,
+			    storage_view_type);
 		} else {
 			image = &texture_cache.FindTexture(command_buffer, info, metadata_read);
 			if (image->type == VulkanImageType::StorageTexture) {

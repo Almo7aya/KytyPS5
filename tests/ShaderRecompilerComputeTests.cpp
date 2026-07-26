@@ -10759,16 +10759,15 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
-ShaderRecompiler::IR::ImageResource MetalSlugStandard4KBStorageTextureResource() {
-  // Write-only 2D (non-uint) storage image: Metal Slug Tactics compute output.
+ShaderRecompiler::IR::ImageResource Standard4KBStorageTextureResource() {
+  // Write-only 2D (non-uint) storage image compute output.
   // kind=StorageImage, dimension=Dim2D, read=false, written=true.
   return BasicBgraStorageTextureResource();
 }
 
-ShaderTextureResource MetalSlugStandard4KBStorageTextureDescriptor() {
-  // Metal Slug Tactics: compute shader writing a Standard4KB-tiled 2D storage
-  // image, 435x281, format 71, tile=5 (kStandard4KB), write-only, swizzle 0xfac.
-  // Raw descriptor dwords captured from the guest at descriptors.cpp:421.
+ShaderTextureResource Standard4KBStorageTextureDescriptor() {
+  // Compute shader writing a Standard4KB-tiled 2D storage image, 435x281,
+  // format 71, tile=5 (kStandard4KB), write-only, swizzle 0xfac.
   return {{0x04ac5ea0u, 0x84700000u, 0x0046006cu, 0x90500facu, 0x00000000u,
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
@@ -11036,8 +11035,8 @@ void CheckBasicStorageTextureDescriptor() {
               DstSel(4, 4, 4, 4)),
           "single-channel replicated destination selection was rejected");
 
-  const auto std4kb = MetalSlugStandard4KBStorageTextureDescriptor();
-  Require("BasicStorageTexture", "Metal Slug Standard4KB descriptor",
+  const auto std4kb = Standard4KBStorageTextureDescriptor();
+  Require("BasicStorageTexture", "Standard4KB descriptor",
           std4kb.Base40() == 0x4ac5ea000ull && std4kb.Width5() + 1u == 435 &&
               std4kb.Height5() + 1u == 281 && std4kb.Depth() + 1u == 1 &&
               std4kb.BaseArray5() == 0 && std4kb.Format() == 71 &&
@@ -11046,9 +11045,23 @@ void CheckBasicStorageTextureDescriptor() {
               std4kb.TileMode() ==
                   Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
               std4kb.DstSelXYZW() == 0xfac,
-          "Metal Slug 4KB-tiled storage descriptor fixture is malformed");
-  ValidateStorageTexture(MetalSlugStandard4KBStorageTextureResource(), std4kb,
-                         0xfc000);
+          "4KB-tiled storage descriptor fixture is malformed");
+  ValidateStorageTexture(Standard4KBStorageTextureResource(), std4kb, 0xfc000);
+
+  // A shader writing mip level 1 of a Standard4KB-tiled 2D-array storage image: a non-zero base
+  // level on a 2D-array view is supported (the base-level view matches the default array view
+  // type).
+  const ShaderTextureResource array_mip{{0x01128e00u, 0xc4b00000u, 0x003fc03fu, 0xd0511facu,
+                                         0x00000000u, 0x00700080u, 0x00000000u, 0x00000000u}};
+  Require("BasicStorageTexture", "array mip-view descriptor",
+          array_mip.Base40() == 0x1128e0000ull && array_mip.BaseLevel() == 1 &&
+              array_mip.LastLevel() == 1 && array_mip.BaseArray5() == 0 &&
+              array_mip.Type() ==
+                  Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+              array_mip.TileMode() ==
+                  Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB),
+          "array mip-view storage descriptor fixture is malformed");
+  ValidateStorageTexture(BasicUintArrayStorageTextureResource(), array_mip, 0x156000);
 
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
@@ -11057,7 +11070,7 @@ void CheckBasicStorageTextureDescriptor() {
   for (const char *kind :
        {"resource", "type", "tile", "mip", "swizzle", "linear-rgb1-read",
         "bgra-read", "r16-float-read", "r8-unorm-read", "yzwx-read",
-        "yzwx-format", "array-base-view", "array-mip-view", "reserved",
+        "yzwx-format", "array-base-view", "reserved",
         "metadata", "uint-format", "uint-resource-float-format",
         "depth-tile-read", "depth-tile-extent"}) {
     std::string command = std::string("\"") + path +
@@ -11183,7 +11196,7 @@ void CheckStorageTextureLinearReadbackLayout() {
 
 void CheckStorageTextureStandard4KBReadbackLayout() {
   constexpr const char *name = "StorageTextureStandard4KBReadback";
-  constexpr uint32_t format = 71;  // Metal Slug Tactics compute storage format
+  constexpr uint32_t format = 71;  // a 4-byte compute storage format
   constexpr uint32_t width = 435;
   constexpr uint32_t height = 281;
   constexpr uint32_t tile =
@@ -11191,14 +11204,14 @@ void CheckStorageTextureStandard4KBReadbackLayout() {
   Require(name, "format support",
           Prospero::IsSupportedTextureFormat(format) &&
               TileIsStandard4KBTextureSupported(format),
-          "Metal Slug storage format is not a supported Standard4KB format");
+          "storage format is not a supported Standard4KB format");
   const uint32_t bpe = Prospero::NumBytesPerElement(format);
   const uint32_t pitch = TileGetTexturePitch(format, width, 1, tile);
   TileSizeAlign total{};
   TileGetTextureTotalSize(format, width, height, 1, pitch, 1, tile, false,
                           total);
   Require(name, "guest size", total.size == 0xfc000,
-          "Standard4KB storage guest layout changed for the Metal Slug surface");
+          "Standard4KB storage guest layout changed for the surface");
 
   // The readback path (DownloadColorImage) routes a Standard4KB storage image
   // through the same transfer-info + GPU-tile-plan pipeline used for
@@ -11659,7 +11672,7 @@ void CheckStorageTextureSampledReuse() {
   // A same-footprint sample with an incompatible view format is a reinterpreting (bitcast) sample
   // of a GPU-produced compute output. The identical footprint keeps the tiled bytes layout-
   // compatible, so the storage image is materialized to guest and the sampled texture is rebuilt
-  // from those same bytes reinterpreted through the new format (Teardown, PPSA15246).
+  // from those same bytes reinterpreted through the new format.
   Require("StorageTextureSampledReuse", "reinterpret",
           ClassifyStorageSampledOverlap(
               incompatible, storage, vk::Format::eR16G16B16A16Unorm,
@@ -12491,9 +12504,12 @@ void CheckBufferImageWrites() {
       Case{"storage unformatted", storage_address + 0x10000, 0x10000,
            storage_address, storage_size, BufferImageBinding::StorageTexture,
            true, false, BufferImageWrite::Unsupported},
+      // A sub-page but fully-contained formatted write into a GPU-owned storage image reconciles by
+      // flushing the whole image to guest; the flush is a whole-image download, so the write need
+      // not be page aligned.
       Case{"storage unaligned", storage_address + 0x100, 0x10000,
            storage_address, storage_size, BufferImageBinding::StorageTexture,
-           true, true, BufferImageWrite::Unsupported},
+           true, true, BufferImageWrite::SynchronizeStorageTexture},
       Case{"depth exact", 0x4a5c80000ull, 0x10000, 0x4a5c80000ull, 0x10000,
            BufferImageBinding::DepthTarget, true, true,
            BufferImageWrite::SynchronizeDepthTarget},
@@ -13358,7 +13374,7 @@ void CheckImageOverlapResolution() {
   // A GPU-modified, clean-owned storage image whose contents differ in format or shape from the
   // aliasing render target is materialized to guest memory and retired: the render target then
   // reuses (and fully overwrites) the region, so the format/shape difference is irrelevant while
-  // the compute output is preserved for any later guest read (Teardown, PPSA15246).
+  // the compute output is preserved for any later guest read.
   Require("ImageOverlapResolution", "storage render-target materialize",
           ClassifyStorageRenderTargetOverlap(
               storage, vk::Format::eR32G32B32A32Sfloat, true, false, false, true,

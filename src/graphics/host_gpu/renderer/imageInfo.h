@@ -362,7 +362,7 @@ enum class RenderTargetOverlap : uint8_t {
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
 enum class StorageSampledOverlap : uint8_t { None, ExactImage, RetireStorage, Unsupported };
 enum class StorageSampledViewShape : uint8_t { Image2D, Image2DArray, Image3D, Unsupported };
-enum class StorageImageOverlap : uint8_t { None, RetireSampled, PageNeighbor, Unsupported };
+enum class StorageImageOverlap : uint8_t { None, RetireSampled, RetireStorage, PageNeighbor, Unsupported };
 enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
 enum class BufferImageBinding : uint8_t {
 	Texture,
@@ -789,11 +789,18 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           ? BufferImageWrite::InvalidateRenderTarget
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::StorageTexture:
-			if (!buffer_page_aligned || !image_page_aligned || !buffer_formatted) {
+			if (!image_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
 			}
+			// A formatted write fully inside a GPU-owned storage image reconciles by flushing the
+			// image's GPU contents to guest memory, after which the buffer write lands coherently on
+			// top. The flush reconstructs the whole backing, so the write itself need not be page
+			// aligned.
 			if (contained && image_gpu_modified && !image_buffer_modified) {
 				return BufferImageWrite::SynchronizeStorageTexture;
+			}
+			if (!buffer_page_aligned) {
+				return BufferImageWrite::Unsupported;
 			}
 			return image_contained && !image_gpu_modified && image_buffer_modified
 			           ? BufferImageWrite::InvalidateStorageTexture
@@ -1036,9 +1043,17 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 	if (!ImageRangeOverlaps(requested_address, requested_size, cached_address, cached_size)) {
 		return StorageImageOverlap::PageNeighbor;
 	}
-	return sampled && !gpu_modified && !buffer_modified && !tracker_gpu_modified
-	           ? StorageImageOverlap::RetireSampled
-	           : StorageImageOverlap::Unsupported;
+	if (sampled) {
+		return !gpu_modified && !buffer_modified && !tracker_gpu_modified
+		           ? StorageImageOverlap::RetireSampled
+		           : StorageImageOverlap::Unsupported;
+	}
+	// A cached storage image reallocated at the same base (e.g. grown to more layers) is replaced by
+	// the new request; retire it so the new allocation owns the range. When it is not GPU-modified
+	// its bytes already live in guest memory (buffer-backed or clean), so the overlapping region
+	// survives the reallocation.
+	return !gpu_modified && !tracker_gpu_modified ? StorageImageOverlap::RetireStorage
+	                                              : StorageImageOverlap::Unsupported;
 }
 
 [[nodiscard]] inline constexpr bool LayeredBackingContains(uint64_t container_size,

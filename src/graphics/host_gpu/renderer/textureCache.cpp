@@ -1067,11 +1067,14 @@ bool Equal(const ImageInfo& left, const ImageInfo& right) {
 }
 
 bool EqualStorageBacking(const ImageInfo& left, const ImageInfo& right) {
+	// base_level and base_array are per-binding view selections, not backing properties: the backing
+	// is always created as the full mip chain and layer array, so bindings that differ only in the
+	// selected mip or layer share one cached image.
 	return left.address == right.address && left.size == right.size &&
 	       left.format == right.format && left.width == right.width &&
 	       left.height == right.height && left.pitch == right.pitch &&
 	       left.levels == right.levels && left.tile == right.tile && left.depth == right.depth &&
-	       left.type == right.type && left.base_array == right.base_array;
+	       left.type == right.type;
 }
 
 bool Equal(const RenderTargetInfo& left, const RenderTargetInfo& right) {
@@ -1318,7 +1321,8 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 		    cached->kind == CachedImage::Kind::Texture, cached->gpu_modified,
 		    cached->buffer_modified, tracker_gpu)) {
 			case StorageImageOverlap::None: continue;
-			case StorageImageOverlap::RetireSampled: retire.push_back(cached); continue;
+			case StorageImageOverlap::RetireSampled:
+			case StorageImageOverlap::RetireStorage: retire.push_back(cached); continue;
 			case StorageImageOverlap::PageNeighbor: continue;
 			case StorageImageOverlap::Unsupported:
 				EXIT("TextureCache: unsupported storage-image byte alias, requested=0x%016" PRIx64
@@ -1334,15 +1338,18 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 	// byte-disjoint subresource outside this storage request. The multi-owner index keeps those
 	// retained pages tracked and UnregisterImageLocked releases only pages whose final owner left.
 	for (auto* cached: retire) {
-		if (!cached->gpu_modified) {
-			continue;
+		if (cached->gpu_modified) {
+			const auto transfer = m_readback->DownloadColorImage(*cached);
+			for (const auto& range: transfer.Ranges()) {
+				m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
+				                                            [](uint64_t, uint64_t) noexcept {});
+			}
+			cached->gpu_modified = false;
 		}
-		const auto transfer = m_readback->DownloadColorImage(*cached);
-		for (const auto& range: transfer.Ranges()) {
-			m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
-			                                            [](uint64_t, uint64_t) noexcept {});
-		}
-		cached->gpu_modified = false;
+		// A buffer-backed storage image keeps its authoritative bytes in guest memory (the buffer
+		// cache retains the backing), so the replacement allocation reads them from there. Clear the
+		// stale-host marker so the image retires through the clean path.
+		cached->buffer_modified = false;
 	}
 	RetireImages(retire);
 }
@@ -1629,7 +1636,7 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	if (info.address == 0 || info.size == 0 || info.address >= TRACKER_ADDRESS_SIZE ||
 	    info.size > TRACKER_ADDRESS_SIZE - info.address || info.width == 0 || info.height == 0 ||
 	    info.depth == 0 || info.levels == 0 || info.levels > 16 || info.base_level >= info.levels ||
-	    info.view_levels != 1 || info.base_array != 0 || !supported_type ||
+	    info.view_levels != 1 || !supported_type ||
 	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
 	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
 	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
@@ -1643,12 +1650,14 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 		     info.depth, info.levels, info.base_level, info.base_array, info.type, info.tile,
 		     info.swizzle);
 	}
-	if ((info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && info.depth != 1) ||
-	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) && info.depth == 0) ||
+	if ((info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+	     (info.depth != 1 || info.base_array != 0)) ||
+	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) &&
+	     (info.depth == 0 || info.base_array != 0)) ||
 	    (info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
 	     info.base_array >= info.depth)) {
-		EXIT("TextureCache: storage-image type and depth disagree, type=%u depth=%u\n", info.type,
-		     info.depth);
+		EXIT("TextureCache: storage-image type and depth disagree, type=%u depth=%u base_array=%u\n",
+		     info.type, info.depth, info.base_array);
 	}
 
 	std::lock_guard       transaction(m_resource_mutex);
@@ -3036,7 +3045,11 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 	}
 	const bool    linear = target.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 	const bool    tiled  = IsTiledRenderTarget(target);
-	const bool    bgra16 = video_out && cached.video_out.bgra16;
+	// A storage image in a standard (non-render-target) tile mode still has a well-defined tiled
+	// layout that the GPU tiler can detile; it just uses the generic per-mip layout below rather
+	// than the render-target block layout.
+	const bool    standard_storage = storage && !linear && !tiled;
+	const bool    bgra16           = video_out && cached.video_out.bgra16;
 	TileSizeAlign exact {};
 	bool          single_slice = false;
 	if (IsSupportedStandard64RenderTarget(target)) {
@@ -3059,7 +3072,8 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 	    render_target || storage ||
 	    (video_out && cached.video_out.compression == VideoOutCompression::Uncompressed);
 	if (!valid_kind || !cached.gpu_modified || cached.buffer_modified ||
-	    (!storage && target.levels != 1) || target.size > UINT32_MAX || (!linear && !exact_tiled) ||
+	    (!storage && target.levels != 1) || target.size > UINT32_MAX ||
+	    (!linear && !exact_tiled && !standard_storage) ||
 	    HasMetaOverlapLocked(target.address, target.size)) {
 		EXIT("TextureCache: unsupported color-image buffer synchronization, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -3119,7 +3133,7 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 		regions = Transfer::MakeLayeredImageBufferCopies(target.layers, slice_size, target.pitch,
 		                                                 target.width, target.height);
 	}
-	if (tiled && !bgra16) {
+	if ((tiled || standard_storage) && !bgra16) {
 		std::vector<GpuTileInfo> infos;
 		const uint32_t           depth = storage ? cached.info.depth : target.layers;
 		EXIT_NOT_IMPLEMENTED(!TextureBuildGpuTileInfos(target.size, tiled_regions, tiled_layout,
