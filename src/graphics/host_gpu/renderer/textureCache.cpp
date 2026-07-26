@@ -679,10 +679,6 @@ struct TextureCache::ReadbackWorker {
 				default: break;
 			}
 		}
-		const bool basic_storage =
-		    !storage ||
-		    (single_layer_storage && cached.info.base_level == 0 && cached.info.levels == 1 &&
-		     cached.info.base_array == 0 && (linear || tiled_storage));
 		const auto    layers = target ? cached.target.layers : 1u;
 		TileSizeAlign target_mip_layout {};
 		const bool    target_mip_chain =
@@ -695,8 +691,28 @@ struct TextureCache::ReadbackWorker {
 		    cached.image->extent.width == info.width &&
 		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
 		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
+		// A compute-generated storage mip chain uses the render-target 64 KiB block layout, so it
+		// reads back through the same tiled path as a mipped color target.
+		TileSizeAlign storage_mip_layout {};
+		const bool    storage_mip_chain =
+		    storage && cached.info.levels > 1 && single_layer_storage &&
+		    cached.info.base_level == 0 && cached.info.base_array == 0 &&
+		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
+		    TileGetRenderTargetMipLayout(info.width, info.height, info.pitch,
+		                                 info.bytes_per_element, info.levels, storage_mip_layout,
+		                                 nullptr, nullptr) &&
+		    storage_mip_layout.align == 65536 && storage_mip_layout.size == info.size &&
+		    cached.image != nullptr && cached.image->format == info.format &&
+		    cached.image->extent.width == info.width &&
+		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
+		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
+		const bool basic_storage =
+		    !storage ||
+		    (single_layer_storage && cached.info.base_level == 0 && cached.info.base_array == 0 &&
+		     (linear || tiled_storage) && (cached.info.levels == 1 || storage_mip_chain));
 		if (info.samples != 1 || (!linear && !tiled_target && !tiled_storage) || !basic_storage ||
-		    (info.levels != 1 && !target_mip_chain) || layers == 0 || info.size > UINT32_MAX) {
+		    (info.levels != 1 && !target_mip_chain && !storage_mip_chain) || layers == 0 ||
+		    info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64
 			     " extent=%ux%u pitch=%u bpe=%u levels=%u samples=%u tile=%u kind=%u\n",
@@ -1203,6 +1219,7 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 			case RenderTargetOverlap::PreserveStorage:
 			case RenderTargetOverlap::ExpandTarget:
 			case RenderTargetOverlap::MaterializeRetireTarget:
+			case RenderTargetOverlap::MaterializeRetireStorage:
 			case RenderTargetOverlap::Unsupported:
 				EXIT("TextureCache: unsupported sampled/render-target alias, sampled=0x%016" PRIx64
 				     "+0x%016" PRIx64 " target=0x%016" PRIx64 "+0x%016" PRIx64
@@ -1861,6 +1878,7 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	std::vector<CachedImage*>                 retire;
 	std::vector<std::shared_ptr<CachedImage>> recreated_depth_sources;
 	std::vector<std::shared_ptr<CachedImage>> materialized_target_sources;
+	std::vector<std::shared_ptr<CachedImage>> materialized_storage_sources;
 	std::shared_ptr<CachedImage>              native_image_source;
 	for (const auto& entry: m_images) {
 		auto& cached = *entry;
@@ -1941,6 +1959,14 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 					materialized_target_sources.push_back(entry);
 				}
 				break;
+			case RenderTargetOverlap::MaterializeRetireStorage:
+				// Allocation-pool reuse over a still-GPU-modified storage image (e.g. a compute mip
+				// chain): download it to guest memory (below) before retiring so nothing is lost.
+				supported = cached.kind == CachedImage::Kind::StorageTexture;
+				if (supported) {
+					materialized_storage_sources.push_back(entry);
+				}
+				break;
 			case RenderTargetOverlap::None:
 			case RenderTargetOverlap::Unsupported: break;
 		}
@@ -1969,6 +1995,12 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	for (const auto& cached: materialized_target_sources) {
 		// Same contract as the recreated depth sources: the download published the current bytes to
 		// guest memory, so the stale color target now retires through the clean path.
+		cached->buffer_modified = false;
+	}
+	MaterializeImagesToGuestLocked(materialized_storage_sources);
+	for (const auto& cached: materialized_storage_sources) {
+		// The download published the storage image's current bytes to guest memory, so the stale
+		// storage texture now retires through the clean path.
 		cached->buffer_modified = false;
 	}
 	RetireDepthMetadataLocked(retire);
@@ -2112,10 +2144,19 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		     " elements=0x%016" PRIx64 "\n",
 		     info.stencil_size, elements);
 	}
-	if (has_stencil && !info.stencil_load_clear && !CanLoadRawStencilPlane(info)) {
-		EXIT("TextureCache: HTile-compressed stencil load is unsupported, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " htile=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
-		     info.stencil_address, info.stencil_size, info.htile_address, info.htile_size);
+	// HTile-compressed stencil cannot be loaded raw from guest memory (no host HTile decoder). Like a
+	// multisampled stencil it is clear-initialized instead of loading compressed bytes: the game
+	// renders its stencil before relying on it, and an HTile fast-clear represents a cleared plane.
+	const bool stencil_htile_clear =
+	    has_stencil && !info.stencil_load_clear && !CanLoadRawStencilPlane(info);
+	const bool skip_raw_stencil_load = info.stencil_load_clear || stencil_htile_clear;
+	if (stencil_htile_clear) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("TextureCache: clear-initializing HTile-compressed stencil plane, "
+			     "addr=0x%016" PRIx64 "\n",
+			     info.stencil_address);
+		}
 	}
 	if (has_htile) {
 		RegisterMeta(info.htile_address, info.htile_size, info.layers);
@@ -2195,7 +2236,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			m_memory_tracker.ForEachUploadRange(
 			    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    if (!info.stencil_load_clear) {
+				    if (!skip_raw_stencil_load) {
 					    m_tiler.DetileStencil(*static_cast<DepthStencilVulkanImage*>(match->image),
 					                          info, stencil_source, true);
 					    match->stencil_initialized = true;
@@ -2410,11 +2451,12 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 	auto cached                 = std::make_shared<CachedImage>(m_graphics);
 	cached->kind                = CachedImage::Kind::DepthTarget;
 	cached->depth               = info;
-	cached->stencil_initialized = !has_stencil || info.stencil_load_clear || initial_stencil_clear;
-	cached->image               = ImageOps::CreateDepthTarget(info);
-	auto* depth_image           = static_cast<DepthStencilVulkanImage*>(cached->image);
+	cached->stencil_initialized =
+	    !has_stencil || info.stencil_load_clear || initial_stencil_clear || stencil_htile_clear;
+	cached->image     = ImageOps::CreateDepthTarget(info);
+	auto* depth_image = static_cast<DepthStencilVulkanImage*>(cached->image);
 	depth_image->initial_depth_clear_pending   = initial_depth_clear;
-	depth_image->initial_stencil_clear_pending = initial_stencil_clear;
+	depth_image->initial_stencil_clear_pending = initial_stencil_clear || stencil_htile_clear;
 	if (discarded_depth_source != nullptr) {
 		command.RetainResourceUntilFence(discarded_depth_source);
 	}
@@ -2445,7 +2487,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		if (has_stencil) {
 			const auto stencil_tail =
 			    SelectSourceRange(stencil_source, tail.stencil_address, tail.stencil_size);
-			if (!info.stencil_load_clear &&
+			if (!skip_raw_stencil_load &&
 			    !IsCoherentGuestImageSource(stencil_tail, tail.stencil_address,
 			                                tail.stencil_size)) {
 				EXIT("TextureCache: stencil expansion tail is not CPU-current\n");
@@ -2453,7 +2495,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			m_memory_tracker.ForEachUploadRange(
 			    tail.stencil_address, tail.stencil_size, true, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    if (!info.stencil_load_clear) {
+				    if (!skip_raw_stencil_load) {
 					    m_tiler.DetileStencil(*static_cast<DepthStencilVulkanImage*>(cached->image),
 					                          tail, stencil_tail, false, old.layers);
 				    }
@@ -2518,7 +2560,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			m_memory_tracker.ForEachUploadRange(
 			    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
 			    [&]() noexcept {
-				    if (!info.stencil_load_clear) {
+				    if (!skip_raw_stencil_load) {
 					    m_tiler.DetileStencil(*static_cast<DepthStencilVulkanImage*>(cached->image),
 					                          info, stencil_source, false);
 				    }
@@ -2618,6 +2660,18 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage& image, bool render_targe
 	if (!image_dirty && !buffer_dirty) {
 		if (info.compression == VideoOutCompression::Uncompressed ||
 		    CanUseVideoOutNativeWithoutUpload(info.compression, render_target, false, false)) {
+			return;
+		}
+		if (info.compression != VideoOutCompression::Unsupported) {
+			// A clean DCC-compressed display buffer cannot be decoded from guest memory (no host DCC
+			// decoder) and nothing newer is pending there. Present the shared native image as-is: a
+			// render target aliasing this display buffer produced its contents.
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("TextureCache: presenting compressed video-out from shared native contents, "
+				     "addr=0x%016" PRIx64 "\n",
+				     info.address);
+			}
 			return;
 		}
 		EXIT("TextureCache: compressed video-out read requires native GPU contents, "

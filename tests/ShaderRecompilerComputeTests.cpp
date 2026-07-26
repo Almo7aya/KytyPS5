@@ -11656,15 +11656,21 @@ void CheckStorageTextureSampledReuse() {
   auto incompatible = storage;
   incompatible.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UNorm);
-  Require("StorageTextureSampledReuse", "incompatible",
+  // A same-footprint sample with an incompatible view format is a reinterpreting (bitcast) sample
+  // of a GPU-produced compute output. The identical footprint keeps the tiled bytes layout-
+  // compatible, so the storage image is materialized to guest and the sampled texture is rebuilt
+  // from those same bytes reinterpreted through the new format (Teardown, PPSA15246).
+  Require("StorageTextureSampledReuse", "reinterpret",
           ClassifyStorageSampledOverlap(
               incompatible, storage, vk::Format::eR16G16B16A16Unorm,
               vk::Format::eR16G16B16A16Sfloat, true,
+              false) == StorageSampledOverlap::RetireStorage,
+          "same-footprint reinterpreting sample was not materialized");
+  Require("StorageTextureSampledReuse", "incompatible",
+          ClassifyStorageSampledOverlap(
+              storage, storage, vk::Format::eR16G16B16A16Sfloat,
+              vk::Format::eR16G16B16A16Sfloat, false,
               false) == StorageSampledOverlap::Unsupported &&
-              ClassifyStorageSampledOverlap(
-                  storage, storage, vk::Format::eR16G16B16A16Sfloat,
-                  vk::Format::eR16G16B16A16Sfloat, false,
-                  false) == StorageSampledOverlap::Unsupported &&
               ClassifyStorageSampledOverlap(
                   storage, storage, vk::Format::eR16G16B16A16Sfloat,
                   vk::Format::eR16G16B16A16Sfloat, true,
@@ -13343,19 +13349,25 @@ void CheckImageOverlapResolution() {
                   storage, storage_target.format, true, false, true, true,
                   storage_target) == RenderTargetOverlap::Unsupported &&
               ClassifyStorageRenderTargetOverlap(
-                  storage, vk::Format::eR32G32B32A32Sfloat, true, false, false,
-                  true, storage_target) == RenderTargetOverlap::Unsupported &&
-              ClassifyStorageRenderTargetOverlap(storage, storage_target.format,
-                                                 true, false, false, true,
-                                                 mismatched_storage_target) ==
-                  RenderTargetOverlap::Unsupported &&
-              ClassifyStorageRenderTargetOverlap(
                   storage, storage_target.format, false, false, false, true,
                   storage_target) == RenderTargetOverlap::Unsupported &&
               ClassifyStorageRenderTargetOverlap(
                   storage, storage_target.format, true, false, false, false,
                   storage_target) == RenderTargetOverlap::Unsupported,
           "unsupported storage-to-render-target transition was admitted");
+  // A GPU-modified, clean-owned storage image whose contents differ in format or shape from the
+  // aliasing render target is materialized to guest memory and retired: the render target then
+  // reuses (and fully overwrites) the region, so the format/shape difference is irrelevant while
+  // the compute output is preserved for any later guest read (Teardown, PPSA15246).
+  Require("ImageOverlapResolution", "storage render-target materialize",
+          ClassifyStorageRenderTargetOverlap(
+              storage, vk::Format::eR32G32B32A32Sfloat, true, false, false, true,
+              storage_target) == RenderTargetOverlap::MaterializeRetireStorage &&
+              ClassifyStorageRenderTargetOverlap(
+                  storage, storage_target.format, true, false, false, true,
+                  mismatched_storage_target) ==
+                  RenderTargetOverlap::MaterializeRetireStorage,
+          "GPU-owned storage reuse for a render target was not materialized");
   partial_storage_target.address = storage.address + storage.size;
   Require("ImageOverlapResolution", "storage render-target adjacency",
           ClassifyStorageRenderTargetOverlap(
@@ -13432,8 +13444,9 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "render target allocation-pool GPU owner",
           ClassifyRenderTargetOverlap(old_target, true, false, true, true,
                                       replacement_target) ==
-              RenderTargetOverlap::Unsupported,
-          "GPU-owned render-target pool allocation was retired");
+              RenderTargetOverlap::MaterializeRetireTarget,
+          "GPU-owned render-target pool allocation was not materialized before "
+          "retirement");
   Require("ImageOverlapResolution",
           "render target allocation-pool buffer owner",
           ClassifyRenderTargetOverlap(old_target, false, true, false, true,

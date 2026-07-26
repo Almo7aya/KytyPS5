@@ -356,6 +356,7 @@ enum class RenderTargetOverlap : uint8_t {
 	ExpandTarget,
 	RetireTarget,
 	MaterializeRetireTarget,
+	MaterializeRetireStorage,
 	Unsupported
 };
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
@@ -725,7 +726,11 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	if (same_backing && compatible_format && cached_gpu_modified && !cached_cpu_dirty) {
 		return StorageSampledOverlap::ExactImage;
 	}
-	if (exact_mip_subresource && cached_gpu_modified && tracker_gpu_modified &&
+	// Same footprint (address/size/pitch/extent/tile) but an incompatible view format: a
+	// reinterpreting sample of a compute output. An identical footprint means an identical
+	// bytes-per-element and tiled byte layout, so the storage image can be materialized to guest and
+	// the sampled texture rebuilt from those same bytes reinterpreted through the new format.
+	if ((same_backing || exact_mip_subresource) && cached_gpu_modified && tracker_gpu_modified &&
 	    !cached_buffer_modified && !cached_cpu_dirty) {
 		return StorageSampledOverlap::RetireStorage;
 	}
@@ -963,10 +968,22 @@ ClassifyStorageRenderTargetOverlap(const ImageInfo& storage, vk::Format storage_
 	    !storage_buffer_modified && !storage_cpu_dirty) {
 		return RenderTargetOverlap::PreserveStorage;
 	}
-	return HasGuestCurrentImageOwnership(storage_gpu_modified, storage_buffer_modified,
-	                                     storage_cpu_dirty, tracker_gpu_modified)
-	           ? RenderTargetOverlap::RetireStorage
-	           : RenderTargetOverlap::Unsupported;
+	if (HasGuestCurrentImageOwnership(storage_gpu_modified, storage_buffer_modified,
+	                                  storage_cpu_dirty, tracker_gpu_modified)) {
+		return RenderTargetOverlap::RetireStorage;
+	}
+	// GPU-produced storage contents (e.g. a compute-generated mip chain) must be flushed to guest
+	// memory before the region is reused as a color target, mirroring MaterializeRetireTarget, so a
+	// later guest read of the reused region loses nothing. Require consistent GPU ownership and page
+	// isolation so the download is well-defined and lossless.
+	const bool page_isolated =
+	    storage.address % TRACKER_PAGE_SIZE == 0 && storage.size % TRACKER_PAGE_SIZE == 0 &&
+	    target.address % TRACKER_PAGE_SIZE == 0 && target.size % TRACKER_PAGE_SIZE == 0;
+	if (page_isolated && storage_gpu_modified && tracker_gpu_modified && !storage_buffer_modified &&
+	    !storage_cpu_dirty) {
+		return RenderTargetOverlap::MaterializeRetireStorage;
+	}
+	return RenderTargetOverlap::Unsupported;
 }
 
 [[nodiscard]] inline bool IsRgba8SrgbViewFormat(vk::Format format) noexcept {
