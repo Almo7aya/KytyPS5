@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <set>
+#include <string>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -227,7 +228,11 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 		DescriptorBindingKind kind;
 		if (!ImageBinding(program.info.images[i], kind)) {
 			if (error != nullptr) {
-				*error = "shader info contains an invalid image binding class";
+				*error = "shader info contains an invalid image binding class (index=" +
+				         std::to_string(i) + " kind=" +
+				         std::to_string(static_cast<int>(program.info.images[i].kind)) +
+				         " dimension=" +
+				         std::to_string(static_cast<int>(program.info.images[i].dimension)) + ")";
 			}
 			return false;
 		}

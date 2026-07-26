@@ -1062,6 +1062,35 @@ void TestResourceSpecializationIsTypedAndTransactional() {
             null_program.info.images[0].dimension == Decoder::ImageDimension::Dim3D,
         "zero-base image descriptor did not preserve tracked null-image shape");
 
+  // A null descriptor whose tracked shape is also undetermined (Teardown CS
+  // hash 0x9009bc300) must default to 2D so the binding layout can be built,
+  // rather than staying Unknown and aborting the recompile.
+  Program unknown_program;
+  unknown_program.stage = ShaderType::Compute;
+  unknown_program.blocks.resize(1);
+  unknown_program.blocks[0].instructions = {
+      ImageUse(0x14, Opcode::ImageLoad, ResourceKind::Image,
+               Decoder::ImageDimension::Unknown)};
+  Prepare(unknown_program);
+  Check(unknown_program.info.images.size() == 1 &&
+            unknown_program.info.images[0].dimension ==
+                Decoder::ImageDimension::Unknown,
+        "tracked image did not start with an undetermined shape");
+  ResourceSnapshot unknown_snapshot;
+  unknown_snapshot.images.resize(1);
+  unknown_snapshot.images[0].dword_count = 8;
+  unknown_snapshot.images[0].dwords[1] = 0x12345600u;
+  unknown_snapshot.images[0].dwords[2] = 0x89abcdefu;
+  unknown_snapshot.images[0].dwords[3] = 0x01234567u;
+  error.clear();
+  Check(SpecializeResources(unknown_program, unknown_snapshot, &error) &&
+            ValidateResourceSpecialization(unknown_program, unknown_snapshot,
+                                           &error) &&
+            unknown_program.info.images[0].kind == ResourceKind::Image &&
+            unknown_program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D,
+        "null-descriptor image with undetermined shape did not default to 2D");
+
   Program program;
   program.stage = ShaderType::Compute;
   program.blocks.resize(1);

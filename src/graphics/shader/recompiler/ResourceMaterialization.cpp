@@ -317,6 +317,13 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = next.images[i];
 		if (NullImageDescriptor(descriptor)) {
+			// A null (unbound) descriptor carries no type, but the binding layout still needs a
+			// concrete image class and the runtime binds a dummy image for it. When the shader
+			// instructions also left the dimension undetermined, default it to 2D so pipeline
+			// layout allocation succeeds instead of aborting the whole recompile.
+			if (image.dimension == Decoder::ImageDimension::Unknown) {
+				image.dimension = Decoder::ImageDimension::Dim2D;
+			}
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor);
