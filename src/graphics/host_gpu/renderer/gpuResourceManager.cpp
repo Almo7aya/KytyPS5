@@ -41,6 +41,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// normal non-CP fault path below rather than aborting.
 	if (auto* cp = GraphicsRunCurrentCommandProcessor(); cp != nullptr) {
 		Kyty::WaitWatch::DrainStats::cp_fault_count.fetch_add(1, std::memory_order_relaxed);
+		Kyty::WaitWatch::Scope w("cp_fault", fault_vaddr, static_cast<uint64_t>(access)); // KYTY_DIAG
 		cp->BeginReadbackTransaction();
 		bool handled = false;
 		{
@@ -54,6 +55,19 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		EXIT("unsupported page fault from a pre-owned resource transaction, addr=0x%016" PRIx64
 		     " access=%u\n",
 		     fault_vaddr, static_cast<uint32_t>(access));
+	}
+	// A GPU label callback (EOP sync-value write on the dedicated label thread) must NOT pause
+	// submissions to resolve its fault. The pause it would need can be held by a thread (Done()/another
+	// fault) that is itself blocked waiting for the GPU worker to consume this very label, and the
+	// worker in turn blocks in a PM4 handler waiting for the callback's write -> a
+	// Done -> worker -> label-callback -> Done deadlock (observed hanging GTA III at level load). A
+	// label callback only writes sync values for pipeline work the GPU has already retired (end-of-
+	// pipe), so the region is no longer in flight; resolving under the resource mutex alone -- without
+	// the submission pause / GPU fence -- is coherent and breaks the cycle.
+	if (LabelInCallback()) {
+		Kyty::WaitWatch::Scope       w("label_fault", fault_vaddr, 0); // KYTY_DIAG
+		ResourceMutex::FaultScope    fault(m_resource_mutex);
+		return m_page_manager.HandleFault(access, fault_vaddr);
 	}
 	// Stop command-processor jobs before taking the shared cache transaction. External readback
 	// workers inherit this paused state and therefore never form resource -> submission lock

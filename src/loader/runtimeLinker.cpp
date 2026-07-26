@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/waitWatch.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -524,21 +525,32 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+
+		// On-demand commit: the guest streams into a huge anon reservation and reads/writes reserved
+		// (uncommitted) 64KB pool blocks before/without an explicit map. Commit the block and resume
+		// rather than treating it as a fatal access violation.
+		if (info->access_violation_type == CoreAccess::Write ||
+		    info->access_violation_type == CoreAccess::Read) {
+			Kyty::WaitWatch::Scope w("commit_fault", info->access_violation_vaddr, 0); // KYTY_DIAG
+			if (Libs::LibKernel::Memory::KernelCommitReservedOnFault(
+			        info->access_violation_vaddr)) {
+				return true;
+			}
+		}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		{ // KYTY_DIAG: characterize the unresolved GPU-aperture fault before crashing
+		{ // KYTY_DIAG: characterize an AV we could NOT resolve, before crashing
 			const auto               av = info->access_violation_vaddr;
 			MEMORY_BASIC_INFORMATION mbi {};
 			const auto               q = VirtualQuery(reinterpret_cast<const void*>(av), &mbi, sizeof(mbi));
 			Libs::LibKernel::Memory::VirtualQueryInfo vqi {};
 			const int                kq = Libs::LibKernel::Memory::KernelVirtualQuery(
                 reinterpret_cast<const void*>(av), 0, &vqi, sizeof(vqi));
-			std::printf("KYTY_DIAG AV addr=0x%016llx os_q=%zu state=0x%08lx protect=0x%08lx "
-			            "base=0x%016llx rsize=0x%016llx | kq=%d kstart=0x%016llx kend=0x%016llx "
-			            "kprot=0x%08x kname=%s\n",
-			            static_cast<unsigned long long>(av), q,
-			            static_cast<unsigned long>(mbi.State), static_cast<unsigned long>(mbi.Protect),
-			            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
-			            static_cast<unsigned long long>(mbi.RegionSize), kq,
+			std::printf("KYTY_DIAG UNHANDLED AV type=%d addr=0x%016llx os_q=%zu state=0x%08lx "
+			            "protect=0x%08lx | kq=%d kstart=0x%016llx kend=0x%016llx kprot=0x%08x "
+			            "kname=%s\n",
+			            static_cast<int>(info->access_violation_type),
+			            static_cast<unsigned long long>(av), q, static_cast<unsigned long>(mbi.State),
+			            static_cast<unsigned long>(mbi.Protect), kq,
 			            static_cast<unsigned long long>(vqi.start),
 			            static_cast<unsigned long long>(vqi.end), vqi.protection, vqi.name);
 			std::fflush(stdout);

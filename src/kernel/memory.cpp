@@ -3418,6 +3418,74 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 	EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
 }
 
+// On-demand commit of a reserved (uncommitted placeholder) page the guest wrote to. GTA III streams
+// into a huge anon reservation and iterates 64KB pool blocks; some blocks are written before/without
+// an explicit map. Mirror the map path's commit-over-reserved sequence (ConsumeReserved + placeholder
+// commit) for the 64KB allocation-granularity block containing the fault, so the write succeeds and
+// the block becomes real, tracked, committed memory.
+static void CommitOnFaultLog(uint64_t block, uint64_t size, const char* tag) {
+	static std::atomic<uint64_t> commit_on_fault_count {0};
+	const uint64_t               n = commit_on_fault_count.fetch_add(1) + 1;
+	if ((n & (n - 1)) == 0) { // log at powers of two to avoid spam
+		std::printf("KYTY_DIAG commit-on-fault #%llu block=0x%016llx size=0x%llx %s\n",
+		            static_cast<unsigned long long>(n), static_cast<unsigned long long>(block),
+		            static_cast<unsigned long long>(size), tag);
+		std::fflush(stdout);
+	}
+}
+
+bool KernelCommitReservedOnFault(uint64_t vaddr) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	constexpr uint64_t GRAN  = 0x10000; // Windows allocation granularity (placeholder split unit)
+	uint64_t           block = vaddr & ~(GRAN - 1);
+
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges->Query(vaddr, 0, &range) && IsReservedRangeType(range.type)) {
+		if (block < range.start) {
+			block = range.start;
+		}
+		const uint64_t range_end = range.start + range.size;
+		uint64_t       block_end = block + GRAN;
+		if (block_end > range_end) {
+			block_end = range_end;
+		}
+		const uint64_t size = block_end - block;
+		if (size != 0 && g_virtual_ranges->ConsumeReserved(block, size, range.type)) {
+			const bool committed =
+			    g_placeholder_address_space->Commit(block, size, VirtualMemory::Mode::ReadWrite) ||
+			    CommitFixedHostRange(block, size, VirtualMemory::Mode::ReadWrite);
+			if (!committed) {
+				g_virtual_ranges->Add(block, size, 0, 0, 0, range.type, range.name, false,
+				                      range.placeholder_backed);
+				return false;
+			}
+			// Register as committed flexible memory so later VirtualQuery/map/unmap stay consistent.
+			g_virtual_ranges->Add(block, size, 0, 0x3 /*R|W*/, 0, VirtualRangeType::Flexible,
+			                      range.name, true, false);
+			CommitOnFaultLog(block, size, "tracked");
+			return true;
+		}
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Fallback: the OS reports the page as reserved-but-uncommitted yet g_virtual_ranges has no record
+	// of it (a bare placeholder or a reservation from a path we do not track). The guest still expects
+	// to read/write it, so commit the 64KB block directly. Try the placeholder-replace path first, then
+	// a plain page-by-page commit for a non-placeholder reserve.
+	MEMORY_BASIC_INFORMATION mbi {};
+	if (VirtualQuery(reinterpret_cast<const void*>(block), &mbi, sizeof(mbi)) != 0 &&
+	    mbi.State == MEM_RESERVE) {
+		if (g_placeholder_address_space->Commit(block, GRAN, VirtualMemory::Mode::ReadWrite) ||
+		    CommitFixedHostRange(block, GRAN, VirtualMemory::Mode::ReadWrite)) {
+			CommitOnFaultLog(block, GRAN, "untracked");
+			return true;
+		}
+	}
+#endif
+	return false;
+}
+
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {
 	PRINT_NAME();

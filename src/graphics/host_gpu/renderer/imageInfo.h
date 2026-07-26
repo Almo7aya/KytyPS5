@@ -1147,6 +1147,13 @@ ClassifyStorageRenderTargetOverlap(const ImageInfo& storage, vk::Format storage_
 	                                  storage_cpu_dirty, tracker_gpu_modified)) {
 		return RenderTargetOverlap::RetireStorage;
 	}
+	// The storage image itself holds no authoritative device content (its own gpu_modified flag is
+	// clear) -- guest memory or a buffer is the current copy, and any tracker-reported GPU writes over
+	// this region belong to another overlapping resource, not this image. Retiring it when a render
+	// target reclaims the region loses nothing; the data re-uploads from its current owner on next use.
+	if (!storage_gpu_modified) {
+		return RenderTargetOverlap::RetireStorage;
+	}
 	// GPU-produced storage contents (e.g. a compute-generated mip chain) must be flushed to guest
 	// memory before the region is reused as a color target, mirroring MaterializeRetireTarget, so a
 	// later guest read of the reused region loses nothing. Require consistent GPU ownership and page

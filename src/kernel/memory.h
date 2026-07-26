@@ -136,6 +136,7 @@ int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryIn
 int KYTY_SYSV_ABI KernelIsStack(void* addr, void** start, void** end);
 int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, size_t alignment);
 bool              KernelHandleReservedRangeAccessViolation(uint64_t vaddr);
+bool              KernelCommitReservedOnFault(uint64_t vaddr);
 int KYTY_SYSV_ABI KernelAvailableFlexibleMemorySize(size_t* size);
 int KYTY_SYSV_ABI KernelConfiguredFlexibleMemorySize(uint64_t* size);
 int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot);

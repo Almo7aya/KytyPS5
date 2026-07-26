@@ -141,10 +141,6 @@ private:
 	bool                                           m_graphics_done    = true;
 	bool                                           m_pause_requested  = false;
 	bool                                           m_worker_parked    = false;
-	Common::Mutex                                  m_pause_mutex;
-	Common::CondVar                                m_pause_cv;
-	uint32_t                                       m_pause_refs       = 0;
-	bool                                           m_done_waiting     = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
@@ -213,18 +209,7 @@ void Gpu::SubmitFlipPreparation() {
 
 void Gpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
-	// Done is the exclusive "writer": it needs the whole queue drained and sole access to the shared
-	// scheduler, the opposite of the shared fault "readers" that park the worker. Take m_pause_mutex,
-	// signal writer intent so new faults yield, wait for in-flight faults to drain, then do the full
-	// WaitLocked drain while holding the lock so no fault touches the scheduler concurrently.
-	Common::LockGuard pause_lock(m_pause_mutex);
-	m_done_waiting = true;
-	while (m_pause_refs != 0) {
-		m_pause_cv.Wait(&m_pause_mutex);
-	}
 	WaitLocked();
-	m_done_waiting = false;
-	m_pause_cv.SignalAll();
 	m_graphics_done = true;
 	m_done_num++;
 }
@@ -283,6 +268,7 @@ void CommandProcessor::Reset() {
 }
 
 void CommandProcessor::BufferInit() {
+	Kyty::WaitWatch::Scope w("gpu_begin", 0, 0); // KYTY_DIAG
 	GetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
 }
 
@@ -298,6 +284,7 @@ void CommandProcessor::BufferFlushAndWait() {
 void CommandProcessor::BufferWait() {
 	Kyty::WaitWatch::DrainStats::bufwait_count.fetch_add(1, std::memory_order_relaxed);
 	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::bufwait_ns);
+	Kyty::WaitWatch::Scope w("gpu_bufwait", 0, 0); // KYTY_DIAG
 	BufferInit();
 	GetScheduler().Finish();
 }
@@ -583,6 +570,7 @@ void Gpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<Gpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Kyty::WaitWatch::SetThreadName("GpuWorker", -2, 0); // KYTY_DIAG
 
 	for (;;) {
 		Submission submission;
@@ -622,7 +610,12 @@ void Gpu::ThreadRun(void* data) {
 			gpu->m_processing = true;
 		}
 
-		const bool complete = gpu->Process(submission);
+		bool complete = false;
+		{
+			Kyty::WaitWatch::Scope w("gpu_process", submission.queue_id, // KYTY_DIAG
+			                         static_cast<uint64_t>(submission.type));
+			complete = gpu->Process(submission);
+		}
 		if (complete) {
 			Kyty::WaitWatch::DrainStats::submits_done.fetch_add(1, std::memory_order_relaxed);
 		}
@@ -666,7 +659,8 @@ bool Gpu::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
-			bool progressed = false;
+			bool     progressed = false;
+			uint64_t spin       = 0; // KYTY_DIAG
 			submission.constant_complete |= submission.constant_commands.Empty();
 			for (;;) {
 				bool round_progress = false;
@@ -689,12 +683,20 @@ bool Gpu::Process(Submission& submission) {
 				if (complete || !round_progress) {
 					break;
 				}
+				if ((++spin & 0xFFFFFu) == 0) { // KYTY_DIAG livelock detector
+					std::printf("KYTY_DIAG Process spin submit=%llu rounds=%llu cc=%d dc=%d\n",
+					            static_cast<unsigned long long>(m_submit_id),
+					            static_cast<unsigned long long>(spin), submission.constant_complete,
+					            submission.command_complete);
+					std::fflush(stdout);
+				}
 			}
 			if (complete && submission.trigger_agc_interrupt_on_done) {
 				cp.TriggerEopEventAtEndOfPipe(0);
 				progressed = true;
 			}
 			if (progressed) {
+				Kyty::WaitWatch::Scope w("gpu_flush", 0, 0); // KYTY_DIAG
 				cp.BufferFlush();
 			}
 			break;
@@ -739,26 +741,20 @@ void Gpu::PauseSubmissions() {
 	Kyty::WaitWatch::DrainStats::pause_count.fetch_add(1, std::memory_order_relaxed);
 	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::pause_ns);
 	g_gpu_mutex_owned = true;
-	// Coalesce concurrent faults into a single shared pause window. During level streaming ~16 engine
-	// threads fault at once; making each do its own park+BufferWait+LabelDrain serialized a thundering
-	// herd through one mutex. Instead the first faulter establishes the window (worker parked, GPU
-	// fenced, labels flushed) and concurrent faulters just ref-count in -- they still serialize their
-	// own cache invalidation on m_resource_mutex, but that is far cheaper than a full drain each.
-	Common::LockGuard lock(m_pause_mutex);
-	while (m_done_waiting) {
-		m_pause_cv.Wait(&m_pause_mutex);
+	// Serialize faults against Done() (and each other) on m_submission_mutex exactly like the original
+	// drain -- this is the proven-deadlock-free ordering. The perf win comes from replacing the old
+	// full-queue WaitForIdle with a lightweight worker PARK (wait only for the in-flight Process, not
+	// the whole queue); BufferWait still fences submitted GPU work and LabelDrain still flushes labels.
+	m_submission_mutex.Lock();
+	{
+		Kyty::WaitWatch::DrainStats::ScopedNs wt(Kyty::WaitWatch::DrainStats::waitidle_ns);
+		RequestPauseAndWait();
 	}
-	if (m_pause_refs++ == 0) {
-		{
-			Kyty::WaitWatch::DrainStats::ScopedNs wt(Kyty::WaitWatch::DrainStats::waitidle_ns);
-			RequestPauseAndWait();
-		}
-		m_gfx_cp->BufferWait();
-		{
-			Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
-			Kyty::WaitWatch::DrainStats::ScopedNs lt(Kyty::WaitWatch::DrainStats::labeldrain_ns);
-			LabelDrain();
-		}
+	m_gfx_cp->BufferWait();
+	{
+		Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
+		Kyty::WaitWatch::DrainStats::ScopedNs lt(Kyty::WaitWatch::DrainStats::labeldrain_ns);
+		LabelDrain();
 	}
 }
 
@@ -766,13 +762,8 @@ void Gpu::ResumeSubmissions() {
 	if (!g_gpu_mutex_owned) {
 		EXIT("GPU submissions resumed without an active pause\n");
 	}
-	{
-		Common::LockGuard lock(m_pause_mutex);
-		if (--m_pause_refs == 0) {
-			ReleasePause();
-			m_pause_cv.SignalAll();
-		}
-	}
+	ReleasePause();
+	m_submission_mutex.Unlock();
 	g_gpu_mutex_owned = false;
 }
 
@@ -801,7 +792,10 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution& execution, uint32_t* bu
 		Pm4Execution*     previous_execution;
 	} execution_scope(*this, execution);
 
-	ProcessPm4(execution, 0);
+	{
+		Kyty::WaitWatch::Scope w("gpu_pm4", 0, 0); // KYTY_DIAG
+		ProcessPm4(execution, 0);
+	}
 	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
 	                                        : Pm4ProcessResult::Blocked;
 }
