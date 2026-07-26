@@ -80,15 +80,53 @@ cost breakdown** (time in `WaitForIdle` vs `BufferWait` vs `LabelDrain`).
   it requires **Phase 2** first (removing the drain without Phase 2 hangs the CP — verified).
 
 ### Phase 2 — Decouple GPU forward-progress from the fault path
-- **Goal:** make submissions/labels advance on their own so the fault-drain is no longer the pump.
-- **Approach:** a dedicated submission/step driver (or ensure `IncrementDe`/CE-DE handoff and the
-  label poll advance the ring without needing a CPU fault). Confirm with the watchdog that with the
-  fault path taking *no* drain, the CP still makes progress (labels fire, `WAIT_REG_MEM` resolves)
-  under a synthetic "many CPU writes, no GPU stall" load.
-- **Risk:** moderate (CE/DE ring management is delicate; see prior `IncrementDe` failures).
-- **Validation:** startup no longer hangs when the fault-path drain is stubbed to a no-op *in a
-  scratch build*; working games unaffected.
-- **Exit:** GPU reaches steady state independent of fault rate.
+
+**Mechanism confirmed by investigation (why removing the drain hangs):**
+- The value a `WAIT_REG_MEM` waits on is usually produced by an **End-Of-Pipe (EOP) event write**
+  that is *deferred*: `WriteAtEndOfPipe*` → `Sync::RecordEndOfPipeSignal` → `SubmitLabel`
+  (`sync.cpp`) records a GPU `vkCmdSetEvent`; the actual guest `memcpy` of the value happens in
+  `CompleteEndOfPipeSignal` (`sync.cpp:107`) which runs as a **label callback on the LabelManager
+  thread** (`label.cpp:173`) — only after the producing command buffer is submitted, executed
+  (vkEvent set), and the label poll observes it.
+- The fault-drain manufactures this: `WaitForIdle` runs every queued submission through `Process`
+  (recording + `BufferFlush`-submitting producers), `BufferWait` (`Scheduler::Finish`, waits all 8
+  ring fences) forces GPU *execution* so the event sets, `LabelDrain` fires the callback → value
+  lands **before the fault returns**.
+- The worker's own retry loop (`graphicsRun.cpp:559-567`) only re-reads guest memory; it never
+  *produces* the value. **Gap:** `BufferFlush` runs only at end of `Process` `if (progressed)`, so a
+  submission that suspends on its *first* packet (`WAIT_REG_MEM`, `progressed==false`) never flushes
+  — a producer's recorded EOP can sit un-submitted and its label never fires. Plain retry can't fix
+  that; only a `Scheduler::Finish` (which submits even when nothing progressed) can.
+- There is ONE shared 8-slot `CommandScheduler` ring across the gfx CP and all 57 queues, so
+  `m_gfx_cp->BufferWait()` drains *everything* regardless of which queue recorded it.
+
+**Concrete pump (self-driven, not per-fault):** the natural hook is the worker's all-fronts-blocked
+branch (`graphicsRun.cpp:559-567`), which fires only when *every* queue front is suspended — i.e.
+exactly when the CP is stuck. Today it just `WaitFor(100ms)` then clears `blocked` flags. Make it, on
+each blocked cycle (or every Nth), run **`m_gfx_cp->BufferWait()` + `LabelDrain()` before clearing
+the flags**. That flushes+executes any un-submitted producer and fires its callback, so the value
+lands and the consumer unblocks on the next retry — a forward-progress pump that lives entirely on
+the GPU worker and never depends on the CPU fault rate.
+
+- **Risk:** moderate. Specific hazards to validate:
+  1. **LabelDrain-under-lock deadlock.** `LabelDrain` blocks until callbacks fire; a callback's guest
+     `memcpy` can page-fault → non-CP fault path → `PauseSubmissions` → `m_submission_mutex.Lock()`.
+     If the pump holds that mutex (as the fault-drain does today) the label thread blocks on it while
+     the pump waits for the callback → deadlock. *This hazard already exists in today's fault-drain*
+     (PauseSubmissions holds the mutex across LabelDrain); the pump must take the mutex the same way
+     and confirm callbacks either don't fault or resolve without needing it. **Investigate whether
+     label-callback guest writes are pre-resident** (they target the EOP value address, usually a
+     small label region) — if so, no fault, no deadlock.
+  2. **Thread identity.** The pump runs on the worker thread. Confirm `BufferWait`/`Scheduler::Finish`
+     is valid there (it is the same thread that runs `Process`); check `g_current_processor` state in
+     the blocked branch.
+  3. **const-RAM ring** correctness is unaffected here (`IncrementDe`'s own `BufferWait` stays); the
+     pump only adds flush/execute/callback when otherwise fully stalled.
+- **Validation:** (a) add the pump *additively* (keep the fault-drain) → working games unchanged;
+  (b) in a scratch build, stub the fault-path drain to a no-op → GTA III startup no longer hangs and
+  the watchdog shows drains/sec collapse; then promote to Phase 4.
+- **Exit:** with the fault-drain stubbed, the CP still reaches steady state (labels fire,
+  `WAIT_REG_MEM` resolves) on GTA III startup and all working games.
 
 ### Phase 3 — Fence-versioned buffer/const-RAM cache
 - **Goal:** answer "is the faulting range still in-flight on the GPU?" precisely, replacing the
