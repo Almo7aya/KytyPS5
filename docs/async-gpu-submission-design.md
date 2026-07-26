@@ -128,6 +128,26 @@ the GPU worker and never depends on the CPU fault rate.
 - **Exit:** with the fault-drain stubbed, the CP still reaches steady state (labels fire,
   `WAIT_REG_MEM` resolves) on GTA III startup and all working games.
 
+#### Phase 2 EMPIRICAL RESULT (scratch test): pump is necessary but NOT sufficient
+- Step (a) additive pump (`BufferWait`, and `BufferWait`+`LabelDrain`) with the fault-drain kept:
+  **no regression**, reaches the menu, one run even progressed further — good.
+- Step (b) drain stubbed + pump: **still hangs at startup (frame 2)**, `gpu_labels_pending`>0. The
+  watchdog dump shows the real blocker is **`AgcSubmissionThread` stuck in `Gpu::WaitForIdle`**
+  (`state=gpu_idle`, `m_submission_count`=4) while the CP is suspended on `WAIT_REG_MEM`
+  (addr `0x20040cb478`, ref=1, value=0). `WaitForIdle` (`graphicsRun.cpp:525`) loops on
+  `m_processing || m_submission_count != 0`, and a `WAIT_REG_MEM`-suspended submission keeps
+  `m_submission_count` non-zero → `WaitForIdle` never returns. Its awaited value is written by the
+  CPU/AGC path that is itself blocked in that `WaitForIdle` → **CPU-side deadlock the GPU-worker
+  pump cannot break** (the pump produces GPU/label values, not CPU writes).
+- **Added prerequisite for Phase 4:** `WaitForIdle` (and any AGC full-drain in the submit protocol)
+  must treat a `WAIT_REG_MEM`-suspended submission as *idle* (it is waiting on the CPU, not
+  executing) — i.e. return when only CPU-blocked submissions remain (track a `m_blocked_count` and
+  wait on `m_submission_count - m_blocked_count`). Only then can the CPU proceed to write the value
+  and unblock the submission. This is a **new sub-task discovered by the scratch test** and must land
+  with the pump before the fault-drain can be removed.
+- **Status:** Phase 2 pump validated as *additive-safe* but reverted (no value without Phase 4);
+  the WaitForIdle-vs-CPU-blocked-submission change is the next concrete prerequisite to prototype.
+
 ### Phase 3 — Fence-versioned buffer/const-RAM cache
 - **Goal:** answer "is the faulting range still in-flight on the GPU?" precisely, replacing the
   global `WaitForIdle`.
