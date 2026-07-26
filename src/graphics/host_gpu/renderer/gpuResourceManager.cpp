@@ -40,6 +40,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// processor faulting thread, so a guest access to GPU-tracked memory can be resolved through the
 	// normal non-CP fault path below rather than aborting.
 	if (auto* cp = GraphicsRunCurrentCommandProcessor(); cp != nullptr) {
+		Kyty::WaitWatch::DrainStats::cp_fault_count.fetch_add(1, std::memory_order_relaxed);
 		cp->BeginReadbackTransaction();
 		bool handled = false;
 		{
@@ -60,6 +61,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	// though ~99.6% of faults need no readback) starves GPU WAIT_REG_MEM waits on guest sync values
 	// written by GPU label callbacks (the drain's LabelDrain flushes them), hanging the GPU at
 	// startup. A real fix must drain only for sync-relevant faults, which is a fault/lock redesign.
+	Kyty::WaitWatch::DrainStats::fault_count.fetch_add(1, std::memory_order_relaxed);
 	GraphicsRunSubmissionLock submissions;
 	ResourceMutex::FaultScope fault(m_resource_mutex);
 	return m_page_manager.HandleFault(access, fault_vaddr);

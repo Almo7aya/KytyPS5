@@ -142,26 +142,40 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer& command
 		BindNullStorageBuffer(command_buffer, result);
 		return result;
 	}
+	// GNM descriptors are frequently over-provisioned (num_records ~= 0xffffffff) so the shader can
+	// bounds-check in-flight; only the head of the footprint is actually resident. Clamp the bound
+	// range to the contiguous GPU-visible extent so we neither fault on unmapped tail pages nor bind
+	// a range the guest never mapped. Robust buffer access returns zero for reads past the clamp.
+	uint64_t bound_size = size;
+	{
+		const auto mapped = GetRenderContext().GetBufferCache().GpuAccessExtent(
+		    address, size, resource.read || resource.formatted, resource.written);
+		if (mapped == 0) {
+			BindNullStorageBuffer(command_buffer, result);
+			return result;
+		}
+		bound_size = mapped;
+	}
 	const auto& graphics  = GetRenderContext().GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
+	    bound_size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange ||
 	    BufferCache::CACHING_PAGE_SIZE % alignment != 0) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
 	(void)submit_id;
 	auto binding = GetRenderContext().GetBufferCache().ObtainBuffer(
-	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
+	    command_buffer, address, bound_size, resource.written, resource.read, resource.formatted);
 	if (binding.offset % alignment != 0) {
 		EXIT("storage buffer binding is not device-aligned, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=%llu stride=%u records=%u "
 		     "formatted=%d\n",
-		     address, size, static_cast<uint64_t>(binding.offset),
+		     address, bound_size, static_cast<uint64_t>(binding.offset),
 		     static_cast<unsigned long long>(alignment), stride, records, resource.formatted);
 	}
 	result.buffer = &binding.buffer;
 	result.offset = binding.offset;
-	result.range  = static_cast<vk::DeviceSize>(size);
+	result.range  = static_cast<vk::DeviceSize>(bound_size);
 	return result;
 }
 

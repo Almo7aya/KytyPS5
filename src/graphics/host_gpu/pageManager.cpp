@@ -361,6 +361,40 @@ bool PageManager::HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) 
 	return true;
 }
 
+uint64_t PageManager::GpuAccessExtent(uint64_t vaddr, uint64_t max_size,
+                                      GpuAccess access) const noexcept {
+	if (access != GpuAccess::Read && access != GpuAccess::Write && access != GpuAccess::ReadWrite) {
+		FailFast("GpuAccessExtent received an invalid GPU access mode");
+	}
+	const bool need_read  = access == GpuAccess::Read || access == GpuAccess::ReadWrite;
+	const bool need_write = access == GpuAccess::Write || access == GpuAccess::ReadWrite;
+	if (vaddr == 0 || max_size == 0 || vaddr >= ADDRESS_SIZE) {
+		return 0;
+	}
+	if (max_size > ADDRESS_SIZE - vaddr) {
+		max_size = ADDRESS_SIZE - vaddr;
+	}
+	const auto end     = PageStart(vaddr + max_size - 1) + PAGE_SIZE;
+	uint64_t   covered = 0;
+	for (auto addr = PageStart(vaddr); addr < end; addr += PAGE_SIZE) {
+		auto* region = m_impl->FindRegion(addr);
+		if (region == nullptr) {
+			break;
+		}
+		auto&     page = m_impl->GetPage(*region, addr);
+		SpinGuard lock(page.lock);
+		if ((need_read && page.gpu_read_mappings == 0) ||
+		    (need_write && page.gpu_write_mappings == 0)) {
+			break;
+		}
+		covered += PAGE_SIZE;
+	}
+	// The first page may start partway in; do not report more than the caller asked for.
+	const uint64_t offset    = vaddr - PageStart(vaddr);
+	const uint64_t available = covered > offset ? covered - offset : 0;
+	return available < max_size ? available : max_size;
+}
+
 void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
                                      PageWatchMode mode) {
 	if (g_in_fault_resolution) {

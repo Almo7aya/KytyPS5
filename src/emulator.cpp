@@ -171,8 +171,40 @@ static void WatchdogRun(void* /*unused*/) {
 	uint64_t last_change_ms = Kyty::WaitWatch::NowMs();
 	bool     dumped         = false;
 	int      save_tick      = 0;
+	namespace DS            = Kyty::WaitWatch::DrainStats;
+	uint64_t p_pause = 0, p_pause_ns = 0, p_wait_ns = 0, p_bw = 0, p_bw_ns = 0, p_ld_ns = 0,
+	         p_incde = 0, p_fault = 0, p_cpf = 0, p_sub = 0;
 	for (;;) {
 		Common::Thread::Sleep(1000);
+		{
+			const uint64_t pause    = DS::pause_count.load(std::memory_order_relaxed);
+			const uint64_t pause_ns = DS::pause_ns.load(std::memory_order_relaxed);
+			const uint64_t wait_ns  = DS::waitidle_ns.load(std::memory_order_relaxed);
+			const uint64_t bw       = DS::bufwait_count.load(std::memory_order_relaxed);
+			const uint64_t bw_ns    = DS::bufwait_ns.load(std::memory_order_relaxed);
+			const uint64_t ld_ns    = DS::labeldrain_ns.load(std::memory_order_relaxed);
+			const uint64_t incde    = DS::incde_count.load(std::memory_order_relaxed);
+			const uint64_t fault    = DS::fault_count.load(std::memory_order_relaxed);
+			const uint64_t cpf      = DS::cp_fault_count.load(std::memory_order_relaxed);
+			const uint64_t sub      = DS::submits_done.load(std::memory_order_relaxed);
+			std::printf("=== DRAIN/s frame=%d faults=%llu cpFaults=%llu submits=%llu "
+			            "pause=%llu(%.1fms) waitidle=%.1fms bufwait=%llu(%.1fms) labeldrain=%.1fms "
+			            "incDe=%llu ===\n",
+			            Libs::Graphics::WindowGetPresentedFrame(),
+			            static_cast<unsigned long long>(fault - p_fault),
+			            static_cast<unsigned long long>(cpf - p_cpf),
+			            static_cast<unsigned long long>(sub - p_sub),
+			            static_cast<unsigned long long>(pause - p_pause),
+			            static_cast<double>(pause_ns - p_pause_ns) / 1e6,
+			            static_cast<double>(wait_ns - p_wait_ns) / 1e6,
+			            static_cast<unsigned long long>(bw - p_bw),
+			            static_cast<double>(bw_ns - p_bw_ns) / 1e6,
+			            static_cast<double>(ld_ns - p_ld_ns) / 1e6,
+			            static_cast<unsigned long long>(incde - p_incde));
+			std::fflush(stdout);
+			p_pause = pause, p_pause_ns = pause_ns, p_wait_ns = wait_ns, p_bw = bw, p_bw_ns = bw_ns,
+			p_ld_ns = ld_ns, p_incde = incde, p_fault = fault, p_cpf = cpf, p_sub = sub;
+		}
 		// Persist the driver pipeline cache periodically so it survives even a hard kill.
 		if (++save_tick >= 15) {
 			save_tick = 0;

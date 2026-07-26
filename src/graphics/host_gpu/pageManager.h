@@ -40,6 +40,11 @@ public:
 	[[nodiscard]] bool     IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool     HasAnyMapping(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) const noexcept;
+	// Returns the number of contiguous bytes from vaddr (capped at max_size) that have the requested
+	// GPU access. Used to clamp effectively-unbounded buffer descriptors (num_records ~= 0xffffffff)
+	// to the range the guest actually made GPU-visible.
+	[[nodiscard]] uint64_t GpuAccessExtent(uint64_t vaddr, uint64_t max_size,
+	                                       GpuAccess access) const noexcept;
 
 	void UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
 	                        PageWatchMode mode = PageWatchMode::Write);

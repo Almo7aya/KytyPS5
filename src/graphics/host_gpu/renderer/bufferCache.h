@@ -78,6 +78,10 @@ public:
 	// True when a descriptor's base is entirely un-GPU-mapped, i.e. an unbound/stale descriptor the
 	// guest never made GPU-visible. Such a descriptor should bind a null resource, not fault.
 	[[nodiscard]] bool IsGpuUnmapped(uint64_t vaddr) const noexcept;
+	// Contiguous bytes from vaddr (capped at max_size) that the guest made GPU-visible for the given
+	// access. Clamps effectively-unbounded descriptors (num_records ~= 0xffffffff) to resident memory.
+	[[nodiscard]] uint64_t GpuAccessExtent(uint64_t vaddr, uint64_t max_size, bool is_read,
+	                                       bool is_written) const noexcept;
 	void SetTextureCache(TextureCache& texture_cache);
 
 	void ResetNullBuffer();

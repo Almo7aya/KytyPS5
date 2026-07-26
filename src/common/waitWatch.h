@@ -58,6 +58,39 @@ inline uint64_t NowMs() {
 	                                 .count());
 }
 
+inline uint64_t NowNs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+// Per-category timing of the synchronous GPU-drain paths so we can see where loading-time actually
+// goes: per-fault PauseSubmissions (split into wait-for-idle / buffer-wait / label-drain) vs the
+// per-DE-increment BufferWait vs readback downloads. All counters are cumulative; the watchdog prints
+// per-second deltas. Diagnostic only.
+namespace DrainStats {
+inline std::atomic<uint64_t> pause_count {0};   // PauseSubmissions (per-fault drain) invocations
+inline std::atomic<uint64_t> pause_ns {0};      // total time in PauseSubmissions
+inline std::atomic<uint64_t> waitidle_ns {0};   // time in WaitForIdle (part of the drain)
+inline std::atomic<uint64_t> bufwait_count {0}; // BufferWait invocations (all callers)
+inline std::atomic<uint64_t> bufwait_ns {0};    // total time in BufferWait
+inline std::atomic<uint64_t> labeldrain_ns {0}; // time in LabelDrain (part of the drain)
+inline std::atomic<uint64_t> incde_count {0};   // IncrementDe invocations
+inline std::atomic<uint64_t> fault_count {0};   // non-CP guest faults taking the drain path
+inline std::atomic<uint64_t> readback_count {0}; // faults that actually downloaded GPU data
+inline std::atomic<uint64_t> cp_fault_count {0}; // CP-path faults (inside the worker's Process)
+inline std::atomic<uint64_t> submits_done {0};   // GPU worker submissions completed (throughput)
+
+struct ScopedNs {
+	std::atomic<uint64_t>& sink;
+	uint64_t               start;
+	explicit ScopedNs(std::atomic<uint64_t>& s) : sink(s), start(NowNs()) {}
+	~ScopedNs() { sink.fetch_add(NowNs() - start, std::memory_order_relaxed); }
+	ScopedNs(const ScopedNs&)            = delete;
+	ScopedNs& operator=(const ScopedNs&) = delete;
+};
+} // namespace DrainStats
+
 struct ThreadWait {
 	std::atomic<uint64_t>    activity {0}; // bumped on every wait enter+exit; static => parked
 	std::atomic<const char*> kind {"start"};

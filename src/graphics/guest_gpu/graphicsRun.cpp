@@ -124,6 +124,8 @@ private:
 	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	void              RequestPauseAndWait();
+	void              ReleasePause();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -137,6 +139,12 @@ private:
 	uint32_t                                       m_submission_count = 0;
 	bool                                           m_processing       = false;
 	bool                                           m_graphics_done    = true;
+	bool                                           m_pause_requested  = false;
+	bool                                           m_worker_parked    = false;
+	Common::Mutex                                  m_pause_mutex;
+	Common::CondVar                                m_pause_cv;
+	uint32_t                                       m_pause_refs       = 0;
+	bool                                           m_done_waiting     = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
@@ -205,7 +213,18 @@ void Gpu::SubmitFlipPreparation() {
 
 void Gpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
+	// Done is the exclusive "writer": it needs the whole queue drained and sole access to the shared
+	// scheduler, the opposite of the shared fault "readers" that park the worker. Take m_pause_mutex,
+	// signal writer intent so new faults yield, wait for in-flight faults to drain, then do the full
+	// WaitLocked drain while holding the lock so no fault touches the scheduler concurrently.
+	Common::LockGuard pause_lock(m_pause_mutex);
+	m_done_waiting = true;
+	while (m_pause_refs != 0) {
+		m_pause_cv.Wait(&m_pause_mutex);
+	}
 	WaitLocked();
+	m_done_waiting = false;
+	m_pause_cv.SignalAll();
 	m_graphics_done = true;
 	m_done_num++;
 }
@@ -215,7 +234,10 @@ int Gpu::GetFrameNum() {
 }
 
 void Gpu::WaitLocked() {
-	WaitForIdle();
+	{
+		Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::waitidle_ns);
+		WaitForIdle();
+	}
 	m_gfx_cp->BufferWait();
 }
 
@@ -274,6 +296,8 @@ void CommandProcessor::BufferFlushAndWait() {
 }
 
 void CommandProcessor::BufferWait() {
+	Kyty::WaitWatch::DrainStats::bufwait_count.fetch_add(1, std::memory_order_relaxed);
+	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::bufwait_ns);
 	BufferInit();
 	GetScheduler().Finish();
 }
@@ -298,6 +322,7 @@ void CommandProcessor::WaitDeDiff(uint32_t diff) {
 }
 
 void CommandProcessor::IncrementDe() {
+	Kyty::WaitWatch::DrainStats::incde_count.fetch_add(1, std::memory_order_relaxed);
 	BufferWait();
 	m_de_count++;
 }
@@ -533,6 +558,27 @@ void Gpu::WaitForIdle() {
 	}
 }
 
+// Lightweight alternative to WaitForIdle for the per-fault drain: instead of waiting for the whole
+// guest-submission queue to drain (the measured loading-time sink -- ~940ms of every 1000ms), just
+// ask the worker to park after finishing its current Process. That is all the exclusivity the fault
+// handler's BufferWait needs against the shared scheduler; unprocessed queued submissions have not
+// touched GPU memory yet and are safe to leave for after the fault resolves. New guest submissions may
+// still enqueue while parked, but the worker will not process them until the pause is released.
+void Gpu::RequestPauseAndWait() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_pause_requested = true;
+	m_work_available.Signal();
+	while (!m_worker_parked) {
+		m_idle.Wait(&m_queue_mutex);
+	}
+}
+
+void Gpu::ReleasePause() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_pause_requested = false;
+	m_work_available.Signal();
+}
+
 void Gpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<Gpu*>(data);
 	EXIT_IF(gpu == nullptr);
@@ -544,10 +590,12 @@ void Gpu::ThreadRun(void* data) {
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			int               selected_queue = -1;
 			while (selected_queue < 0) {
-				while (gpu->m_submission_count == 0) {
-					gpu->m_processing = false;
+				while (gpu->m_submission_count == 0 || gpu->m_pause_requested) {
+					gpu->m_processing    = false;
+					gpu->m_worker_parked = true;
 					gpu->m_idle.Signal();
 					gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+					gpu->m_worker_parked = false;
 				}
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
 					const auto id = (gpu->m_next_queue + offset) % QueueCount;
@@ -575,6 +623,9 @@ void Gpu::ThreadRun(void* data) {
 		}
 
 		const bool complete = gpu->Process(submission);
+		if (complete) {
+			Kyty::WaitWatch::DrainStats::submits_done.fetch_add(1, std::memory_order_relaxed);
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -685,12 +736,29 @@ void Gpu::PauseSubmissions() {
 		EXIT("GPU submissions are already paused by this thread\n");
 	}
 	Kyty::WaitWatch::Scope watch("gpu_pause_lock", 0, 0);
+	Kyty::WaitWatch::DrainStats::pause_count.fetch_add(1, std::memory_order_relaxed);
+	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::pause_ns);
 	g_gpu_mutex_owned = true;
-	m_submission_mutex.Lock();
-	WaitLocked();
-	{
-		Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
-		LabelDrain();
+	// Coalesce concurrent faults into a single shared pause window. During level streaming ~16 engine
+	// threads fault at once; making each do its own park+BufferWait+LabelDrain serialized a thundering
+	// herd through one mutex. Instead the first faulter establishes the window (worker parked, GPU
+	// fenced, labels flushed) and concurrent faulters just ref-count in -- they still serialize their
+	// own cache invalidation on m_resource_mutex, but that is far cheaper than a full drain each.
+	Common::LockGuard lock(m_pause_mutex);
+	while (m_done_waiting) {
+		m_pause_cv.Wait(&m_pause_mutex);
+	}
+	if (m_pause_refs++ == 0) {
+		{
+			Kyty::WaitWatch::DrainStats::ScopedNs wt(Kyty::WaitWatch::DrainStats::waitidle_ns);
+			RequestPauseAndWait();
+		}
+		m_gfx_cp->BufferWait();
+		{
+			Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
+			Kyty::WaitWatch::DrainStats::ScopedNs lt(Kyty::WaitWatch::DrainStats::labeldrain_ns);
+			LabelDrain();
+		}
 	}
 }
 
@@ -698,7 +766,13 @@ void Gpu::ResumeSubmissions() {
 	if (!g_gpu_mutex_owned) {
 		EXIT("GPU submissions resumed without an active pause\n");
 	}
-	m_submission_mutex.Unlock();
+	{
+		Common::LockGuard lock(m_pause_mutex);
+		if (--m_pause_refs == 0) {
+			ReleasePause();
+			m_pause_cv.SignalAll();
+		}
+	}
 	g_gpu_mutex_owned = false;
 }
 

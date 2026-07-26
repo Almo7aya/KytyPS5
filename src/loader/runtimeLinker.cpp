@@ -524,6 +524,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		{ // KYTY_DIAG: characterize the unresolved GPU-aperture fault before crashing
+			const auto               av = info->access_violation_vaddr;
+			MEMORY_BASIC_INFORMATION mbi {};
+			const auto               q = VirtualQuery(reinterpret_cast<const void*>(av), &mbi, sizeof(mbi));
+			Libs::LibKernel::Memory::VirtualQueryInfo vqi {};
+			const int                kq = Libs::LibKernel::Memory::KernelVirtualQuery(
+                reinterpret_cast<const void*>(av), 0, &vqi, sizeof(vqi));
+			std::printf("KYTY_DIAG AV addr=0x%016llx os_q=%zu state=0x%08lx protect=0x%08lx "
+			            "base=0x%016llx rsize=0x%016llx | kq=%d kstart=0x%016llx kend=0x%016llx "
+			            "kprot=0x%08x kname=%s\n",
+			            static_cast<unsigned long long>(av), q,
+			            static_cast<unsigned long>(mbi.State), static_cast<unsigned long>(mbi.Protect),
+			            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)),
+			            static_cast<unsigned long long>(mbi.RegionSize), kq,
+			            static_cast<unsigned long long>(vqi.start),
+			            static_cast<unsigned long long>(vqi.end), vqi.protection, vqi.name);
+			std::fflush(stdout);
+		}
+#endif
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);
