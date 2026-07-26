@@ -170,8 +170,14 @@ static void WatchdogRun(void* /*unused*/) {
 	int      last_frame     = -1;
 	uint64_t last_change_ms = Kyty::WaitWatch::NowMs();
 	bool     dumped         = false;
+	int      save_tick      = 0;
 	for (;;) {
 		Common::Thread::Sleep(1000);
+		// Persist the driver pipeline cache periodically so it survives even a hard kill.
+		if (++save_tick >= 15) {
+			save_tick = 0;
+			Libs::Graphics::SavePipelineCache();
+		}
 		const int      frame = Libs::Graphics::WindowGetPresentedFrame();
 		const uint64_t now   = Kyty::WaitWatch::NowMs();
 		if (frame != last_frame) {

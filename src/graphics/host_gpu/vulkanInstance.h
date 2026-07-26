@@ -22,6 +22,7 @@ struct VulkanInstance {
 	vk::PhysicalDeviceProperties       physical_device_properties        = {};
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties = {};
 	vk::Device                         device                            = nullptr;
+	vk::PipelineCache                  pipeline_cache                    = nullptr;
 	VmaAllocator                       allocator                         = nullptr;
 	bool                               memory_budget_ext_enabled         = false;
 	bool                               rt_extensions_enabled             = false;

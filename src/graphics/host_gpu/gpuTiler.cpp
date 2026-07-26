@@ -345,7 +345,7 @@ void TileCompute::CreatePipeline(uint32_t pipeline_slot) {
 	info.layout           = resources.pipeline_layout;
 	vk::Pipeline pipeline = nullptr;
 	const auto   result =
-	    graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline);
+	    graphics.device.createComputePipelines(graphics.pipeline_cache, 1, &info, nullptr, &pipeline);
 	graphics.device.destroyShaderModule(module, nullptr);
 	RequireVulkanSuccess(result, "create GPU tiler pipeline");
 	resources.pipelines[pipeline_slot] = pipeline;

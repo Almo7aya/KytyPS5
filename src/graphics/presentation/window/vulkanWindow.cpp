@@ -43,6 +43,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -460,6 +462,61 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device) {
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
 	     static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
 	     graphics.subgroup_size_control_enabled ? "true" : "false");
+}
+
+static const char* PipelineCacheFilePath() {
+	// Persistent driver pipeline cache. Skips SPIR-V->ISA driver compilation of already-seen
+	// pipelines on subsequent launches, cutting startup time considerably.
+	return "_pipeline_cache.bin";
+}
+
+void VulkanCreatePipelineCache(GraphicContext& ctx) {
+	std::vector<uint8_t> initial;
+	if (std::ifstream in(PipelineCacheFilePath(), std::ios::binary); in) {
+		initial.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	}
+	vk::PipelineCacheCreateInfo info {};
+	info.initialDataSize = initial.size();
+	info.pInitialData    = initial.empty() ? nullptr : initial.data();
+	const auto result    = ctx.device.createPipelineCache(&info, nullptr, &ctx.pipeline_cache);
+	if (result != vk::Result::eSuccess) {
+		ctx.pipeline_cache = nullptr; // pipelines fall back to no cache
+		LOGF("VulkanCreatePipelineCache failed: %s\n", VulkanToString(result).c_str());
+		return;
+	}
+	LOGF("VulkanCreatePipelineCache: loaded %zu bytes from %s\n", initial.size(),
+	     PipelineCacheFilePath());
+}
+
+void SavePipelineCache() {
+	if (g_window_ctx == nullptr || g_window_ctx->graphic_ctx.device == nullptr ||
+	    g_window_ctx->graphic_ctx.pipeline_cache == nullptr) {
+		return;
+	}
+	auto&  ctx  = g_window_ctx->graphic_ctx;
+	size_t size = 0;
+	if (ctx.device.getPipelineCacheData(ctx.pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
+	    size == 0) {
+		return;
+	}
+	std::vector<uint8_t> data(size);
+	if (ctx.device.getPipelineCacheData(ctx.pipeline_cache, &size, data.data()) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	data.resize(size);
+	// Write to a temp file then rename, so a kill mid-write can't corrupt the cache.
+	const std::string tmp = std::string(PipelineCacheFilePath()) + ".tmp";
+	{
+		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+		if (!out) {
+			return;
+		}
+		out.write(reinterpret_cast<const char*>(data.data()),
+		          static_cast<std::streamsize>(data.size()));
+	}
+	std::remove(PipelineCacheFilePath());
+	std::rename(tmp.c_str(), PipelineCacheFilePath());
 }
 
 static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const VulkanExtensions& r,
@@ -941,6 +998,8 @@ void VulkanCreate(WindowContext& window) {
 	window.graphic_ctx.queue_family = queue_family;
 	window.graphic_ctx.device.getQueue(queue_family, 0, &window.graphic_ctx.queue);
 	EXIT_IF(window.graphic_ctx.queue == nullptr);
+
+	VulkanCreatePipelineCache(window.graphic_ctx);
 
 	if (!window.graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
