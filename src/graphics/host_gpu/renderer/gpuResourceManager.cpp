@@ -54,7 +54,10 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	}
 	// Stop command-processor jobs before taking the shared cache transaction. External readback
 	// workers inherit this paused state and therefore never form resource -> submission lock
-	// inversion.
+	// inversion. NOTE: this full drain is load-bearing for CPU->GPU ordering -- removing it (even
+	// though ~99.6% of faults need no readback) starves GPU WAIT_REG_MEM waits on guest sync values
+	// written by GPU label callbacks (the drain's LabelDrain flushes them), hanging the GPU at
+	// startup. A real fix must drain only for sync-relevant faults, which is a fault/lock redesign.
 	GraphicsRunSubmissionLock submissions;
 	ResourceMutex::FaultScope fault(m_resource_mutex);
 	return m_page_manager.HandleFault(access, fault_vaddr);
