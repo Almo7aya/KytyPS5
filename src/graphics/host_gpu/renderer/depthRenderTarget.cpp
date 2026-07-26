@@ -137,6 +137,18 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		}
 		return;
 	}
+	// Depth/stencil test or clear state can remain enabled after every backing address is unbound
+	// (Teardown leaves DB_Z_INFO/zfunc programmed with z_read_base_addr == 0). With no depth,
+	// stencil, or HTile address there is nothing to test, write, or clear, so drop the attachment
+	// instead of treating the leftover register state as fatal.
+	if (z.z_read_base_addr == 0 && z.z_write_base_addr == 0 && z.stencil_read_base_addr == 0 &&
+	    z.stencil_write_base_addr == 0 && z.htile_data_base_addr == 0) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: ignoring enabled depth/stencil state with no bound address\n");
+		}
+		return;
+	}
 	const bool has_stencil =
 	    z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid);
 	const bool has_htile = z.z_info.tile_surface_enable;
@@ -158,11 +170,15 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	}
 	// Prospero defines the compression-disable bits as tile writeback policy. Vulkan attachments
 	// expose the same logical depth/stencil values regardless of the driver's backing compression.
+	// plane_compression and tile_mode_index are backing/tiling policy that Vulkan abstracts (the
+	// attachment exposes the same logical depth values regardless of driver compression), and the
+	// depth footprint validation below independently checks the resolved pitch/size, so a real
+	// layout mismatch is still caught. embedded_sample_locations only shifts subpixel sample
+	// positions. Teardown programs all three on its main compressed depth buffer.
 	if ((stencil_active && !has_stencil) || rc.resummarize_enable || rc.copy_centroid ||
 	    rc.copy_sample != 0 || z.z_info.expclear_enabled || z.stencil_info.expclear_enabled ||
-	    z.z_info.embedded_sample_locations || z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.plane_compression != 0 ||
-	    z.z_info.num_mip_levels != 0 || z.z_info.tile_mode_index != 0 ||
+	    z.z_info.partially_resident || z.stencil_info.partially_resident ||
+	    z.z_info.num_mip_levels != 0 ||
 	    z.z_info.zrange_precision > 1 || z.depth_view.current_mip_level != 0 ||
 	    z.depth_info.addr5_swizzle_mask != 0 || z.depth_info.array_mode != 0 ||
 	    z.depth_info.pipe_config != 0 || z.depth_info.bank_width != 0 ||
@@ -179,9 +195,12 @@ void ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 	if (has_stencil) {
 		// Prospero defines Hi-Stencil as HTile-backed acceleration of the logical stencil plane.
 		// Keep the plane native in Vulkan while tracking HTile separately.
+		// stencil tile_mode_index and texture_compatible_stencil are backing/tiling policy that Vulkan
+		// abstracts (the stencil plane is kept native and is always host-sampleable); the depth
+		// footprint validation independently checks the resolved size, so a real layout mismatch is
+		// still caught.
 		if (z.stencil_info.format != Prospero::GpuEnumValue(Prospero::StencilFormat::k8UInt) ||
-		    z.stencil_info.tile_mode_index != 0 || z.stencil_info.tile_split != 0 ||
-		    !htile_stencil_compat || z.stencil_info.texture_compatible_stencil ||
+		    z.stencil_info.tile_split != 0 || !htile_stencil_compat ||
 		    z.stencil_read_base_addr == 0 ||
 		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
 		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
