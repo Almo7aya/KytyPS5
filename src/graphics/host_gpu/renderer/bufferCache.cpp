@@ -1231,6 +1231,11 @@ void BufferCache::ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read,
 	}
 }
 
+bool BufferCache::IsGpuUnmapped(uint64_t vaddr) const noexcept {
+	return vaddr != 0 && !m_page_manager.HasGpuAccess(vaddr, 1, GpuAccess::Read) &&
+	       !m_page_manager.HasGpuAccess(vaddr, 1, GpuAccess::Write);
+}
+
 void BufferCache::SetTextureCache(TextureCache& texture_cache) {
 	if (m_texture_cache != nullptr) {
 		EXIT("BufferCache: texture cache already connected\n");

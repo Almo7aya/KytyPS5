@@ -135,6 +135,13 @@ static BufferView NativeStorageBuffer(uint64_t submit_id, CommandBuffer& command
 		BindNullStorageBuffer(command_buffer, result);
 		return result;
 	}
+	// An unbound/stale descriptor points at memory the guest never made GPU-visible. The shader
+	// references it but must not access it (an unbound UAV write is dropped on hardware); bind a
+	// null buffer instead of faulting, mirroring how null image descriptors bind a dummy image.
+	if (GetRenderContext().GetBufferCache().IsGpuUnmapped(address)) {
+		BindNullStorageBuffer(command_buffer, result);
+		return result;
+	}
 	const auto& graphics  = GetRenderContext().GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||
