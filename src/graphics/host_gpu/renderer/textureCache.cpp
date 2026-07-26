@@ -1230,6 +1230,7 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 			case RenderTargetOverlap::RetireStorage:
 			case RenderTargetOverlap::PreserveStorage:
 			case RenderTargetOverlap::ExpandTarget:
+			case RenderTargetOverlap::RecreateTarget:
 			case RenderTargetOverlap::MaterializeRetireTarget:
 			case RenderTargetOverlap::MaterializeRetireStorage:
 			case RenderTargetOverlap::Unsupported:
@@ -1993,6 +1994,7 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	std::vector<std::shared_ptr<CachedImage>> materialized_target_sources;
 	std::vector<std::shared_ptr<CachedImage>> materialized_storage_sources;
 	std::shared_ptr<CachedImage>              native_image_source;
+	bool                                      native_target_expansion = false;
 	for (const auto& entry: m_images) {
 		auto& cached = *entry;
 		if (!cached.OverlapsRange(info.address, info.size, true)) {
@@ -2054,7 +2056,16 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 				supported = cached.kind == CachedImage::Kind::RenderTarget &&
 				            native_image_source == nullptr;
 				if (supported) {
-					native_image_source = entry;
+					native_image_source     = entry;
+					native_target_expansion = true;
+				}
+				break;
+			case RenderTargetOverlap::RecreateTarget:
+				supported = cached.kind == CachedImage::Kind::RenderTarget &&
+				            native_image_source == nullptr;
+				if (supported) {
+					native_image_source     = entry;
+					native_target_expansion = false;
 				}
 				break;
 			case RenderTargetOverlap::RetireTarget:
@@ -2087,13 +2098,17 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 			EXIT("TextureCache: unsupported render-target alias, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " existing_kind=%u existing=0x%016" PRIx64 "+0x%016" PRIx64
 			     " gpu_modified=%d"
-			     " sampled_format=%u extent=%ux%ux%u pitch=%u levels=%u base_level=%u"
-			     " tile=%u type=%u base_array=%u\n",
+			     " requested_info={format=%d extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u"
+			     " samples=%u tile=%u}"
+			     " existing_target={format=%d extent=%ux%u pitch=%u bpe=%u levels=%u layers=%u"
+			     " samples=%u tile=%u}\n",
 			     info.address, info.size, static_cast<uint32_t>(cached.kind), cached.Address(),
-			     cached.Size(), cached.gpu_modified, cached.info.format, cached.info.width,
-			     cached.info.height, cached.info.depth, cached.info.pitch, cached.info.levels,
-			     cached.info.base_level, cached.info.tile, cached.info.type,
-			     cached.info.base_array);
+			     cached.Size(), cached.gpu_modified, static_cast<int>(info.format), info.width,
+			     info.height, info.pitch, info.bytes_per_element, info.levels, info.layers,
+			     info.samples, info.tile_mode, static_cast<int>(cached.target.format),
+			     cached.target.width, cached.target.height, cached.target.pitch,
+			     cached.target.bytes_per_element, cached.target.levels, cached.target.layers,
+			     cached.target.samples, cached.target.tile_mode);
 		}
 		retire.push_back(&cached);
 	}
@@ -2126,7 +2141,8 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	const bool preserve_native = native_image_source != nullptr;
 	if (preserve_native) {
 		command.RetainResourceUntilFence(native_image_source);
-		if (native_image_source->kind == CachedImage::Kind::RenderTarget) {
+		if (native_image_source->kind == CachedImage::Kind::RenderTarget &&
+		    native_target_expansion) {
 			const auto& old          = native_image_source->target;
 			const auto  tail_address = info.address + old.size;
 			const auto  tail_size    = info.size - old.size;
@@ -2144,11 +2160,20 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 				        info.layers - old.layers, false);
 			    });
 		}
-		std::vector<ImageImageCopy> regions;
-		regions.reserve(static_cast<size_t>(native_image_source->image->layers) *
-		                native_image_source->image->mip_levels);
-		AppendLayerCopies(regions, *native_image_source->image, vk::ImageAspectFlagBits::eColor);
-		Transfer::CopyImage(command, regions, *cached->image, RENDER_COLOR_IMAGE_LAYOUT);
+		if (native_image_source->kind == CachedImage::Kind::RenderTarget &&
+		    !native_target_expansion) {
+			Transfer::CopyImageViaBuffer(
+			    command, *native_image_source->image, vk::ImageAspectFlagBits::eColor,
+			    *cached->image, vk::ImageAspectFlagBits::eColor, info.bytes_per_element,
+			    RENDER_COLOR_IMAGE_LAYOUT);
+		} else {
+			std::vector<ImageImageCopy> regions;
+			regions.reserve(static_cast<size_t>(native_image_source->image->layers) *
+			                native_image_source->image->mip_levels);
+			AppendLayerCopies(regions, *native_image_source->image,
+			                  vk::ImageAspectFlagBits::eColor);
+			Transfer::CopyImage(command, regions, *cached->image, RENDER_COLOR_IMAGE_LAYOUT);
+		}
 	} else {
 		if (info.samples > 1) {
 			if (!IsCoherentGuestImageSource(target_source, info.address, info.size) ||
@@ -2423,6 +2448,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 	std::shared_ptr<CachedImage>              native_depth_source;
 	std::shared_ptr<CachedImage>              discarded_depth_source;
 	std::shared_ptr<CachedImage>              retired_storage_source;
+	std::shared_ptr<CachedImage>              preserved_storage_source;
 	std::vector<std::shared_ptr<CachedImage>> recreated_target_sources;
 	std::vector<std::shared_ptr<CachedImage>> discarded_pool_sources;
 	for (const auto& entry: m_images) {
@@ -2505,16 +2531,28 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				break;
 			case DepthOverlap::RetireStorage:
 				supported = cached.kind == CachedImage::Kind::StorageTexture &&
-				            retired_storage_source == nullptr && native_depth_source == nullptr &&
+				            retired_storage_source == nullptr &&
+				            preserved_storage_source == nullptr && native_depth_source == nullptr &&
 				            discarded_depth_source == nullptr && recreated_target_sources.empty() &&
 				            discarded_pool_sources.empty();
 				if (supported) {
 					retired_storage_source = entry;
 				}
 				break;
+			case DepthOverlap::PreserveStorage:
+				supported = cached.kind == CachedImage::Kind::StorageTexture &&
+				            preserved_storage_source == nullptr &&
+				            retired_storage_source == nullptr && native_depth_source == nullptr &&
+				            discarded_depth_source == nullptr && recreated_target_sources.empty() &&
+				            discarded_pool_sources.empty();
+				if (supported) {
+					preserved_storage_source = entry;
+				}
+				break;
 			case DepthOverlap::ExpandTarget:
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            native_depth_source == nullptr && retired_storage_source == nullptr &&
+				            preserved_storage_source == nullptr &&
 				            recreated_target_sources.empty() && discarded_pool_sources.empty();
 				if (supported) {
 					native_depth_source = entry;
@@ -2524,6 +2562,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            discarded_depth_source == nullptr && native_depth_source == nullptr;
 				supported = supported && retired_storage_source == nullptr &&
+				            preserved_storage_source == nullptr &&
 				            recreated_target_sources.empty() && discarded_pool_sources.empty();
 				if (supported) {
 					discarded_depth_source = entry;
@@ -2536,7 +2575,7 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				supported = cached.kind == CachedImage::Kind::DepthTarget &&
 				            native_depth_source == nullptr && discarded_depth_source == nullptr &&
 				            retired_storage_source == nullptr && sampled_depth_source == nullptr &&
-				            recreated_target_sources.empty();
+				            preserved_storage_source == nullptr && recreated_target_sources.empty();
 				if (supported) {
 					discarded_pool_sources.push_back(entry);
 				}
@@ -2545,7 +2584,8 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 				supported = (cached.kind == CachedImage::Kind::DepthTarget ||
 				             cached.kind == CachedImage::Kind::RenderTarget) &&
 				            native_depth_source == nullptr && discarded_depth_source == nullptr &&
-				            retired_storage_source == nullptr && discarded_pool_sources.empty();
+				            retired_storage_source == nullptr &&
+				            preserved_storage_source == nullptr && discarded_pool_sources.empty();
 				if (supported) {
 					recreated_target_sources.push_back(entry);
 				}
@@ -2582,9 +2622,11 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		command.RetainResourceUntilFence(source);
 	}
 	const auto* transition_source =
-	    native_depth_source != nullptr
-	        ? native_depth_source.get()
-	        : (discarded_depth_source != nullptr ? discarded_depth_source.get() : nullptr);
+	    preserved_storage_source != nullptr
+	        ? preserved_storage_source.get()
+	        : (native_depth_source != nullptr
+	               ? native_depth_source.get()
+	               : (discarded_depth_source != nullptr ? discarded_depth_source.get() : nullptr));
 	RetireDepthMetadataLocked(retire, info.htile_address);
 	RetireImages(retire, transition_source);
 	const bool coherent_guest_stencil =
@@ -2600,7 +2642,8 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		     info.stencil_address, info.stencil_size);
 	}
 	if (info.samples > 1 && (native_depth_source != nullptr || sampled_depth_source != nullptr ||
-	                         retired_storage_source != nullptr)) {
+	                         retired_storage_source != nullptr ||
+	                         preserved_storage_source != nullptr)) {
 		EXIT("TextureCache: multisampled depth native transition is unsupported, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " samples=%u\n",
 		     info.address, info.size, info.samples);
@@ -2634,6 +2677,9 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 	}
 	if (retired_storage_source != nullptr) {
 		command.RetainResourceUntilFence(retired_storage_source);
+	}
+	if (preserved_storage_source != nullptr) {
+		command.RetainResourceUntilFence(preserved_storage_source);
 	}
 	if (native_depth_source != nullptr) {
 		const auto& old = native_depth_source->depth;
@@ -2698,17 +2744,35 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 			}
 			return static_cast<DepthStencilVulkanImage&>(PublishImage(command, std::move(cached)));
 		}
-		if (sampled_depth_source != nullptr &&
-		    (sampled_depth_source->image->type != VulkanImageType::Texture ||
-		     sampled_depth_source->image->format != VulkanFormat(info.guest_format) ||
-		     sampled_depth_source->image->extent.width != info.width ||
-		     sampled_depth_source->image->extent.height != info.height)) {
-			EXIT("TextureCache: sampled-depth native source is inconsistent\n");
+		const auto native_color_source =
+		    preserved_storage_source != nullptr ? preserved_storage_source : sampled_depth_source;
+		if (native_color_source != nullptr) {
+			const auto expected_type =
+			    preserved_storage_source != nullptr ? VulkanImageType::StorageTexture
+			                                        : VulkanImageType::Texture;
+			if (native_color_source->image->type != expected_type ||
+			    native_color_source->image->format != VulkanFormat(info.guest_format) ||
+			    native_color_source->image->extent.width != info.width ||
+			    native_color_source->image->extent.height != info.height ||
+			    native_color_source->image->layers != 1 ||
+			    native_color_source->image->mip_levels != 1 ||
+			    native_color_source->image->samples != 1) {
+				EXIT("TextureCache: color-to-depth native source is inconsistent, kind=%u "
+				     "type=%u format=%d extent=%ux%u layers=%u levels=%u samples=%u\n",
+				     static_cast<uint32_t>(native_color_source->kind),
+				     static_cast<uint32_t>(native_color_source->image->type),
+				     static_cast<int>(native_color_source->image->format),
+				     native_color_source->image->extent.width,
+				     native_color_source->image->extent.height,
+				     native_color_source->image->layers,
+				     native_color_source->image->mip_levels,
+				     native_color_source->image->samples);
+			}
 		}
 		const auto transition_source = SelectDepthTransitionSource(
-		    info.depth_load_clear, sampled_depth_source != nullptr,
-		    sampled_depth_source != nullptr && sampled_depth_source->info.IsCpuDirty(),
-		    sampled_depth_source != nullptr && sampled_depth_source->buffer_modified,
+		    info.depth_load_clear, native_color_source != nullptr,
+		    native_color_source != nullptr && native_color_source->info.IsCpuDirty(),
+		    native_color_source != nullptr && native_color_source->buffer_modified,
 		    depth_buffer_overlap, depth_source.cpu_dirty);
 		m_memory_tracker.ForEachUploadRange(
 		    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -2720,14 +2784,17 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 					                        info, depth_source, false);
 					    break;
 				    case DepthTransitionSource::Native:
-					    command.RetainResourceUntilFence(sampled_depth_source);
+					    command.RetainResourceUntilFence(native_color_source);
 					    Transfer::CopyImageViaBuffer(
-					        command, *sampled_depth_source->image, vk::ImageAspectFlagBits::eColor,
+					        command, *native_color_source->image, vk::ImageAspectFlagBits::eColor,
 					        *cached->image, vk::ImageAspectFlagBits::eDepth, info.bytes_per_element,
 					        vk::ImageLayout::eDepthStencilAttachmentOptimal);
 					    break;
 			    }
 		    });
+		if (preserved_storage_source != nullptr) {
+			cached->gpu_modified = true;
+		}
 		if (has_stencil) {
 			m_memory_tracker.ForEachUploadRange(
 			    info.stencil_address, info.stencil_size, false, [](uint64_t, uint64_t) noexcept {},
@@ -3663,7 +3730,9 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 
 DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& command,
                                                               uint64_t vaddr, uint64_t size,
-                                                              bool allow_containing_sampled) {
+                                                              bool allow_containing_sampled,
+                                                              vk::ImageAspectFlagBits*
+                                                                  sampled_aspect) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("TextureCache: invalid depth-target range query, addr=0x%016" PRIx64
@@ -3672,6 +3741,7 @@ DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& com
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	CachedImage*         found = nullptr;
+	DepthTargetPlane     found_plane = DepthTargetPlane::None;
 	for (auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
 		if (cached->kind != CachedImage::Kind::DepthTarget ||
 		    !cached->OverlapsRange(vaddr, size, false)) {
@@ -3679,8 +3749,8 @@ DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& com
 		}
 		const bool containing_sampled =
 		    allow_containing_sampled && vaddr == cached->depth.address && size > cached->depth.size;
-		if ((!IsDepthTargetRangeCompatible(cached->depth, vaddr, size) && !containing_sampled) ||
-		    found != nullptr) {
+		const auto plane = ClassifyDepthTargetViewRange(cached->depth, vaddr, size);
+		if ((plane == DepthTargetPlane::None && !containing_sampled) || found != nullptr) {
 			EXIT("TextureCache: incompatible or ambiguous depth-target range, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " cached=0x%016" PRIx64 "+0x%016" PRIx64 " previous=%p\n",
 			     vaddr, size, cached->depth.address, cached->depth.size,
@@ -3689,14 +3759,13 @@ DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& com
 		if (containing_sampled) {
 			return nullptr;
 		}
-		const bool stencil_range =
-		    vaddr == cached->depth.stencil_address && size == cached->depth.stencil_size;
-		if (stencil_range && !cached->stencil_initialized) {
+		if (plane == DepthTargetPlane::Stencil && !cached->stencil_initialized) {
 			EXIT("TextureCache: sampled stencil range is uninitialized, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 "\n",
 			     vaddr, size);
 		}
-		found = cached;
+		found       = cached;
+		found_plane = plane;
 	}
 	if (found == nullptr) {
 		return nullptr;
@@ -3707,6 +3776,11 @@ DepthStencilVulkanImage* TextureCache::FindDepthTargetByRange(CommandBuffer& com
 		EXIT("TextureCache: page-table depth target has no cache owner\n");
 	}
 	command.RetainResourceUntilFence(*owner);
+	if (sampled_aspect != nullptr) {
+		*sampled_aspect = found_plane == DepthTargetPlane::Stencil
+		                      ? vk::ImageAspectFlagBits::eStencil
+		                      : vk::ImageAspectFlagBits::eDepth;
+	}
 	return static_cast<DepthStencilVulkanImage*>(found->image);
 }
 

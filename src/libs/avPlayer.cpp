@@ -1,4 +1,5 @@
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -617,6 +618,14 @@ public:
 		if (!video_id && !audio_id) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
+		if (Config::AvPlayerSkipEnabled()) {
+			skipped_playback = true;
+			eof              = true;
+			start_time_ms    = std::max(ms, PlaybackDuration());
+			clock_start      = std::chrono::steady_clock::now();
+			::printf("AvPlayer playback skipped\n");
+			return 0;
+		}
 		if (!OpenCodecs()) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
@@ -642,7 +651,7 @@ public:
 	}
 	int Stop() {
 		std::lock_guard lock(mutex);
-		bool            was_playing_video = !stopped && video_id.has_value();
+		bool was_playing_video = !stopped && !skipped_playback && video_id.has_value();
 		StopNoLock(true);
 		if (was_playing_video) {
 			::printf("AvPlayer video stopped\n");
@@ -668,6 +677,9 @@ public:
 		if (stopped) {
 			return 0;
 		}
+		if (skipped_playback) {
+			return start_time_ms;
+		}
 		using namespace std::chrono;
 		auto now = paused ? pause_time : steady_clock::now();
 		return start_time_ms +
@@ -676,6 +688,11 @@ public:
 	}
 	int Jump(uint64_t ms) {
 		std::lock_guard lock(mutex);
+		if (skipped_playback) {
+			start_time_ms = std::max(ms, PlaybackDuration());
+			eof           = true;
+			return 0;
+		}
 		SeekNoLock(ms);
 		start_time_ms = ms;
 		clock_start   = std::chrono::steady_clock::now();
@@ -793,6 +810,7 @@ private:
 			avcodec_free_context(&audio_ctx);
 		}
 		eof                      = true;
+		skipped_playback         = false;
 		seek_video_frame_pending = false;
 		if (mark) {
 			stopped = true;
@@ -968,6 +986,16 @@ private:
 		return s->duration != AV_NOPTS_VALUE
 		           ? to_ms(s->duration, s->time_base)
 		           : (fmt->duration > 0 ? static_cast<uint64_t>(fmt->duration / 1000) : 0);
+	}
+	uint64_t PlaybackDuration() const {
+		uint64_t duration = 0;
+		if (video_id) {
+			duration = std::max(duration, Duration(fmt->streams[video_id.value()]));
+		}
+		if (audio_id) {
+			duration = std::max(duration, Duration(fmt->streams[audio_id.value()]));
+		}
+		return duration;
 	}
 	uint32_t VideoPitch(AVStream* s) const { return align_up(Width(s), 256u); }
 	uint32_t VideoBufferSize(AVStream* s) const { return VideoPitch(s) * Height(s) * 3 / 2; }
@@ -1199,6 +1227,7 @@ private:
 	bool                                     stopped                  = true;
 	bool                                     paused                   = false;
 	bool                                     eof                      = true;
+	bool                                     skipped_playback         = false;
 	bool                                     seek_video_frame_pending = false;
 	bool                                     loop                     = false;
 	int32_t                                  trick_speed              = AVPLAYER_TRICK_SPEED_NORMAL;

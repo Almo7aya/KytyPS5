@@ -35,7 +35,9 @@ ResolveTargetTextureView(const ShaderRecompiler::IR::ImageResource& resource,
                          Prospero::ImageType type, uint32_t base_layer, uint32_t image_layers);
 
 [[nodiscard]] bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
-                                                    const VulkanImage&           image);
+                                                    const VulkanImage& image,
+                                                    vk::ImageAspectFlagBits aspect =
+                                                        vk::ImageAspectFlagBits::eDepth);
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor);
 [[nodiscard]] bool
 IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,

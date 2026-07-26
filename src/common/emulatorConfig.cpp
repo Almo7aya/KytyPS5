@@ -93,4 +93,8 @@ bool NggRectlistDrawEnabled() {
 	return g_config->ngg_rectlist_draw_enabled;
 }
 
+bool AvPlayerSkipEnabled() {
+	return g_config->avplayer_skip_enabled;
+}
+
 } // namespace Config

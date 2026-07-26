@@ -76,6 +76,7 @@ struct TextureImageCreateParams {
 	TextureFormatUsage       view_usage               = TextureFormatUsage::Sampled;
 	TextureUploadDestination image_layout             = TextureUploadDestination::MipLevels;
 	bool                     allow_cube_view          = false;
+	bool                     cube_compatible_backing  = false;
 	bool                     compatible_format_views  = false;
 	bool                     storage_swizzle_fallback = false;
 	const char*              owner                    = nullptr;

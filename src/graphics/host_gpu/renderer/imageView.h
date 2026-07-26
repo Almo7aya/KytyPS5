@@ -165,8 +165,17 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
-                                                      uint32_t   swizzle) noexcept {
-	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
+                                                      uint32_t swizzle,
+                                                      vk::ImageAspectFlagBits aspect =
+                                                          vk::ImageAspectFlagBits::eDepth) noexcept {
+	const bool format_supported =
+	    aspect == vk::ImageAspectFlagBits::eDepth
+	        ? IsSupportedSampledDepthFormat(image_format, view_format)
+	        : (aspect == vk::ImageAspectFlagBits::eStencil &&
+	           IsSupportedSampledStencilFormat(
+	               image_format, Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt),
+	               view_format));
+	if (!format_supported) {
 		return false;
 	}
 	switch (swizzle) {
@@ -178,12 +187,16 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 }
 
 [[nodiscard]] inline uint32_t
-SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t swizzle) noexcept {
-	if (IsSupportedSampledDepthView(image_format, view_format, swizzle)) {
+SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t swizzle,
+                       vk::ImageAspectFlagBits aspect =
+                           vk::ImageAspectFlagBits::eDepth) noexcept {
+	if (IsSupportedSampledDepthView(image_format, view_format, swizzle, aspect)) {
 		return swizzle;
 	}
-	EXIT("unsupported sampled depth image view: image_format=%d view_format=%d swizzle=0x%03x\n",
-	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
+	EXIT("unsupported sampled depth image view: image_format=%d view_format=%d aspect=0x%x"
+	     " swizzle=0x%03x\n",
+	     static_cast<int>(image_format), static_cast<int>(view_format),
+	     static_cast<uint32_t>(aspect), swizzle);
 }
 
 [[nodiscard]] inline bool
@@ -198,7 +211,8 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 [[nodiscard]] inline bool
 IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	return resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint &&
-	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
 	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic && !resource.depth_compare;
 }

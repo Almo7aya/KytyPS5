@@ -10654,6 +10654,11 @@ void CheckSampledDepthResource() {
   Require("SampledDepthResource", "integer reinterpret resource",
           IsSupportedSampledDepthUintResource(resource),
           "read-only uint depth reinterpretation resource was rejected");
+  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  Require("SampledDepthResource", "integer array/stencil resource",
+          IsSupportedSampledDepthUintResource(resource),
+          "read-only uint depth/stencil array resource was rejected");
+  resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   Require("SampledDepthResource", "D32 to R32_UINT",
           IsDepthUintTextureReinterpretation(
               vk::Format::eD32Sfloat,
@@ -10738,6 +10743,40 @@ void CheckSampledDepthDescriptor() {
       (descriptor.fields[3] & ~(0xfu << 28u)) |
       (Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) << 28u);
 
+  ShaderTextureResource stencil_descriptor{{
+      0x20023c00u, 0xc0500000u, 0x01d8c347u, 0x91800204u,
+      0x00000000u, 0x00700000u, 0x00000000u, 0x00000000u}};
+  DepthStencilVulkanImage stencil_image;
+  stencil_image.extent = {
+      static_cast<uint32_t>(stencil_descriptor.Width5()) + 1u,
+      static_cast<uint32_t>(stencil_descriptor.Height5()) + 1u};
+  stencil_image.guest_pitch = 3456;
+  stencil_image.layers = 1;
+  stencil_image.format = vk::Format::eD32SfloatS8Uint;
+  Require(
+      "SampledDepthDescriptor", "captured S8 plane",
+      stencil_descriptor.Format() ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+          TileGetTexturePitch(
+              stencil_descriptor.Format(), stencil_image.extent.width, 1,
+              stencil_descriptor.TileMode()) == 3584 &&
+          IsSupportedDepthTextureEncoding(stencil_descriptor) &&
+          IsSupportedDepthTargetDescriptor(
+              stencil_descriptor, stencil_image,
+              vk::ImageAspectFlagBits::eStencil) &&
+          !IsSupportedDepthTargetDescriptor(
+              stencil_descriptor, stencil_image,
+              vk::ImageAspectFlagBits::eDepth) &&
+          IsSupportedSampledDepthAspectFormat(
+              stencil_image.format, stencil_descriptor.Format(),
+              vk::Format::eR8Uint, vk::ImageAspectFlagBits::eStencil) &&
+          IsSupportedSampledDepthView(
+              stencil_image.format, vk::Format::eR8Uint,
+              stencil_descriptor.DstSelXYZW(),
+              vk::ImageAspectFlagBits::eStencil),
+      "captured k8UInt stencil descriptor did not resolve to the combined "
+      "depth/stencil image's stencil aspect");
+
   ShaderTextureResource cube_descriptor{{0x01267d00u, 0xc0700000u, 0x00ffc0ffu,
                                          0xb1800924u, 0x00000005u, 0x00700000u,
                                          0x00000000u, 0x00000000u}};
@@ -10811,6 +10850,19 @@ void CheckSampledDepthDescriptor() {
       Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
   target.format = vk::Format::eD32Sfloat;
   target.tile_mode = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  target.stencil_address = 0x20023c0000ull;
+  target.stencil_size = 0x700000;
+  Require(
+      "SampledDepthDescriptor", "depth/stencil range classification",
+      ClassifyDepthTargetViewRange(target, target.address, target.size) ==
+              DepthTargetPlane::Depth &&
+          ClassifyDepthTargetViewRange(target, target.stencil_address,
+                                       target.stencil_size) ==
+              DepthTargetPlane::Stencil &&
+          ClassifyDepthTargetViewRange(target, target.stencil_address,
+                                       target.stencil_size - TRACKER_PAGE_SIZE) ==
+              DepthTargetPlane::None,
+      "depth-target lookup did not distinguish its depth and stencil planes");
   ImageInfo expanded{};
   expanded.address = target.address;
   expanded.size = 0x400000;
@@ -11980,6 +12032,7 @@ void CheckStorageTextureSampledReuse() {
   const auto image_2d_array =
       Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
   const auto image_3d = Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
+  const auto image_cube = Prospero::GpuEnumValue(Prospero::ImageType::kCube);
   Require(
       "StorageTextureSampledReuse", "view shapes",
       SelectStorageSampledViewShape(image_2d, 1, 1) ==
@@ -11988,11 +12041,17 @@ void CheckStorageTextureSampledReuse() {
               StorageSampledViewShape::Image2DArray &&
           SelectStorageSampledViewShape(image_3d, 16, 1) ==
               StorageSampledViewShape::Image3D &&
+          SelectStorageSampledViewShape(image_cube, 6, 6) ==
+              StorageSampledViewShape::ImageCube &&
+          SelectStorageSampledViewShape(image_cube, 12, 12) ==
+              StorageSampledViewShape::ImageCube &&
           SelectStorageSampledViewShape(image_2d, 16, 1) ==
               StorageSampledViewShape::Unsupported &&
           SelectStorageSampledViewShape(image_2d_array, 16, 1) ==
               StorageSampledViewShape::Unsupported &&
           SelectStorageSampledViewShape(image_3d, 16, 16) ==
+              StorageSampledViewShape::Unsupported &&
+          SelectStorageSampledViewShape(image_cube, 6, 1) ==
               StorageSampledViewShape::Unsupported,
       "sampled storage view shape or backing-layer validation is incorrect");
   ImageInfo storage{};
@@ -12069,6 +12128,39 @@ void CheckStorageTextureSampledReuse() {
               false, false, false,
               true) == StorageSampledOverlap::ExactImage,
       "single-layer array storage backing did not accept an equivalent 2D sampled view");
+  ImageInfo cube_storage{};
+  cube_storage.address = 0x2059c80000ull;
+  cube_storage.size = 0x102000;
+  cube_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UInt);
+  cube_storage.width = 128;
+  cube_storage.height = 128;
+  cube_storage.pitch = 128;
+  cube_storage.levels = 8;
+  cube_storage.view_levels = 1;
+  cube_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB);
+  cube_storage.swizzle = DstSel(4, 5, 6, 7);
+  cube_storage.depth = 6;
+  cube_storage.type = image_2d_array;
+  auto sampled_cube = cube_storage;
+  sampled_cube.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float);
+  sampled_cube.view_levels = 8;
+  sampled_cube.type = image_cube;
+  Require(
+      "StorageTextureSampledReuse", "RGBA16 cube storage view",
+      HasSampleCompatibleStorageImageBacking(sampled_cube, cube_storage) &&
+          IsRgba16UintFloatReinterpretation(
+              vk::Format::eR16G16B16A16Uint,
+              vk::Format::eR16G16B16A16Sfloat) &&
+          ClassifyStorageSampledOverlap(
+              sampled_cube, cube_storage,
+              vk::Format::eR16G16B16A16Sfloat,
+              vk::Format::eR16G16B16A16Uint, true, false, false, false,
+              true) == StorageSampledOverlap::ExactImage,
+      "GPU-owned RGBA16_UINT array backing did not accept its RGBA16_FLOAT "
+      "cube sampled view");
   auto incompatible = storage;
   incompatible.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UNorm);
@@ -12406,6 +12498,32 @@ void CheckStorageTextureDepthAlias() {
       "StorageTextureDepthAlias", "D16/R16 main plane",
       IsMaterializableStorageDepthAlias(d16_storage, d16_depth),
       "one-layer R16 storage could not materialize its matching D16 depth allocation");
+  d16_depth.depth_access = true;
+  Require(
+      "StorageTextureDepthAlias", "GPU D16/R16 preservation",
+      ClassifyStorageDepthOverlap(d16_storage, true, false, false, true,
+                                  d16_depth) ==
+          DepthOverlap::PreserveStorage,
+      "GPU-written R16 storage was not selected as the native D16 load source");
+  auto cleared_d16_depth = d16_depth;
+  cleared_d16_depth.depth_load_clear = true;
+  Require(
+      "StorageTextureDepthAlias", "cleared D16/R16 transition",
+      ClassifyStorageDepthOverlap(d16_storage, true, false, false, true,
+                                  cleared_d16_depth) ==
+          DepthOverlap::RetireStorage,
+      "a cleared D16 target unnecessarily preserved old R16 storage contents");
+  Require(
+      "StorageTextureDepthAlias", "GPU D16/R16 ownership guards",
+      ClassifyStorageDepthOverlap(d16_storage, true, true, false, true,
+                                  d16_depth) == DepthOverlap::Unsupported &&
+          ClassifyStorageDepthOverlap(d16_storage, true, false, true, true,
+                                      d16_depth) ==
+              DepthOverlap::Unsupported &&
+          ClassifyStorageDepthOverlap(d16_storage, true, false, false, false,
+                                      d16_depth) ==
+              DepthOverlap::Unsupported,
+      "an incoherent R16 storage owner was accepted as a D16 native source");
   auto wrong_d16_format = d16_storage;
   wrong_d16_format.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt);
@@ -14083,6 +14201,13 @@ void CheckImageOverlapResolution() {
                                           incompatible_same_shape_target) ==
                   RenderTargetOverlap::RetireTarget,
           "clean incompatible render-target format was not recreated");
+  Require(
+      "ImageOverlapResolution", "render target GPU format recreation",
+      ClassifyRenderTargetOverlap(old_target, true, false, true, true,
+                                  incompatible_same_shape_target) ==
+          RenderTargetOverlap::RecreateTarget,
+      "GPU-owned exact render-target allocation was not preserved across a "
+      "size-compatible format recreation");
 
   RenderTargetInfo ppsa02604_unorm_target{};
   ppsa02604_unorm_target.address = 0x79c50000ull;

@@ -18,14 +18,14 @@
             "request": "launch",
             "program": "${workspaceFolder}\\_Build\\vscode-clang\\kyty_emulator.exe",
             "args": [
-                "--game", "D:/gamesps5/PPSA07429",
-                "--printf-direction", "File",
+                "--game", "Z:\\projects\\PS5\\[SuperPSX]-Greak.Memories.of.Azur-PPSA02849-EUR-Game-(v01.003)-PS5\\[SuperPSX]-Greak.Memories.of.Azur-PPSA02849-EUR-Game-(v01.003)-PS5\\eboot.bin",
+                "--printf-direction", "Silent",
                 "--graphics-debug-dump", "True"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}\\_Build\\vscode-clang",
             "environment": [],
-            "externalConsole": true
+            "externalConsole": false
         },
         {
             "name": "Attach to running kyty_emulator",

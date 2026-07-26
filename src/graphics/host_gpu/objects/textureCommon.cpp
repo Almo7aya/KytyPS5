@@ -451,10 +451,11 @@ vk::ComponentMapping TextureCreateImage(VulkanImage& vk_obj,
 	vk::ImageCreateInfo image_info {};
 	image_info.sType = vk::StructureType::eImageCreateInfo;
 	image_info.pNext = nullptr;
+	const bool cube_compatible =
+	    (params.allow_cube_view && TextureCanCreateCubeView(params.type, 0, params.depth)) ||
+	    params.cube_compatible_backing;
 	image_info.flags =
-	    (params.allow_cube_view && TextureCanCreateCubeView(params.type, 0, params.depth)
-	         ? vk::ImageCreateFlagBits::eCubeCompatible
-	         : vk::ImageCreateFlags {}) |
+	    (cube_compatible ? vk::ImageCreateFlagBits::eCubeCompatible : vk::ImageCreateFlags {}) |
 	    (volume_texture ? vk::ImageCreateFlagBits::e2DArrayCompatible : vk::ImageCreateFlags {}) |
 	    (params.compatible_format_views ? vk::ImageCreateFlagBits::eMutableFormat
 	                                    : vk::ImageCreateFlags {});

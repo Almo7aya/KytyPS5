@@ -273,10 +273,14 @@ bool IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& r
 }
 
 bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
-                                      const VulkanImage&           image) {
+                                      const VulkanImage& image,
+                                      vk::ImageAspectFlagBits aspect) {
 	const auto width  = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto pitch  = TileGetTexturePitch(descriptor.Format(), width, 1, descriptor.TileMode());
+	const auto expected_stencil_pitch = TileGetTexturePitch(
+	    Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt), width, 1,
+	    Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
 	const auto type   = static_cast<Prospero::ImageType>(descriptor.Type());
 	const bool supported_single_layer =
 	    image.layers == 1 && descriptor.Depth() == 0 && descriptor.BaseArray5() == 0 &&
@@ -285,13 +289,17 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor,
 	                            image.layers >= 6 && image.layers % 6u == 0 &&
 	                            static_cast<uint32_t>(descriptor.Depth()) + 1u == image.layers &&
 	                            descriptor.BaseArray5() == 0;
+	const bool plane_pitch =
+	    aspect == vk::ImageAspectFlagBits::eStencil
+	        ? pitch == expected_stencil_pitch
+	        : (aspect == vk::ImageAspectFlagBits::eDepth && pitch == image.guest_pitch);
 	return image.type == VulkanImageType::DepthStencil && width == image.extent.width &&
 	       height == image.extent.height && (supported_single_layer || supported_cube) &&
 	       descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 && descriptor.MaxMip() == 0 &&
 	       descriptor.MinLod() == 0 && descriptor.BaseArray5() == 0 &&
 	       descriptor.TileMode() == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth() && pitch >= width &&
-	       pitch == image.guest_pitch;
+	       plane_pitch;
 }
 
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor) {
@@ -312,13 +320,16 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor) {
 static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                        const ShaderTextureResource&               descriptor,
                                        const VulkanImage* image, vk::Format view_format,
-                                       uint64_t size) {
-	const bool resource_ok = IsSupportedSampledDepthResource(resource);
+                                       uint64_t size, vk::ImageAspectFlagBits aspect) {
+	const bool resource_ok = aspect == vk::ImageAspectFlagBits::eStencil
+	                             ? IsSupportedSampledDepthUintResource(resource)
+	                             : IsSupportedSampledDepthResource(resource);
 	const bool descriptor_ok =
-	    image != nullptr && IsSupportedDepthTargetDescriptor(descriptor, *image);
+	    image != nullptr && IsSupportedDepthTargetDescriptor(descriptor, *image, aspect);
 	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor);
-	const bool format_ok   = image != nullptr && IsSupportedSampledDepthFormat(
-	                                                 image->format, descriptor.Format(), view_format);
+	const bool format_ok =
+	    image != nullptr && IsSupportedSampledDepthAspectFormat(
+	                            image->format, descriptor.Format(), view_format, aspect);
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -327,7 +338,7 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	                        descriptor.TileMode());
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
 	     "kind=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
-	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
+	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d aspect=0x%x image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
@@ -337,8 +348,9 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	     descriptor.Format(), descriptor.DstSelXYZW(),
 	     image == nullptr ? static_cast<int>(vk::Format::eUndefined)
 	                      : static_cast<int>(image->format),
-	     static_cast<int>(view_format), image == nullptr ? 0u : image->layers, descriptor.Type(),
-	     descriptor.BaseArray5(), descriptor.Depth(), descriptor_pitch,
+	     static_cast<int>(view_format), static_cast<uint32_t>(aspect),
+	     image == nullptr ? 0u : image->layers, descriptor.Type(), descriptor.BaseArray5(),
+	     descriptor.Depth(), descriptor_pitch,
 	     image == nullptr ? 0u : image->guest_pitch, descriptor.Base40(), size,
 	     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
 	     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
@@ -558,12 +570,13 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 	VulkanImage*  image      = nullptr;
 	int           view       = VulkanImage::VIEW_DEFAULT;
 	vk::ImageView image_view = nullptr;
+	vk::ImageAspectFlagBits depth_target_aspect = vk::ImageAspectFlagBits::eDepth;
 	const bool check_depth = static_cast<Prospero::TileMode>(tile) == Prospero::TileMode::kDepth ||
 	                         descriptor.MsaaDepth();
 	if (image == nullptr) {
 		if (check_depth) {
 			image = GetRenderContext().GetTextureCache().FindDepthTargetByRange(
-			    command_buffer, address, size.size, true);
+			    command_buffer, address, size.size, true, &depth_target_aspect);
 		} else {
 			image = GetRenderContext().GetTextureCache().FindRenderTargetByRange(
 			    command_buffer, address, size.size);
@@ -571,8 +584,9 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 		if (image != nullptr) {
 			if (check_depth) {
 				const bool uint_reinterpret =
+				    depth_target_aspect == vk::ImageAspectFlagBits::eDepth &&
 				    IsSupportedSampledDepthUintResource(resource) &&
-				    IsSupportedDepthTargetDescriptor(descriptor, *image) &&
+				    IsSupportedDepthTargetDescriptor(descriptor, *image, depth_target_aspect) &&
 				    IsSupportedDepthTextureEncoding(descriptor) &&
 				    IsDepthUintTextureReinterpretation(image->format, descriptor.Format(),
 				                                       view_format);
@@ -587,7 +601,8 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 				} else {
 					const auto depth_view = ResolveTargetTextureView(
 					    resource, type, descriptor.BaseArray5(), image->layers);
-					ValidateDepthTargetBinding(resource, descriptor, image, view_format, size.size);
+					ValidateDepthTargetBinding(resource, descriptor, image, view_format, size.size,
+					                           depth_target_aspect);
 					if (depth_view.type ==
 					    static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM)) {
 						EXIT("unsupported sampled depth target view: dimension=%u "
@@ -598,7 +613,8 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 					}
 					image_view = GetRenderContext().GetTextureCache().GetDepthTargetSampledView(
 					    *static_cast<DepthStencilVulkanImage*>(image), view_format, swizzle, 0, 1,
-					    depth_view.type, depth_view.base_layer, depth_view.layer_count);
+					    depth_view.type, depth_view.base_layer, depth_view.layer_count,
+					    depth_target_aspect);
 				}
 			} else {
 				const bool compatible =

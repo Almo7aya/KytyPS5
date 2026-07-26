@@ -221,6 +221,29 @@ FindGuestDepthFormatPolicy(uint32_t guest_format) noexcept {
 	return false;
 }
 
+[[nodiscard]] inline constexpr bool IsSupportedSampledStencilFormat(
+    vk::Format image_format, uint32_t guest_format, vk::Format view_format) noexcept {
+	const bool stencil_attachment =
+	    image_format == vk::Format::eD16UnormS8Uint ||
+	    image_format == vk::Format::eD24UnormS8Uint ||
+	    image_format == vk::Format::eD32SfloatS8Uint;
+	return stencil_attachment &&
+	       guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	       view_format == vk::Format::eR8Uint;
+}
+
+[[nodiscard]] inline constexpr bool IsSupportedSampledDepthAspectFormat(
+    vk::Format image_format, uint32_t guest_format, vk::Format view_format,
+    vk::ImageAspectFlagBits aspect) noexcept {
+	switch (aspect) {
+		case vk::ImageAspectFlagBits::eDepth:
+			return IsSupportedSampledDepthFormat(image_format, guest_format, view_format);
+		case vk::ImageAspectFlagBits::eStencil:
+			return IsSupportedSampledStencilFormat(image_format, guest_format, view_format);
+		default: return false;
+	}
+}
+
 [[nodiscard]] inline constexpr bool IsSupportedDepthTargetFormat(const DepthTargetInfo& info) {
 	const bool  has_stencil = info.stencil_address != 0 || info.stencil_size != 0;
 	const auto* policy      = FindGuestDepthFormatPolicy(info.guest_format);
@@ -341,6 +364,7 @@ enum class DepthOverlap : uint8_t {
 	None,
 	RetireSampled,
 	RetireStorage,
+	PreserveStorage,
 	ExpandTarget,
 	DiscardTarget,
 	DiscardStaleTarget,
@@ -354,6 +378,7 @@ enum class RenderTargetOverlap : uint8_t {
 	RetireStorage,
 	PreserveStorage,
 	ExpandTarget,
+	RecreateTarget,
 	RetireTarget,
 	MaterializeRetireTarget,
 	MaterializeRetireStorage,
@@ -367,7 +392,13 @@ enum class StorageSampledOverlap : uint8_t {
 	DiscardStorage,
 	Unsupported
 };
-enum class StorageSampledViewShape : uint8_t { Image2D, Image2DArray, Image3D, Unsupported };
+enum class StorageSampledViewShape : uint8_t {
+	Image2D,
+	Image2DArray,
+	Image3D,
+	ImageCube,
+	Unsupported
+};
 enum class StorageImageOverlap : uint8_t {
 	None,
 	RetireSampled,
@@ -458,12 +489,20 @@ HasSampleCompatibleStorageImageBacking(const ImageInfo& sampled, const ImageInfo
 	const auto image_2d = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
 	const auto image_2d_array =
 	    Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+	const auto image_cube = Prospero::GpuEnumValue(Prospero::ImageType::kCube);
 	const bool single_layer_2d_views =
 	    sampled.depth == 1 && storage.depth == 1 &&
 	    (sampled.type == image_2d || sampled.type == image_2d_array) &&
 	    (storage.type == image_2d || storage.type == image_2d_array);
+	// Cubes are backed by six (or a multiple of six) ordinary 2D array layers in Vulkan. A
+	// storage descriptor cannot itself be a cube, so allow a sampled cube descriptor to reuse the
+	// exact GPU-owned 2D-array allocation.
+	const bool cube_array_view =
+	    sampled.type == image_cube && storage.type == image_2d_array && sampled.depth >= 6 &&
+	    sampled.depth % 6 == 0 && sampled.depth == storage.depth &&
+	    sampled.width == sampled.height;
 	return HasSameStorageImageBackingLayout(sampled, storage) &&
-	       (sampled.type == storage.type || single_layer_2d_views);
+	       (sampled.type == storage.type || single_layer_2d_views || cube_array_view);
 }
 
 [[nodiscard]] inline constexpr bool
@@ -537,6 +576,10 @@ SelectStorageSampledViewShape(uint32_t type, uint32_t depth, uint32_t backing_la
 		case Prospero::ImageType::kColor3D:
 			return depth != 0 && backing_layers == 1 ? StorageSampledViewShape::Image3D
 			                                         : StorageSampledViewShape::Unsupported;
+		case Prospero::ImageType::kCube:
+			return depth >= 6 && depth % 6 == 0 && depth == backing_layers
+			           ? StorageSampledViewShape::ImageCube
+			           : StorageSampledViewShape::Unsupported;
 		default: return StorageSampledViewShape::Unsupported;
 	}
 }
@@ -709,6 +752,20 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	return depth || stencil;
 }
 
+enum class DepthTargetPlane : uint8_t { None, Depth, Stencil };
+
+[[nodiscard]] inline DepthTargetPlane ClassifyDepthTargetViewRange(
+    const DepthTargetInfo& target, uint64_t address, uint64_t size) {
+	if (!IsDepthTargetRangeCompatible(target, address, size)) {
+		return DepthTargetPlane::None;
+	}
+	if (target.stencil_address != 0 && address == target.stencil_address &&
+	    size == target.stencil_size) {
+		return DepthTargetPlane::Stencil;
+	}
+	return DepthTargetPlane::Depth;
+}
+
 [[nodiscard]] inline bool ImageRangeOverlaps(uint64_t left, uint64_t left_size, uint64_t right,
                                              uint64_t right_size) {
 	if (left_size == 0 || right_size == 0 || left > UINT64_MAX - left_size ||
@@ -806,7 +863,8 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	const bool compatible_format =
 	    (requested.format == cached.format && requested_view_format == cached_image_format) ||
 	    IsRgba8SrgbReinterpretation(cached_image_format, requested_view_format) ||
-	    IsR32UintFloatReinterpretation(cached_image_format, requested_view_format);
+	    IsR32UintFloatReinterpretation(cached_image_format, requested_view_format) ||
+	    IsRgba16UintFloatReinterpretation(cached_image_format, requested_view_format);
 	if (same_backing && compatible_format && cached_gpu_modified && !cached_cpu_dirty) {
 		return StorageSampledOverlap::ExactImage;
 	}
@@ -994,10 +1052,18 @@ ClassifyStorageDepthOverlap(const ImageInfo& storage, bool storage_gpu_modified,
 	if (!overlaps_depth && !overlaps_stencil) {
 		return DepthOverlap::None;
 	}
+	const bool exact_native_depth =
+	    overlaps_depth && !overlaps_stencil && !depth.depth_load_clear &&
+	    IsMaterializableStorageDepthAlias(storage, depth);
+	if (exact_native_depth && storage_gpu_modified && tracker_gpu_modified &&
+	    !storage_buffer_modified && !storage_cpu_dirty) {
+		return DepthOverlap::PreserveStorage;
+	}
 	const bool guest_current = HasGuestCurrentImageOwnership(
 	    storage_gpu_modified, storage_buffer_modified, storage_cpu_dirty, tracker_gpu_modified);
 	const bool aspects_discarded =
-	    (!overlaps_depth || !depth.depth_access) && (!overlaps_stencil || !depth.stencil_access);
+	    (!overlaps_depth || !depth.depth_access || depth.depth_load_clear) &&
+	    (!overlaps_stencil || !depth.stencil_access || depth.stencil_load_clear);
 	return guest_current || (!storage_buffer_modified && !storage_cpu_dirty && aspects_discarded)
 	           ? DepthOverlap::RetireStorage
 	           : DepthOverlap::Unsupported;
@@ -1241,6 +1307,24 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 	const bool new_allocation = cached.address != requested.address ||
 	                            cached.size != requested.size || pool_storage_shape_changed;
 	if (page_isolated && new_allocation && guest_source_current) {
+		// An exact allocation can be rebound through another size-compatible render-target format.
+		// Preserve the GPU-current texels with an image-buffer-image copy into a freshly created
+		// target. This avoids a synchronous guest readback and, unlike a mutable view, also permits
+		// render-target formats that are not members of one Vulkan mutable-format image.
+		const bool exact_native_recreation =
+		    cached.address == requested.address && cached.size == requested.size &&
+		    incompatible_format && cached.width == requested.width &&
+		    cached.height == requested.height && cached.pitch == requested.pitch &&
+		    cached.bytes_per_element == requested.bytes_per_element &&
+		    cached.tile_mode == requested.tile_mode && cached.levels == 1 &&
+		    requested.levels == 1 && cached.layers == 1 && requested.layers == 1 &&
+		    cached.samples == 1 && requested.samples == 1 &&
+		    (cached.bytes_per_element == 1 || cached.bytes_per_element == 2 ||
+		     cached.bytes_per_element == 4 || cached.bytes_per_element == 8);
+		if (exact_native_recreation && cached_gpu_modified && tracker_gpu_modified &&
+		    !cached_buffer_modified) {
+			return RenderTargetOverlap::RecreateTarget;
+		}
 		if (HasGuestCurrentImageOwnership(cached_gpu_modified, cached_buffer_modified, false,
 		                                  tracker_gpu_modified)) {
 			return RenderTargetOverlap::RetireTarget;

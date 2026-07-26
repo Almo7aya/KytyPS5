@@ -89,7 +89,8 @@ public:
 	[[nodiscard]] vk::ImageView
 	GetDepthTargetSampledView(DepthStencilVulkanImage& image, vk::Format view_format,
 	                          uint32_t swizzle, uint32_t base_level, uint32_t level_count,
-	                          vk::ImageViewType type, uint32_t base_layer, uint32_t layer_count);
+	                          vk::ImageViewType type, uint32_t base_layer, uint32_t layer_count,
+	                          vk::ImageAspectFlagBits aspect = vk::ImageAspectFlagBits::eDepth);
 	[[nodiscard]] vk::ImageView GetSampledColorView(VulkanImage& image, vk::Format view_format,
 	                                                uint32_t swizzle, uint32_t base_level,
 	                                                uint32_t level_count, vk::ImageViewType type,
@@ -105,7 +106,8 @@ public:
 	    vk::ImageViewType view_type = vk::ImageViewType::e2D);
 	[[nodiscard]] DepthStencilVulkanImage*
 	FindDepthTargetByRange(CommandBuffer& command, uint64_t vaddr, uint64_t size,
-	                       bool allow_containing_sampled = false);
+	                       bool allow_containing_sampled = false,
+	                       vk::ImageAspectFlagBits* sampled_aspect = nullptr);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool       ResolveMetaRange(uint64_t vaddr, uint64_t size, MetaRangeInfo& info);
 	void                     RegisterMeta(uint64_t vaddr, uint64_t size, uint32_t layers = 1);

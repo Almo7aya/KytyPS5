@@ -59,6 +59,7 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf("  --ngg-rectlist-draw <true|false>     Draw rect-list auto draws using the NGG "
 	         "4-vertex path.\n");
+	::printf("  --avplayer-skip <true|false>         Skip AVPlayer playback and intro videos.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -207,6 +208,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--ngg-rectlist-draw") {
 			if (!ParseBool(value, options.config.ngg_rectlist_draw_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--avplayer-skip") {
+			if (!ParseBool(value, options.config.avplayer_skip_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

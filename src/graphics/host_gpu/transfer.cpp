@@ -827,7 +827,8 @@ void CopyImageViaBuffer(CommandBuffer& buffer, VulkanImage& src_image,
                         vk::ImageAspectFlags dst_aspect, uint32_t bytes_per_element,
                         vk::ImageLayout dst_layout) {
 	if (!IsSingleImageAspect(src_aspect) || !IsSingleImageAspect(dst_aspect) ||
-	    (bytes_per_element != 1 && bytes_per_element != 2 && bytes_per_element != 4) ||
+	    (bytes_per_element != 1 && bytes_per_element != 2 && bytes_per_element != 4 &&
+	     bytes_per_element != 8) ||
 	    src_image.layers != 1 ||
 	    dst_image.layers != 1 || src_image.mip_levels != 1 || dst_image.mip_levels != 1 ||
 	    src_image.extent.width == 0 || src_image.extent.height == 0 ||

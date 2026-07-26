@@ -24,6 +24,7 @@ namespace {
 
 TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 	TextureImageCreateParams params {};
+	const auto               image_format = TextureGetFormat(info.format);
 	params.fmt        = info.format;
 	params.width      = info.width;
 	params.height     = info.height;
@@ -42,10 +43,15 @@ TextureImageCreateParams MakeImageParams(const ImageInfo& info, bool storage) {
 	                                 : TextureFormatUsage::Sampled;
 	params.image_layout    = TextureUploadDestination::MipLevels;
 	params.allow_cube_view = !storage;
+	params.cube_compatible_backing =
+	    storage && info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+	    info.depth >= 6 && info.depth % 6 == 0 && info.width == info.height;
 	params.compatible_format_views =
-	    storage && (IsRgba8SrgbViewFormat(TextureGetFormat(info.format)) ||
-	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	                info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float));
+	    storage && (IsRgba8SrgbViewFormat(image_format) ||
+	                image_format == vk::Format::eR32Uint ||
+	                image_format == vk::Format::eR32Sfloat ||
+	                image_format == vk::Format::eR16G16B16A16Uint ||
+	                image_format == vk::Format::eR16G16B16A16Sfloat);
 	params.owner = storage ? "StorageTextureCache" : "TextureCache";
 	return params;
 }

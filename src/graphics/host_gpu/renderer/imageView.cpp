@@ -194,7 +194,9 @@ vk::ImageView TextureCache::GetDepthTargetAttachmentView(DepthStencilVulkanImage
 vk::ImageView TextureCache::GetImageView(VulkanImage& image, const ImageViewInfo& info) {
 	const bool supported_type  = info.type == vk::ImageViewType::e2D ||
 	                             info.type == vk::ImageViewType::e2DArray ||
-	                             info.type == vk::ImageViewType::e3D;
+	                             info.type == vk::ImageViewType::e3D ||
+	                             info.type == vk::ImageViewType::eCube ||
+	                             info.type == vk::ImageViewType::eCubeArray;
 	const bool supported_usage = info.usage == vk::ImageUsageFlagBits::eSampled ||
 	                             info.usage == vk::ImageUsageFlagBits::eStorage ||
 	                             info.usage == vk::ImageUsageFlagBits::eColorAttachment ||
@@ -202,7 +204,11 @@ vk::ImageView TextureCache::GetImageView(VulkanImage& image, const ImageViewInfo
 	const bool valid_shape =
 	    (info.type == vk::ImageViewType::e2D && info.layer_count == 1) ||
 	    info.type == vk::ImageViewType::e2DArray ||
-	    (info.type == vk::ImageViewType::e3D && info.base_layer == 0 && info.layer_count == 1);
+	    (info.type == vk::ImageViewType::e3D && info.base_layer == 0 && info.layer_count == 1) ||
+	    (info.type == vk::ImageViewType::eCube && info.base_layer % 6 == 0 &&
+	     info.layer_count == 6) ||
+	    (info.type == vk::ImageViewType::eCubeArray && info.base_layer % 6 == 0 &&
+	     info.layer_count >= 6 && info.layer_count % 6 == 0);
 	if (info.format == vk::Format::eUndefined || !info.aspect || info.level_count == 0 ||
 	    info.base_level >= (image.mip_levels) ||
 	    info.level_count > image.mip_levels - info.base_level || info.layer_count == 0 ||
@@ -261,18 +267,20 @@ vk::ImageView TextureCache::GetDepthTargetSampledView(DepthStencilVulkanImage& i
                                                       vk::Format view_format, uint32_t swizzle,
                                                       uint32_t base_level, uint32_t level_count,
                                                       vk::ImageViewType type, uint32_t base_layer,
-                                                      uint32_t layer_count) {
+                                                      uint32_t layer_count,
+                                                      vk::ImageAspectFlagBits aspect) {
 	if (view_format == vk::Format::eUndefined ||
-	    !IsSupportedSampledDepthView(image.format, view_format, swizzle)) {
+	    !IsSupportedSampledDepthView(image.format, view_format, swizzle, aspect)) {
 		EXIT("TextureCache: invalid sampled depth-target view, image=%p image_format=%d"
-		     " view_format=%d swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d"
+		     " view_format=%d aspect=0x%x swizzle=0x%03x mip=%u+%u layer=%u+%u type=%d"
 		     " image_levels=%u image_layers=%u\n",
 		     static_cast<const void*>(&image), static_cast<int>(image.format),
-		     static_cast<int>(view_format), swizzle, base_level, level_count, base_layer,
-		     layer_count, static_cast<int>(type), image.mip_levels, image.layers);
+		     static_cast<int>(view_format), static_cast<uint32_t>(aspect), swizzle, base_level,
+		     level_count, base_layer, layer_count, static_cast<int>(type), image.mip_levels,
+		     image.layers);
 	}
-	return GetImageView(image, {image.format, type, vk::ImageAspectFlagBits::eDepth, base_level,
-	                            level_count, base_layer, layer_count, swizzle});
+	return GetImageView(image, {image.format, type, aspect, base_level, level_count, base_layer,
+	                            layer_count, swizzle});
 }
 
 vk::ImageView TextureCache::GetSampledColorView(VulkanImage& image, vk::Format view_format,
@@ -356,7 +364,8 @@ vk::ImageView TextureCache::GetStorageTextureSampledView(StorageTextureVulkanIma
 	}
 	const auto view_format = TextureGetFormat(info.format);
 	if (view_format != image.format && !IsRgba8SrgbReinterpretation(image.format, view_format) &&
-	    !IsR32UintFloatReinterpretation(image.format, view_format)) {
+	    !IsR32UintFloatReinterpretation(image.format, view_format) &&
+	    !IsRgba16UintFloatReinterpretation(image.format, view_format)) {
 		EXIT("TextureCache: incompatible sampled view of storage texture, image_format=%d"
 		     " view_format=%d swizzle=0x%03x\n",
 		     static_cast<int>(image.format), static_cast<int>(view_format), info.swizzle);
@@ -367,10 +376,17 @@ vk::ImageView TextureCache::GetStorageTextureSampledView(StorageTextureVulkanIma
 		case StorageSampledViewShape::Image2D: type = vk::ImageViewType::e2D; break;
 		case StorageSampledViewShape::Image2DArray: type = vk::ImageViewType::e2DArray; break;
 		case StorageSampledViewShape::Image3D: type = vk::ImageViewType::e3D; break;
+		case StorageSampledViewShape::ImageCube:
+			type = info.depth > 6 ? vk::ImageViewType::eCubeArray : vk::ImageViewType::eCube;
+			break;
 		case StorageSampledViewShape::Unsupported:
 			EXIT("TextureCache: unsupported sampled storage-image view shape\n");
 	}
-	const auto layer_count = shape == StorageSampledViewShape::Image2DArray ? info.depth : 1u;
+	const auto layer_count =
+	    shape == StorageSampledViewShape::Image2DArray ||
+	            shape == StorageSampledViewShape::ImageCube
+	        ? info.depth
+	        : 1u;
 	return GetImageView(image, {view_format, type, vk::ImageAspectFlagBits::eColor, info.base_level,
 	                            info.view_levels, 0, layer_count, info.swizzle});
 }
