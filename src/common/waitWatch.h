@@ -18,6 +18,40 @@
 
 namespace Kyty::WaitWatch {
 
+// Lock-free unique-vs-total guest-fault measurement (Phase 1 diagnosis). Tells whether the fault
+// storm is re-faults of the same pages (eager re-protection => coalescing helps) or unique pages
+// (genuine streaming volume). One atomic bit test-set + two counters per fault.
+namespace FaultStats {
+inline constexpr uint64_t kBase  = 0x2000000000ULL;      // guest GPU address window base
+inline constexpr uint64_t kSpan  = 0x400000000ULL;       // 16 GiB covers observed 0x20xx-0x23xx
+inline constexpr uint64_t kPages = kSpan / 0x1000ULL;    // 4,194,304 pages
+inline constexpr uint64_t kWords = kPages / 64ULL;
+
+inline std::atomic<uint64_t> total {0};
+inline std::atomic<uint64_t> unique {0};
+
+inline std::atomic<uint64_t>* Bits() {
+	static std::atomic<uint64_t>* bits = new std::atomic<uint64_t>[kWords](); // value-init to 0
+	return bits;
+}
+
+inline void Record(uint64_t vaddr) {
+	total.fetch_add(1, std::memory_order_relaxed);
+	if (vaddr < kBase) {
+		return;
+	}
+	const uint64_t page = (vaddr - kBase) / 0x1000ULL;
+	if (page >= kPages) {
+		return;
+	}
+	const uint64_t mask = 1ULL << (page % 64ULL);
+	const uint64_t prev = Bits()[page / 64ULL].fetch_or(mask, std::memory_order_relaxed);
+	if ((prev & mask) == 0) {
+		unique.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+} // namespace FaultStats
+
 inline uint64_t NowMs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
 	                                 std::chrono::steady_clock::now().time_since_epoch())

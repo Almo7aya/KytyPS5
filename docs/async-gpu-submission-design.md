@@ -67,15 +67,17 @@ The wait watchdog + fault/drain counters exist (committed `ad90964`; counters us
 to measure every later phase. Also add (cheap): **per-page re-fault histogram** and a **drain
 cost breakdown** (time in `WaitForIdle` vs `BufferWait` vs `LabelDrain`).
 
-### Phase 1 — Reduce fault *frequency* (safe, orthogonal, no drain change)
-- **Goal:** fewer faults ⇒ fewer drains, without touching the (load-bearing) drain itself.
-- **Approach:** measure whether the tracker re-arms write-protection too eagerly, re-faulting pages
-  that are still CPU-owned. If a page written by the CPU is re-protected while the GPU only ever
-  reads a device copy, batch/coalesce: keep freshly-written pages writable until the GPU actually
-  re-consumes the range (tracked via the buffer cache), instead of per-frame re-protect.
-- **Risk:** low–moderate (coherency of buffer re-upload). Validate visually.
-- **Validation:** re-fault histogram drops; working games unchanged (fps + visual).
-- **Exit:** measurable fault-count reduction on GTA III streaming with no regression.
+### Phase 1 — Reduce fault *frequency* (MEASURED: dead end, skip)
+- **Goal (was):** fewer faults ⇒ fewer drains, without touching the load-bearing drain.
+- **Result (measured, `FaultStats` unique-vs-total, GTA III level-load):** the fault storm is
+  ~**91-100% unique pages** during active streaming (incremental re-fault ratio ≈1.09; cumulative
+  1.4-1.8, inflated only by a little startup churn). So faults are genuine one-shot writes to newly
+  streamed asset pages — **not** eager re-protection re-faults. Coalescing re-faults would cut only
+  ~10-30%, far short of the ~100× needed. **Phase 1 is not the lever; do not pursue coalescing.**
+- **Redirection:** the cost is the *full drain per unique fault*. The 99.6% of faults that are plain
+  CPU writes to freshly-streamed pages with no in-flight GPU work need no drain at all; only
+  ordering-sensitive pages (WAIT_REG_MEM sync values, in-flight buffers) do. That is **Phase 4**, and
+  it requires **Phase 2** first (removing the drain without Phase 2 hangs the CP — verified).
 
 ### Phase 2 — Decouple GPU forward-progress from the fault path
 - **Goal:** make submissions/labels advance on their own so the fault-drain is no longer the pump.

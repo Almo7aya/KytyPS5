@@ -188,9 +188,16 @@ static void WatchdogRun(void* /*unused*/) {
 		}
 		const uint64_t stalled = now - last_change_ms;
 		if (stalled >= 5000 && !dumped) {
+			const uint64_t f_total  = Kyty::WaitWatch::FaultStats::total.load(std::memory_order_relaxed);
+			const uint64_t f_unique = Kyty::WaitWatch::FaultStats::unique.load(std::memory_order_relaxed);
 			std::printf("=== WATCHDOG: presented frame %d stalled %llums, gpu_labels_pending=%llu ===\n",
 			            frame, static_cast<unsigned long long>(stalled),
 			            static_cast<unsigned long long>(Libs::Graphics::LabelPendingCount()));
+			std::printf("=== WATCHDOG faults: total=%llu unique_pages=%llu refault_ratio=%.2f ===\n",
+			            static_cast<unsigned long long>(f_total),
+			            static_cast<unsigned long long>(f_unique),
+			            f_unique != 0 ? static_cast<double>(f_total) / static_cast<double>(f_unique)
+			                          : 0.0);
 			Kyty::WaitWatch::Dump("stall#1");
 			Libs::Graphics::GraphicsRunDumpGpuWait();
 			Common::Thread::Sleep(2000);

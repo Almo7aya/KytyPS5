@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/waitWatch.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/objects/label.h"
@@ -33,6 +34,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!m_page_manager.IsMapped(fault_vaddr, 1)) {
 		return false;
 	}
+	Kyty::WaitWatch::FaultStats::Record(fault_vaddr);
 	// GPU label callbacks run guest code on the dedicated label thread with no label lock held (see
 	// LabelManager::ThreadRun, which unlocks before firing). Such a thread is just another non-command-
 	// processor faulting thread, so a guest access to GPU-tracked memory can be resolved through the
