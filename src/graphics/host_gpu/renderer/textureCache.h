@@ -74,6 +74,7 @@ public:
 	                                        uint32_t packed_clear);
 	void               MarkGpuWritten(VulkanImage& image);
 	void               PrepareHostWrite(uint64_t vaddr, uint64_t size);
+	void               PrepareGpuBufferRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 	                                           bool formatted_buffer_write = false);
 	[[nodiscard]] RenderTextureVulkanImage* FindRenderTargetByRange(CommandBuffer& command,
@@ -138,7 +139,7 @@ private:
 	void                        MarkSampledAliasesCpuDirtyLocked(uint64_t vaddr, uint64_t size);
 	void                        RetireSampledTargetAliases(const ImageInfo& requested);
 	void                        ResolveStorageImageOverlaps(const ImageInfo& requested);
-	void                        RetireStorageDepthAliasLocked(const ImageInfo& requested);
+	void                        DetachStorageDepthAliasLocked(const ImageInfo& requested);
 	void                        RegisterImageLocked(CachedImage& image);
 	void                        UnregisterImageLocked(CachedImage& image, bool release_tracking);
 	[[nodiscard]] VulkanImage&  PublishImage(CommandBuffer&               command,
@@ -152,8 +153,8 @@ private:
 	void RetireDepthMetadataLocked(const std::vector<CachedImage*>& retire,
 	                               uint64_t                         preserve_address = 0);
 	void MaterializeImagesToGuestLocked(const std::vector<std::shared_ptr<CachedImage>>& images);
-	void SynchronizeColorImageToBufferLocked(CachedImage& cached, uint64_t write_address,
-	                                         uint64_t write_size);
+	void SynchronizeColorImageBackingLocked(CachedImage& cached, uint64_t write_address,
+	                                        uint64_t write_size, bool publish_buffer);
 	void SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
 	                                         uint64_t write_size);
 

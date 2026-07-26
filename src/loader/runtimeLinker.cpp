@@ -613,10 +613,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	};
 
-	if (is_readable_range(info->rsp, 16u * sizeof(uint64_t))) {
+	constexpr uint64_t guest_stack_dump_qwords = 48;
+	const bool guest_stack_readable =
+	    is_readable_range(info->rsp, guest_stack_dump_qwords * sizeof(uint64_t));
+	if (guest_stack_readable) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
-		for (uint64_t i = 0; i < 16; i++) {
+		for (uint64_t i = 0; i < guest_stack_dump_qwords; i++) {
 			LOGF(" [%02" PRIu64 "]=%016" PRIx64, i, stack[i]);
 		}
 		LOGF("\n");
@@ -655,13 +658,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		LOGF("\n");
 	};
 
+	dump_guest_code("guest rip", info->exception_address);
 	dump_guest_code("guest rax[0]", info->rax);
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (info->rsp != 0) {
+	if (guest_stack_readable) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-		for (uint64_t i = 0; i < 16; i++) {
+		for (uint64_t i = 0; i < guest_stack_dump_qwords; i++) {
 			char name[32] {};
 			std::snprintf(name, sizeof(name), "stack[%" PRIu64 "]", i);
 			dump_guest_code(name, stack[i]);
@@ -1055,6 +1059,32 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	EXIT_IF(program == nullptr);
 	EXIT_IF(program->elf == nullptr);
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows delivers page-protection faults on the interrupted stack and does not preserve the
+	// 128-byte SysV red zone. This Clang zlib inflate_fast call can therefore lose live locals
+	// when its output first touches GPU-tracked guest memory. Force the existing slow path, which
+	// remains in the caller's allocated frame and produces the same decompression result.
+	static constexpr uint8_t INFLATE_FAST_CALL_PATTERN[] = {
+	    0x41, 0x81, 0xf9, 0x02, 0x01, 0x00, 0x00, 0x72, 0x6d, 0x41, 0x83, 0xfc, 0x06, 0x72,
+	    0x67, 0x48, 0x8b, 0x75, 0x98, 0x48, 0x8b, 0x45, 0xa0, 0x4c, 0x89, 0xdf, 0x49, 0x89,
+	    0x43, 0x18, 0x45, 0x89, 0x4b, 0x20, 0x4d, 0x89, 0x2b, 0x45, 0x89, 0x63, 0x08, 0x49,
+	    0x89, 0x58, 0x48, 0x45, 0x89, 0x78, 0x50, 0xe8, 0x05, 0x10, 0x00, 0x00,
+	};
+	if (size >= sizeof(INFLATE_FAST_CALL_PATTERN)) {
+		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
+		auto* end_ptr   = start_ptr + size - sizeof(INFLATE_FAST_CALL_PATTERN);
+		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
+			if (std::memcmp(ptr, INFLATE_FAST_CALL_PATTERN,
+			                sizeof(INFLATE_FAST_CALL_PATTERN)) == 0) {
+				LOGF("Patch red-zone-unsafe inflate_fast call at addr: [%016" PRIx64 "]\n",
+				     reinterpret_cast<uint64_t>(ptr));
+				ptr[7] = 0xeb; // jb slow_path -> jmp slow_path
+				ptr += sizeof(INFLATE_FAST_CALL_PATTERN) - 1;
+			}
+		}
+	}
+#endif
 
 	if (size >= 12) {
 		// Replace guest stack-canary/errno stores through fs:[0x28] with nops.

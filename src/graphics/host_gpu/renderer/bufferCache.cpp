@@ -561,67 +561,85 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 }
 
 void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid unmap range, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
 	GraphicsRunSubmissionLock submissions;
 	FaultSafeCacheLock        lock(this, m_mutex);
-	for (const auto& [begin, cached]: m_buffers) {
-		if (vaddr < begin + cached->size && begin < vaddr + size &&
-		    (vaddr > begin || size < cached->size || vaddr + size < begin + cached->size)) {
-			EXIT("BufferCache: partial buffer unmap is unsupported, unmap=0x%016" PRIx64
-			     "+0x%016" PRIx64 " buffer=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
-			     vaddr, size, begin, cached->size);
-		}
-	}
-	for (const auto& [begin, cached]: m_buffers) {
-		const auto offset = begin >= vaddr ? begin - vaddr : UINT64_MAX;
-		if (offset > size || cached->size > size - offset ||
-		    !m_memory_tracker.IsRegionGpuModified(begin, cached->size)) {
+	const auto                unmap_end = vaddr + size;
+	for (auto it = m_buffers.begin(); it != m_buffers.end();) {
+		const auto begin      = it->first;
+		auto&      cached     = *it->second;
+		const auto buffer_end = begin + cached.size;
+		if (vaddr >= buffer_end || begin >= unmap_end) {
+			++it;
 			continue;
 		}
-		const auto dirty = m_gpu_modified_ranges.Intersections(begin, cached->size);
-		if (dirty.empty()) {
-			EXIT("BufferCache: GPU-modified buffer has no dirty ranges, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     begin, cached->size);
+
+		const bool gpu_modified = m_memory_tracker.IsRegionGpuModified(begin, cached.size);
+		const auto dirty        = m_gpu_modified_ranges.Intersections(begin, cached.size);
+		if (gpu_modified != !dirty.empty()) {
+			EXIT("BufferCache: tracker and dirty ranges disagree during unmap, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " tracker_gpu=%d ranges=%zu\n",
+			     begin, cached.size, gpu_modified, dirty.size());
 		}
-		auto     backing_writes = ReserveBackingWrites(m_page_manager, dirty);
-		uint64_t downloaded     = 0;
-		m_memory_tracker.ForEachDownloadRange<true>(
-		    begin, cached->size,
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    ValidateDirtyPages(m_gpu_modified_ranges, address, bytes, "unmap");
-		    },
-		    [&](uint64_t address, uint64_t bytes) noexcept {
-			    const auto ranges = m_gpu_modified_ranges.Intersections(address, bytes);
-			    for (const auto& range: ranges) {
-				    std::vector<uint8_t> data(range.size);
-				    Transfer::DownloadBuffer(*cached->buffer, range.address - begin, data.data(),
-				                             range.size);
-				    Libs::LibKernel::Memory::WriteBacking(range.address, data.data(), data.size());
-				    downloaded += range.size;
-			    }
-		    });
-		if (downloaded == 0) {
-			EXIT("BufferCache: GPU-modified buffer downloaded no bytes, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     begin, cached->size);
+		if (gpu_modified) {
+			auto     backing_writes = ReserveBackingWrites(m_page_manager, dirty);
+			uint64_t downloaded     = 0;
+			m_memory_tracker.ForEachDownloadRange<true>(
+			    begin, cached.size,
+			    [&](uint64_t address, uint64_t bytes) noexcept {
+				    ValidateDirtyPages(m_gpu_modified_ranges, address, bytes, "unmap");
+			    },
+			    [&](uint64_t address, uint64_t bytes) noexcept {
+				    const auto ranges = m_gpu_modified_ranges.Intersections(address, bytes);
+				    for (const auto& range: ranges) {
+					    std::vector<uint8_t> data(range.size);
+					    Transfer::DownloadBuffer(*cached.buffer, range.address - begin, data.data(),
+					                             range.size);
+					    Libs::LibKernel::Memory::WriteBacking(range.address, data.data(),
+					                                          data.size());
+					    downloaded += range.size;
+				    }
+			    });
+			if (downloaded == 0) {
+				EXIT("BufferCache: GPU-modified buffer downloaded no bytes, addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 "\n",
+				     begin, cached.size);
+			}
+			m_gpu_modified_ranges.Subtract(begin, cached.size);
 		}
-		m_memory_tracker.MarkRegionAsCpuModified(begin, cached->size);
-		m_gpu_modified_ranges.Subtract(begin, cached->size);
+
+		// A cached Vulkan buffer cannot keep representing a guest allocation after any part of
+		// that allocation is unmapped. Retire the native buffer as a whole. Preserve the guest
+		// backing above, then make each still-mapped side CPU-current so a future cache miss
+		// uploads it into a new native buffer rather than treating the retired allocation as the
+		// current owner.
+		const auto left_end    = std::min(vaddr, buffer_end);
+		const auto right_begin = std::max(unmap_end, begin);
+		if (begin < left_end) {
+			m_memory_tracker.MarkRegionAsCpuModified(begin, left_end - begin);
+		}
+		if (right_begin < buffer_end) {
+			m_memory_tracker.MarkRegionAsCpuModified(right_begin, buffer_end - right_begin);
+		}
+		if (begin < vaddr || unmap_end < buffer_end) {
+			LOGF("BufferCache: retiring cached buffer for partial unmap, "
+			     "unmap=0x%016" PRIx64 "+0x%016" PRIx64 " buffer=0x%016" PRIx64
+			     "+0x%016" PRIx64 " gpu_modified=%d\n",
+			     vaddr, size, begin, cached.size, gpu_modified);
+		}
+		it = m_buffers.erase(it);
 	}
+
 	if (!m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
 		EXIT("BufferCache: unmap retained dirty byte ranges, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	m_memory_tracker.UntrackMemory(vaddr, size);
-	for (auto it = m_buffers.begin(); it != m_buffers.end();) {
-		const auto offset = (it->first >= vaddr ? it->first - vaddr : UINT64_MAX);
-		if (offset <= size && it->second->size <= size - offset) {
-			it = m_buffers.erase(it);
-		} else {
-			++it;
-		}
-	}
 }
 
 BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
@@ -669,19 +687,23 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		     texture_pages.metadata_bytes, texture_pages.gpu_metadata_bytes);
 	}
 	// Cache allocations are tracker-page aligned, but byte-disjoint buffers and images may share
-	// an edge page. Clean read-only buffer and image views may coexist; Kyty retains a hard failure
-	// when either cache owns newer GPU bytes. Writable buffers delegate the ownership transition
-	// to TextureCache, which distinguishes raw texture-data writes from formatted target paths.
+	// an edge page. Read-only buffers can coexist with clean images. If an overlapping image owns
+	// newer bytes, materialize its complete backing before uploading the requested buffer range.
+	// Writable buffers delegate their ownership transition separately so TextureCache can
+	// distinguish raw texture-data writes from formatted target paths.
 	if (texture_pages.image_pages && texture_region.image_bytes) {
-		const bool coherent_read = is_read && !is_written &&
-		                           !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-		                           !texture_region.gpu_image_bytes;
-		if (!coherent_read) {
-			if (!is_written) {
-				EXIT("BufferCache: unsupported buffer/image alias, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 " read=%d written=%d formatted=%d\n",
-				     vaddr, size, is_read, is_written, is_formatted);
+		if (is_read && !is_written) {
+			if (texture_region.gpu_image_bytes) {
+				m_texture_cache->PrepareGpuBufferRead(vaddr, size);
+				const auto resolved = m_texture_cache->QueryRegion(vaddr, size);
+				if (resolved.gpu_image_bytes) {
+					EXIT("BufferCache: image materialization retained GPU ownership, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+					     " formatted=%d\n",
+					     vaddr, size, is_formatted);
+				}
 			}
+		} else {
 			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
 	}
@@ -943,19 +965,10 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		}
 		m_gpu_modified_ranges.Subtract(vaddr, size);
 	}
-	auto owner = m_buffers.upper_bound(vaddr);
-	if (owner == m_buffers.begin()) {
-		return {nullptr, 0, vaddr, size, true, cpu_modified};
-	}
-	--owner;
-	auto&      cached = *owner->second;
-	const auto offset = vaddr - cached.vaddr;
-	if (offset > cached.size || size > cached.size - offset) {
-		return {nullptr, 0, vaddr, size, true, cpu_modified};
-	}
-	if (cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
-		EXIT("BufferCache: containing image source is inconsistent\n");
-	}
+	// Image ownership covers the complete guest allocation, while BufferCache allocations can
+	// cover only prefixes, tails, or several disjoint subranges. Publish every CPU-dirty
+	// intersection before looking for an optional whole-image buffer; otherwise an early
+	// non-containing return leaves the buffer tracker dirty and blocks the image GPU transition.
 	if (cpu_modified) {
 		std::vector<std::pair<uint64_t, uint64_t>> uploads;
 		m_memory_tracker.ForEachUploadRange(
@@ -965,9 +978,27 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		    },
 		    [&]() noexcept {
 			    for (const auto& [address, bytes]: uploads) {
-				    Transfer::UploadBuffer(Transfer::StagingBufferType::Vertex, *cached.buffer,
-				                           address - cached.vaddr,
-				                           reinterpret_cast<const void*>(address), bytes);
+				    const auto end = address + bytes;
+				    for (const auto& [buffer_address, buffer_owner]: m_buffers) {
+					    if (buffer_address >= end) {
+						    break;
+					    }
+					    auto& cached = *buffer_owner;
+					    const auto buffer_end = buffer_address + cached.size;
+					    const auto begin      = std::max(address, buffer_address);
+					    const auto copy_end   = std::min(end, buffer_end);
+					    if (begin >= copy_end) {
+						    continue;
+					    }
+					    if (cached.vaddr != buffer_address || cached.buffer == nullptr ||
+					        cached.buffer->buffer == nullptr) {
+						    EXIT("BufferCache: CPU-dirty image alias has an inconsistent buffer\n");
+					    }
+					    Transfer::UploadBuffer(
+					        Transfer::StagingBufferType::Vertex, *cached.buffer,
+					        begin - buffer_address, reinterpret_cast<const void*>(begin),
+					        copy_end - begin);
+				    }
 			    }
 		    });
 		if (uploads.empty()) {
@@ -982,6 +1013,19 @@ BufferImageCopySource BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t
 		EXIT("BufferCache: image source did not become coherent, addr=0x%016" PRIx64
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
+	}
+	auto owner = m_buffers.upper_bound(vaddr);
+	if (owner == m_buffers.begin()) {
+		return {nullptr, 0, vaddr, size, true, cpu_modified};
+	}
+	--owner;
+	auto&      cached = *owner->second;
+	const auto offset = vaddr - cached.vaddr;
+	if (offset > cached.size || size > cached.size - offset) {
+		return {nullptr, 0, vaddr, size, true, cpu_modified};
+	}
+	if (cached.buffer == nullptr || cached.buffer->buffer == nullptr) {
+		EXIT("BufferCache: containing image source is inconsistent\n");
 	}
 	return {cached.buffer.get(), offset, vaddr, size, true, cpu_modified};
 }
@@ -1181,32 +1225,27 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
-void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size) {
+void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size,
+                                      bool preserve_cpu_dirty) {
 	FaultSafeCacheLock lock(this, m_mutex);
-	auto               owner = m_buffers.end();
+	bool               cached_overlap = false;
 	for (auto it = m_buffers.begin(); it != m_buffers.end(); ++it) {
 		if (!PageOverlaps(vaddr, size, it->second->vaddr, it->second->size)) {
 			continue;
 		}
-		const auto offset = vaddr >= it->second->vaddr ? vaddr - it->second->vaddr : UINT64_MAX;
-		if (owner != m_buffers.end() || offset > it->second->size ||
-		    size > it->second->size - offset) {
-			EXIT("BufferCache: image backing aliases a non-containing cached buffer, "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " buffer=0x%016" PRIx64 "+0x%016" PRIx64
-			     "\n",
-			     vaddr, size, it->second->vaddr, it->second->size);
-		}
-		owner = it;
+		cached_overlap = true;
 	}
-	if ((owner != m_buffers.end() && m_memory_tracker.IsRegionCpuModified(vaddr, size)) ||
+	if ((cached_overlap && !preserve_cpu_dirty &&
+	     m_memory_tracker.IsRegionCpuModified(vaddr, size)) ||
 	    m_memory_tracker.IsRegionGpuModified(vaddr, size) ||
 	    !m_gpu_modified_ranges.Intersections(vaddr, size).empty()) {
 		EXIT("BufferCache: image backing requires clean buffer ownership, addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 " cached=%d\n",
-		     vaddr, size, owner != m_buffers.end());
+		     " size=0x%016" PRIx64 " cached=%d preserve_cpu=%d\n",
+		     vaddr, size, cached_overlap, preserve_cpu_dirty);
 	}
-	// A fresh tracker is CPU-dirty by construction when no cached buffer exists. Keep the range
-	// CPU-dirty so subsequently-created buffer uploads the just-published image backing.
+	// The image allocation may cover several partial buffers or only one subrange of a cached
+	// buffer. Mark the complete reconstructed backing CPU-current; ObtainBufferForImage and
+	// ObtainBuffer upload only the intersections relevant to each native buffer.
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 

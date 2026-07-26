@@ -14,6 +14,8 @@ namespace Libs::Graphics {
 inline constexpr uint32_t AcquireGcrGl2Writeback = 1u << 15u;
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func);
+bool TestRecycledWaitRegMemLabel(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask,
+                                 uint32_t width, uint32_t func, uint32_t wait_op);
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
@@ -109,6 +111,7 @@ public:
 	void PrepareCpuFlip();
 	void SynchronizeGpu();
 	void MemoryBarrier();
+	void TriggerAgcUserInterruptAtEndOfPipe();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void RenderTextureBarrier(uint64_t vaddr, uint64_t size);
 	void DepthStencilBarrier(uint64_t vaddr, uint64_t size);
@@ -191,6 +194,14 @@ private:
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
 	bool     m_predicate_skip = false;
+
+	uint64_t m_wait_reg_address = 0;
+	uint64_t m_wait_reg_ref     = 0;
+	uint64_t m_wait_reg_mask    = 0;
+	uint64_t m_wait_reg_retries = 0;
+	uint32_t m_wait_reg_width   = 0;
+	uint32_t m_wait_reg_func    = 0;
+	uint32_t m_wait_reg_op      = 0;
 };
 
 } // namespace Libs::Graphics

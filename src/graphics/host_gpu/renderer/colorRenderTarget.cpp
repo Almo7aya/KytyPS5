@@ -302,6 +302,10 @@ void ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer, R
 		}
 		EXIT_NOT_IMPLEMENTED(video_image.size < size);
 		EXIT_NOT_IMPLEMENTED(video_image.pitch != pitch);
+		// Display surfaces bypass FindRenderTarget and share their registered VideoOut image
+		// directly. Resolve any newer buffer-backed contents before the render pass can load or
+		// overwrite the attachment; MarkGpuWritten then receives exclusive image ownership.
+		GetRenderContext().GetTextureCache().RefreshVideoOut(*video_image.image, true);
 		r.type           = RenderColorType::DisplayBuffer;
 		r.base_addr      = rt.base.addr;
 		r.vulkan_buffer  = video_image.image;

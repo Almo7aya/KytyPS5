@@ -254,6 +254,7 @@ void CommandProcessor::Reset() {
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
+	m_wait_reg_retries                 = 0;
 
 	std::memset(m_const_ram, 0, sizeof(m_const_ram));
 }
@@ -327,6 +328,25 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+bool TestRecycledWaitRegMemLabel(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask,
+                                 uint32_t width, uint32_t func, uint32_t wait_op) {
+	// Native AGC code can publish a CPU completion label, observe it, and return the
+	// 32-byte entry to its free list before the serialized emulator GPU thread gets
+	// to the corresponding WAIT_REG_MEM. A recycled entry contains the low 32 bits
+	// of another entry's guest address. Keep this recognition deliberately limited
+	// to the exact completion-label contract seen in those command streams.
+	if (width != 32 || func != 3 || wait_op != 0 || ref != 1 || mask != UINT32_MAX ||
+	    value <= 1 || value > UINT32_MAX || (address >> 32u) != 0x10u ||
+	    (address & 0x1fu) != 0 || (value & 0x1fu) != 0) {
+		return false;
+	}
+
+	const uint64_t linked_address = (address & 0xffffffff00000000ull) | value;
+	const uint64_t distance =
+	    address > linked_address ? address - linked_address : linked_address - address;
+	return distance >= 0x20 && distance <= 0x100000 && (distance & 0x1fu) == 0;
+}
+
 template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
@@ -335,10 +355,70 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
-	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
-		SuspendPm4();
+	const auto value   = *reinterpret_cast<const volatile T*>(addr);
+	const auto address = reinterpret_cast<uint64_t>(addr);
+	const auto width   = static_cast<uint32_t>(sizeof(T) * 8u);
+	if (TestWaitRegMemValue(value, ref, mask, func)) {
+		if (m_wait_reg_retries != 0 && GraphicsRunDebugDumpEnabled()) {
+			LOGF("WaitRegMem resolved: submit=%" PRIu64 " width=%u addr=0x%016" PRIx64
+			     " value=0x%016" PRIx64 " retries=%" PRIu64 "\n",
+			     m_submit_id, width, address, static_cast<uint64_t>(value), m_wait_reg_retries);
+		}
+		m_wait_reg_retries = 0;
+		return;
 	}
+
+	const bool new_wait =
+	    m_wait_reg_retries == 0 || m_wait_reg_address != address || m_wait_reg_width != width ||
+	    m_wait_reg_ref != static_cast<uint64_t>(ref) ||
+	    m_wait_reg_mask != static_cast<uint64_t>(mask) || m_wait_reg_func != func ||
+	    m_wait_reg_op != wait_op;
+	if (new_wait) {
+		m_wait_reg_address = address;
+		m_wait_reg_width   = width;
+		m_wait_reg_ref     = static_cast<uint64_t>(ref);
+		m_wait_reg_mask    = static_cast<uint64_t>(mask);
+		m_wait_reg_func    = func;
+		m_wait_reg_op      = wait_op;
+		m_wait_reg_retries = 1;
+	} else {
+		m_wait_reg_retries++;
+	}
+
+	// A value matching the completion-label free-list shape means AGC has already observed and
+	// recycled this entry. It cannot become the requested value again unless the entry is allocated
+	// for unrelated work. Delaying recognition used to replay the blocked packet 128 times; the
+	// nominal 100-us poll rounds up to 1 ms on Windows, imposing at least 128 ms for every recycled
+	// label and several seconds per frame in command streams with many completion waits.
+	const bool recycled_completion =
+	    TestRecycledWaitRegMemLabel(address, static_cast<uint64_t>(value),
+	                                static_cast<uint64_t>(ref), static_cast<uint64_t>(mask),
+	                                width, func, wait_op);
+	if (recycled_completion) {
+		if (GraphicsRunDebugDumpEnabled()) {
+			LOGF("WaitRegMem accepted recycled completion label: submit=%" PRIu64
+			     " addr=0x%016" PRIx64 " link=0x%016" PRIx64 " retries=%" PRIu64 "\n",
+			     m_submit_id, address,
+			     (address & 0xffffffff00000000ull) | static_cast<uint64_t>(value),
+			     m_wait_reg_retries);
+		}
+		m_wait_reg_retries = 0;
+		return;
+	}
+
+	if (GraphicsRunDebugDumpEnabled() &&
+	    (new_wait || m_wait_reg_retries == 128 || m_wait_reg_retries % 1024 == 0)) {
+		LOGF("WaitRegMem blocked: submit=%" PRIu64 " width=%u addr=0x%016" PRIx64
+		     " value=0x%016" PRIx64 " ref=0x%016" PRIx64 " mask=0x%016" PRIx64
+		     " func=%u op=%u poll=%u retries=%" PRIu64 "\n",
+		     m_submit_id, width, address, static_cast<uint64_t>(value),
+		     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func, wait_op, poll,
+		     m_wait_reg_retries);
+		if (m_wait_reg_retries == 128) {
+			GetScheduler().DebugDumpFenceStatus();
+		}
+	}
+	SuspendPm4();
 }
 
 template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, uint32_t, uint32_t,
@@ -536,11 +616,12 @@ bool Gpu::Process(Submission& submission) {
 					break;
 				}
 			}
+			if (complete && submission.trigger_agc_interrupt_on_done) {
+				cp.TriggerEopEventAtEndOfPipe(0);
+				progressed = true;
+			}
 			if (progressed) {
 				cp.BufferFlush();
-			}
-			if (complete && submission.trigger_agc_interrupt_on_done) {
-				Sync::TriggerEopEvent(0);
 			}
 			break;
 		}
@@ -560,11 +641,13 @@ bool Gpu::Process(Submission& submission) {
 			}
 			complete = cp.Process(submission.command_execution, buffer, num_dw) ==
 			           Pm4ProcessResult::Complete;
-			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
-			}
+			bool progressed = submission.command_execution.MadeProgress();
 			if (complete && submission.trigger_agc_interrupt_on_done) {
-				Sync::TriggerAgcUserInterrupt();
+				cp.TriggerAgcUserInterruptAtEndOfPipe();
+				progressed = true;
+			}
+			if (progressed) {
+				cp.BufferFlush();
 			}
 			break;
 		}
@@ -1173,7 +1256,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1218,7 +1300,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1300,7 +1381,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x04:
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
-				std::memcpy(dst_gpu_addr, &clock, sizeof(clock));
 				switch (cache_action) {
 					case 0x00:
 						if (((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1365,6 +1445,12 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	CheckBuffer();
 
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
+}
+
+void CommandProcessor::TriggerAgcUserInterruptAtEndOfPipe() {
+	CheckBuffer();
+
+	Sync::TriggerAgcUserInterruptAtEndOfPipe(CurrentBuffer());
 }
 
 void CommandProcessor::RenderTextureBarrier(uint64_t vaddr, uint64_t size) {
@@ -1458,7 +1544,6 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
 	                                               m_flip.flip_mode, m_flip.flip_arg);
@@ -1484,7 +1569,6 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareDisplayBufferFlip(command, m_flip.handle, m_flip.index,
 	                                               m_flip.flip_mode, m_flip.flip_arg);

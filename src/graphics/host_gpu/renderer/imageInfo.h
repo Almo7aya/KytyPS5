@@ -360,10 +360,23 @@ enum class RenderTargetOverlap : uint8_t {
 	Unsupported
 };
 enum class SampledOverlap : uint8_t { None, ReadOnlyAlias, Unsupported };
-enum class StorageSampledOverlap : uint8_t { None, ExactImage, RetireStorage, Unsupported };
+enum class StorageSampledOverlap : uint8_t {
+	None,
+	ExactImage,
+	RetireStorage,
+	DiscardStorage,
+	Unsupported
+};
 enum class StorageSampledViewShape : uint8_t { Image2D, Image2DArray, Image3D, Unsupported };
-enum class StorageImageOverlap : uint8_t { None, RetireSampled, RetireStorage, PageNeighbor, Unsupported };
-enum class HostWriteOverlap : uint8_t { None, InvalidateImage, Unsupported };
+enum class StorageImageOverlap : uint8_t {
+	None,
+	RetireSampled,
+	RetireImage,
+	MaterializeImage,
+	PageNeighbor,
+	Unsupported
+};
+enum class HostWriteOverlap : uint8_t { None, InvalidateImage, SynchronizeImage, Unsupported };
 enum class BufferImageBinding : uint8_t {
 	Texture,
 	VideoOut,
@@ -424,6 +437,76 @@ enum class MetaImageOverlap : uint8_t { RetainSampled, RetireImage, Unsupported 
 	// Storage descriptors select a per-mip view of one full allocation. Backing creation must not
 	// depend on which view happens to be bound first.
 	return storage ? 0u : view_base_level;
+}
+
+[[nodiscard]] inline constexpr bool HasSameStorageImageBackingLayout(const ImageInfo& left,
+                                                                     const ImageInfo& right) noexcept {
+	// base_level, view_levels, swizzle, and base_array select a view over the image and do not
+	// describe its allocation.
+	return left.address == right.address && left.size == right.size &&
+	       left.width == right.width && left.height == right.height && left.pitch == right.pitch &&
+	       left.levels == right.levels && left.tile == right.tile && left.depth == right.depth;
+}
+
+[[nodiscard]] inline constexpr bool HasSameStorageImageBacking(const ImageInfo& left,
+                                                               const ImageInfo& right) noexcept {
+	return HasSameStorageImageBackingLayout(left, right) && left.type == right.type;
+}
+
+[[nodiscard]] inline constexpr bool
+HasSampleCompatibleStorageImageBacking(const ImageInfo& sampled, const ImageInfo& storage) noexcept {
+	const auto image_2d = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+	const auto image_2d_array =
+	    Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+	const bool single_layer_2d_views =
+	    sampled.depth == 1 && storage.depth == 1 &&
+	    (sampled.type == image_2d || sampled.type == image_2d_array) &&
+	    (storage.type == image_2d || storage.type == image_2d_array);
+	return HasSameStorageImageBackingLayout(sampled, storage) &&
+	       (sampled.type == storage.type || single_layer_2d_views);
+}
+
+[[nodiscard]] inline constexpr bool
+IsStorageStencilPlaneAlias(const ImageInfo& storage, const DepthTargetInfo& depth) noexcept {
+	return depth.stencil_address != 0 && depth.stencil_size != 0 &&
+	       storage.address == depth.stencil_address && storage.size == depth.stencil_size;
+}
+
+[[nodiscard]] inline constexpr bool
+IsMaterializableStorageDepthAlias(const ImageInfo& storage, const DepthTargetInfo& depth) noexcept {
+	const auto depth_tile = Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+	const auto image_2d = Prospero::GpuEnumValue(Prospero::ImageType::kColor2D);
+	const auto image_2d_array =
+	    Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+	const bool common =
+	    storage.address != 0 && storage.size != 0 && storage.base_level == 0 &&
+	    storage.levels == 1 && storage.view_levels == 1 &&
+	    storage.tile == depth_tile && storage.tile == depth.tile_mode && storage.depth == 1 &&
+	    storage.base_array == 0 && ((depth.stencil_address == 0) == (depth.stencil_size == 0)) &&
+	    ((depth.htile_address == 0) == (depth.htile_size == 0)) && depth.layers == 1 &&
+	    depth.samples == 1 && IsSupportedDepthTargetFormat(depth) &&
+	    storage.width == depth.width && storage.height == depth.height;
+	const bool storage_2d = storage.type == image_2d || storage.type == image_2d_array;
+	const bool exact_d16 =
+	    depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
+	    depth.bytes_per_element == 2 &&
+	    storage.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
+	const bool exact_d32 =
+	    depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
+	    depth.bytes_per_element == 4 &&
+	    (storage.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) ||
+	     storage.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt));
+	const bool exact_depth =
+	    storage.address == depth.address && storage.size == depth.size && storage_2d &&
+	    storage.pitch == depth.pitch && (exact_d16 || exact_d32);
+	// Prospero keeps stencil in a separate tiled allocation. A write-only R8_UINT array
+	// descriptor exposes that plane directly, with its own element-size-dependent pitch.
+	const bool exact_stencil_r8 =
+	    IsStorageStencilPlaneAlias(storage, depth) &&
+	    storage.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
+	    storage.type == image_2d_array &&
+	    storage.pitch >= storage.width;
+	return common && (exact_depth || exact_stencil_r8);
 }
 
 [[nodiscard]] inline constexpr bool
@@ -712,13 +795,14 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 	if (!ImagePageRangesOverlap(requested.address, requested.size, cached.address, cached.size)) {
 		return StorageSampledOverlap::None;
 	}
-	const bool same_backing =
-	    requested.address == cached.address && requested.size == cached.size &&
-	    requested.width == cached.width && requested.height == cached.height &&
-	    requested.pitch == cached.pitch && requested.base_level == cached.base_level &&
-	    requested.levels == cached.levels && requested.view_levels == cached.view_levels &&
-	    requested.tile == cached.tile && requested.depth == cached.depth &&
-	    requested.type == cached.type && requested.base_array == cached.base_array;
+	// CPU writes can make a cached storage view stale before the same bytes are rebound through a
+	// sampled descriptor with a different format, tile mode, or image type. With no native image,
+	// buffer, or tracker GPU ownership left, guest backing is authoritative and the stale storage
+	// allocation can be discarded without a readback.
+	if (!cached_gpu_modified && !cached_buffer_modified && !tracker_gpu_modified) {
+		return StorageSampledOverlap::DiscardStorage;
+	}
+	const bool same_backing = HasSampleCompatibleStorageImageBacking(requested, cached);
 	const bool compatible_format =
 	    (requested.format == cached.format && requested_view_format == cached_image_format) ||
 	    IsRgba8SrgbReinterpretation(cached_image_format, requested_view_format) ||
@@ -740,13 +824,18 @@ SelectDepthTransitionSource(bool depth_load_clear, bool sampled_native_available
 [[nodiscard]] inline HostWriteOverlap
 ClassifyHostWriteOverlap(uint64_t write_address, uint64_t write_size, uint64_t image_address,
                          uint64_t image_size, bool host_refreshable, bool gpu_modified,
-                         bool metadata_overlap) {
+                         bool metadata_overlap, bool gpu_synchronizable = false) {
 	if (!ImagePageRangesOverlap(write_address, write_size, image_address, image_size)) {
 		return HostWriteOverlap::None;
 	}
-	return host_refreshable && !gpu_modified && !metadata_overlap
-	           ? HostWriteOverlap::InvalidateImage
-	           : HostWriteOverlap::Unsupported;
+	if (!host_refreshable || metadata_overlap) {
+		return HostWriteOverlap::Unsupported;
+	}
+	if (gpu_modified) {
+		return gpu_synchronizable ? HostWriteOverlap::SynchronizeImage
+		                          : HostWriteOverlap::Unsupported;
+	}
+	return HostWriteOverlap::InvalidateImage;
 }
 
 [[nodiscard]] inline BufferImageWrite
@@ -779,15 +868,21 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
 			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
-			if (!exact || !buffer_page_aligned || !buffer_formatted) {
+			if (!contained || !buffer_page_aligned || !image_page_aligned) {
 				return BufferImageWrite::Unsupported;
 			}
-			if (image_gpu_modified && !image_buffer_modified) {
-				return BufferImageWrite::SynchronizeRenderTarget;
+			if (image_gpu_modified) {
+				// Preserve the complete native image in guest backing before a formatted buffer
+				// overwrites any contained page range. The synchronization path downloads the
+				// whole target, so bytes outside a partial write remain current.
+				return buffer_formatted && !image_buffer_modified
+				           ? BufferImageWrite::SynchronizeRenderTarget
+				           : BufferImageWrite::Unsupported;
 			}
-			return !image_gpu_modified && image_buffer_modified
-			           ? BufferImageWrite::InvalidateRenderTarget
-			           : BufferImageWrite::Unsupported;
+			// A raw page-aligned write inside a CPU-current render target can move just that byte
+			// range into native-buffer ownership. ObtainBufferForImage later downloads the dirty
+			// subrange into the full guest backing before refreshing the target.
+			return BufferImageWrite::InvalidateRenderTarget;
 		case BufferImageBinding::StorageTexture:
 			if (!image_page_aligned || !buffer_formatted) {
 				return BufferImageWrite::Unsupported;
@@ -1048,12 +1143,20 @@ ClassifyStorageImageOverlap(uint64_t requested_address, uint64_t requested_size,
 		           ? StorageImageOverlap::RetireSampled
 		           : StorageImageOverlap::Unsupported;
 	}
-	// A cached storage image reallocated at the same base (e.g. grown to more layers) is replaced by
-	// the new request; retire it so the new allocation owns the range. When it is not GPU-modified
-	// its bytes already live in guest memory (buffer-backed or clean), so the overlapping region
-	// survives the reallocation.
-	return !gpu_modified && !tracker_gpu_modified ? StorageImageOverlap::RetireStorage
-	                                              : StorageImageOverlap::Unsupported;
+	// Writable color images use exclusive byte ownership. A new storage shape replaces any clean
+	// overlapping image because its current bytes already reside in guest memory. If the old image
+	// owns the current bytes on the GPU, materialize its complete native layout first; this also
+	// preserves bytes outside a contained storage subrange for a later recreation of the old shape.
+	if (!gpu_modified && !tracker_gpu_modified) {
+		return StorageImageOverlap::RetireImage;
+	}
+	const bool page_isolated = requested_address % TRACKER_PAGE_SIZE == 0 &&
+	                           requested_size % TRACKER_PAGE_SIZE == 0 &&
+	                           cached_address % TRACKER_PAGE_SIZE == 0 &&
+	                           cached_size % TRACKER_PAGE_SIZE == 0;
+	return page_isolated && gpu_modified && tracker_gpu_modified && !buffer_modified
+	           ? StorageImageOverlap::MaterializeImage
+	           : StorageImageOverlap::Unsupported;
 }
 
 [[nodiscard]] inline constexpr bool LayeredBackingContains(uint64_t container_size,

@@ -72,7 +72,8 @@ public:
 	[[nodiscard]] bool HasPageOverlap(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void               PublishImageBacking(uint64_t vaddr, uint64_t size);
+	void PublishImageBacking(uint64_t vaddr, uint64_t size,
+	                         bool preserve_cpu_dirty = false);
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
 	// True when a descriptor's base is entirely un-GPU-mapped, i.e. an unbound/stale descriptor the
 	// guest never made GPU-visible. Such a descriptor should bind a null resource, not fault.

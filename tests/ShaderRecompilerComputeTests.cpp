@@ -1315,10 +1315,77 @@ public:
   }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  void CheckPartialBufferUnmapRetirement() {
+    constexpr const char *name = "PartialBufferUnmapRetirement";
+    constexpr uintptr_t base = 0x00000002003c0000ull;
+    constexpr uint64_t part_size = BufferCache::CACHING_PAGE_SIZE;
+    constexpr uint64_t allocation_size = part_size * 3;
+    auto *memory = static_cast<uint8_t *>(
+        VirtualAlloc(reinterpret_cast<void *>(base), allocation_size,
+                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(name, "allocation", memory == reinterpret_cast<void *>(base),
+            "fixed VirtualAlloc failed");
+    for (uint64_t i = 0; i < allocation_size; i++) {
+      memory[i] = static_cast<uint8_t>(i);
+    }
+
+    EnsureRuntimeContext();
+    ResourceMutex resource_mutex;
+    PageManager page_manager(RejectUnexpectedPageFault, nullptr);
+    BufferCache buffer_cache(m_runtime_context, page_manager, resource_mutex);
+    TextureCache texture_cache(m_runtime_context, page_manager, buffer_cache,
+                               resource_mutex);
+    buffer_cache.SetTextureCache(texture_cache);
+    page_manager.OnGpuMap(base, allocation_size);
+
+    {
+      CommandBuffer initial;
+      initial.Begin();
+      (void)buffer_cache.ObtainBuffer(initial, base, allocation_size, false,
+                                      true);
+      initial.End();
+      initial.Execute();
+      initial.WaitForFence();
+    }
+
+    const auto middle = base + part_size;
+    buffer_cache.UnmapMemory(middle, part_size);
+    page_manager.OnGpuUnmap(middle, part_size);
+    Require(name, "retained ownership",
+            buffer_cache.IsRegionCpuModified(base, part_size) &&
+                buffer_cache.IsRegionCpuModified(base + part_size * 2,
+                                                 part_size),
+            "retained sides still referred to the retired native buffer");
+
+    {
+      CommandBuffer rebound;
+      rebound.Begin();
+      (void)buffer_cache.ObtainBuffer(rebound, base, part_size, false, true);
+      (void)buffer_cache.ObtainBuffer(rebound, base + part_size * 2, part_size,
+                                      false, true);
+      rebound.End();
+      rebound.Execute();
+      rebound.WaitForFence();
+    }
+    Require(name, "rebind",
+            !buffer_cache.IsRegionCpuModified(base, part_size) &&
+                !buffer_cache.IsRegionCpuModified(base + part_size * 2,
+                                                  part_size),
+            "retained guest backing was not uploaded into replacement buffers");
+
+    buffer_cache.UnmapMemory(base, part_size);
+    page_manager.OnGpuUnmap(base, part_size);
+    buffer_cache.UnmapMemory(base + part_size * 2, part_size);
+    page_manager.OnGpuUnmap(base + part_size * 2, part_size);
+    Require(name, "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
+            "VirtualFree failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckQueryRegionImageClassification() {
     constexpr const char *name = "QueryRegionImageClassification";
     constexpr uintptr_t base = 0x0000000200100000ull;
-    constexpr uint64_t allocation_size = 0x4000;
+    constexpr uint64_t allocation_size = 8 * BufferCache::CACHING_PAGE_SIZE;
     auto *memory = static_cast<uint8_t *>(
         VirtualAlloc(reinterpret_cast<void *>(base), allocation_size,
                      MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -1409,7 +1476,168 @@ public:
                   !gpu_page.gpu_image_bytes && gpu_page.non_sampled_pages,
               "GPU ownership escaped the target's exact byte range");
 
+      CommandBuffer buffer_read;
+      buffer_read.Begin();
+      (void)buffer_cache.ObtainBuffer(buffer_read, base + 0x1000, 0x400,
+                                      false, true, true);
+      buffer_read.End();
+      buffer_read.Execute();
+      buffer_read.WaitForFence();
+      Require(name, "formatted buffer read",
+              !texture_cache
+                   .QueryRegion(target_info.address, target_info.size)
+                   .gpu_image_bytes,
+              "expanded read-only formatted buffer did not materialize its GPU-owned target");
+
+      RenderTargetInfo dirty_buffer_target{};
+      dirty_buffer_target.address = base + BufferCache::CACHING_PAGE_SIZE;
+      dirty_buffer_target.size = TRACKER_PAGE_SIZE;
+      dirty_buffer_target.format = vk::Format::eR8G8B8A8Unorm;
+      dirty_buffer_target.width = 64;
+      dirty_buffer_target.height = 16;
+      dirty_buffer_target.pitch = 64;
+      dirty_buffer_target.bytes_per_element = 4;
+      dirty_buffer_target.tile_mode = linear;
+      (void)texture_cache.FindRenderTarget(command, dirty_buffer_target);
+      {
+        CommandBuffer buffer_command;
+        buffer_command.Begin();
+        (void)buffer_cache.ObtainBuffer(
+            buffer_command, dirty_buffer_target.address,
+            dirty_buffer_target.size, false, true, true);
+        buffer_command.End();
+        buffer_command.Execute();
+        buffer_command.WaitForFence();
+      }
+      buffer_cache.PublishImageBacking(dirty_buffer_target.address,
+                                       dirty_buffer_target.size);
+      (void)texture_cache.FindRenderTarget(command, dirty_buffer_target);
+      Require(name, "exact target refresh",
+              !buffer_cache.IsRegionCpuModified(dirty_buffer_target.address,
+                                                dirty_buffer_target.size),
+              "exact lookup did not fold CPU-dirty buffer bytes into the target");
+      buffer_cache.PublishImageBacking(dirty_buffer_target.address,
+                                       dirty_buffer_target.size);
+      Require(name, "dirty-buffer fixture",
+              buffer_cache.IsRegionCpuModified(dirty_buffer_target.address,
+                                               dirty_buffer_target.size),
+              "failed to establish CPU-dirty buffer ownership");
+      CommandBuffer range_command;
+      auto *range_target = texture_cache.FindRenderTargetByRange(
+          range_command, dirty_buffer_target.address, dirty_buffer_target.size);
+      Require(
+          name, "range target refresh",
+          range_target != nullptr &&
+              !buffer_cache.IsRegionCpuModified(dirty_buffer_target.address,
+                                                dirty_buffer_target.size) &&
+              !texture_cache
+                   .QueryRegion(dirty_buffer_target.address,
+                                dirty_buffer_target.size)
+                   .gpu_image_bytes,
+          "range lookup did not fold CPU-dirty buffer bytes into the target");
+      texture_cache.MarkGpuWritten(*range_target);
+      Require(name, "range target GPU ownership",
+              texture_cache
+                  .QueryRegion(dirty_buffer_target.address,
+                               dirty_buffer_target.size)
+                  .gpu_image_bytes,
+              "refreshed range target could not acquire GPU ownership");
+
+      auto direct_write_target = dirty_buffer_target;
+      direct_write_target.address =
+          base + 2 * BufferCache::CACHING_PAGE_SIZE;
+      direct_write_target.size = 8 * TRACKER_PAGE_SIZE;
+      direct_write_target.height = 128;
+      auto &direct_write_image =
+          texture_cache.FindRenderTarget(command, direct_write_target);
+      const auto partial_buffer_size = direct_write_target.size / 2;
+      {
+        CommandBuffer direct_buffer;
+        direct_buffer.Begin();
+        (void)buffer_cache.ObtainBuffer(
+            direct_buffer, direct_write_target.address,
+            partial_buffer_size, false, true, true);
+        direct_buffer.End();
+        direct_buffer.Execute();
+        direct_buffer.WaitForFence();
+      }
+      buffer_cache.PublishImageBacking(direct_write_target.address,
+                                       direct_write_target.size);
+      Require(
+          name, "partial-buffer backing publication",
+          buffer_cache.IsRegionCpuModified(direct_write_target.address,
+                                           direct_write_target.size),
+          "complete image backing was not published across a partial buffer alias");
+      texture_cache.MarkGpuWritten(direct_write_image);
+      Require(
+          name, "partial-buffer GPU-write transition",
+          !buffer_cache.IsRegionCpuModified(direct_write_target.address,
+                                            direct_write_target.size) &&
+              texture_cache
+                  .QueryRegion(direct_write_target.address,
+                               direct_write_target.size)
+                  .gpu_image_bytes,
+          "MarkGpuWritten did not reconcile a partial dirty buffer alias");
+
+      VideoOutInfo video_info{};
+      video_info.address = base + 4 * BufferCache::CACHING_PAGE_SIZE;
+      video_info.format = vk::Format::eR8G8B8A8Srgb;
+      video_info.guest_format =
+          Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8Srgb);
+      video_info.width = 64;
+      video_info.height = 16;
+      video_info.pitch = TileGetTexturePitch(
+          video_info.guest_format, video_info.width, 1,
+          Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget));
+      video_info.bytes_per_element = 4;
+      video_info.tile_mode =
+          Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+      video_info.compression = VideoOutCompression::Uncompressed;
+      TileSizeAlign video_layout{};
+      TileGetTextureTotalSize(
+          video_info.guest_format, video_info.width, video_info.height, 1,
+          video_info.pitch, 1, video_info.tile_mode, false, video_layout);
+      video_info.size = video_layout.size;
+      Require(name, "video-out fixture",
+              video_layout.align == 0x10000 &&
+                  video_info.size == 4 * BufferCache::CACHING_PAGE_SIZE &&
+                  video_info.address + video_info.size <=
+                      base + allocation_size,
+              "video-out fixture has an unexpected guest layout");
+      auto video_images =
+          texture_cache.RegisterVideoOutSurfaces({video_info});
+      Require(name, "video-out registration",
+              video_images.size() == 1 && video_images.front() != nullptr,
+              "video-out fixture was not registered");
+      {
+        CommandBuffer video_buffer;
+        video_buffer.Begin();
+        (void)buffer_cache.ObtainBuffer(
+            video_buffer, video_info.address, video_info.size, false, true,
+            true);
+        video_buffer.End();
+        video_buffer.Execute();
+        video_buffer.WaitForFence();
+      }
+      buffer_cache.PublishImageBacking(video_info.address, video_info.size);
+      Require(name, "video-out dirty-buffer fixture",
+              buffer_cache.IsRegionCpuModified(video_info.address,
+                                               video_info.size),
+              "failed to establish dirty display-buffer ownership");
+      texture_cache.RefreshVideoOut(*video_images.front(), true);
+      Require(name, "video-out render refresh",
+              !buffer_cache.IsRegionCpuModified(video_info.address,
+                                                video_info.size),
+              "display render-target refresh retained dirty buffer ownership");
+      texture_cache.MarkGpuWritten(*video_images.front());
+      Require(name, "video-out GPU ownership",
+              texture_cache.QueryRegion(video_info.address, video_info.size)
+                  .gpu_image_bytes,
+              "refreshed display target could not acquire GPU ownership");
+      texture_cache.UnregisterVideoOutSurfaces(video_images);
+
       texture_cache.UnmapMemory(base, allocation_size);
+      buffer_cache.UnmapMemory(base, allocation_size);
       page_manager.OnGpuUnmap(base, allocation_size);
     }
     Require(name, "free", VirtualFree(memory, 0, MEM_RELEASE) != 0,
@@ -10772,6 +11000,19 @@ ShaderTextureResource Standard4KBStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+ShaderTextureResource ExpandedWriteMetadataStorageTextureDescriptor() {
+  // Write-only six-layer storage image with DCC read metadata present, but compression-producing
+  // writes disabled. Kyty represents the logical image as an expanded Vulkan image.
+  return {{0x200fd400u, 0xc4500000u, 0x003fc03fu, 0xd1b00facu, 0x00000005u,
+           0x00700000u, 0x006b0000u, 0x0020110bu}};
+}
+
+ShaderTextureResource PpsaStorageR16DepthTileDescriptor() {
+  // Write-only one-layer R16_UNORM depth-tiled 2D-array storage image, 10240x2048.
+  return {{0x22e5d700u, 0xc0700000u, 0x01ffc9ffu, 0xd1800204u, 0x00000000u,
+           0x00700000u, 0x00000000u, 0x00000000u}};
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -10800,7 +11041,7 @@ ShaderTextureResource Standard4KBStorageTextureDescriptor() {
     descriptor = BasicYzwxStorageTextureDescriptor();
     descriptor.fields[1] =
         (descriptor.fields[1] & ~0x1ff00000u) |
-        (Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16Float)
+        (Prospero::GpuEnumValue(Prospero::BufferFormat::kBc1UNorm)
          << 20u);
   } else if (std::strcmp(kind, "resource") == 0) {
     resource.written = false;
@@ -10811,12 +11052,12 @@ ShaderTextureResource Standard4KBStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "tile") == 0) {
     descriptor.fields[3] =
         (descriptor.fields[3] & ~(0x1fu << 20u)) |
-        (Prospero::GpuEnumValue(Prospero::TileMode::kStandard64KB) << 20u);
+        (2u << 20u);
   } else if (std::strcmp(kind, "mip") == 0) {
     descriptor.fields[3] |= 1u << 16u;
   } else if (std::strcmp(kind, "swizzle") == 0) {
     descriptor.fields[3] =
-        (descriptor.fields[3] & ~0xfffu) | DstSel(4, 5, 6, 1);
+        (descriptor.fields[3] & ~0xfffu) | DstSel(4, 5, 2, 7);
   } else if (std::strcmp(kind, "array-base-view") == 0) {
     resource = BasicArrayStorageTextureResource();
     descriptor = BasicArrayStorageTextureDescriptor();
@@ -10830,6 +11071,14 @@ ShaderTextureResource Standard4KBStorageTextureDescriptor() {
     descriptor.fields[1] |= 1u << 29u;
   } else if (std::strcmp(kind, "metadata") == 0) {
     descriptor.fields[6] |= 1u << 21u;
+  } else if (std::strcmp(kind, "metadata-read") == 0) {
+    resource = BasicArrayStorageTextureResource();
+    descriptor = ExpandedWriteMetadataStorageTextureDescriptor();
+    resource.read = true;
+  } else if (std::strcmp(kind, "metadata-write-compress") == 0) {
+    resource = BasicArrayStorageTextureResource();
+    descriptor = ExpandedWriteMetadataStorageTextureDescriptor();
+    descriptor.fields[6] |= 1u << 20u;
   } else if (std::strcmp(kind, "uint-format") == 0) {
     descriptor.fields[1] =
         (descriptor.fields[1] & ~0x1ff00000u) |
@@ -10844,7 +11093,10 @@ ShaderTextureResource Standard4KBStorageTextureDescriptor() {
   } else if (std::strcmp(kind, "depth-tile-extent") == 0) {
     resource = Ppsa14053DepthTileStorageTextureResource();
     descriptor = Ppsa14053DepthTileStorageTextureDescriptor();
-    descriptor.fields[4] |= 1u;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+    descriptor.fields[3] =
+        (descriptor.fields[3] & 0x0fffffffu) |
+        (Prospero::GpuEnumValue(Prospero::ImageType::kColor3D) << 28u);
   } else {
     std::_Exit(0x7e);
   }
@@ -11063,6 +11315,66 @@ void CheckBasicStorageTextureDescriptor() {
           "array mip-view storage descriptor fixture is malformed");
   ValidateStorageTexture(BasicUintArrayStorageTextureResource(), array_mip, 0x156000);
 
+  const auto expanded_metadata = ExpandedWriteMetadataStorageTextureDescriptor();
+  Require("BasicStorageTexture", "expanded write metadata descriptor",
+          expanded_metadata.Base40() == 0x200fd40000ull &&
+              expanded_metadata.Width5() + 1u == 256 &&
+              expanded_metadata.Height5() + 1u == 256 &&
+              expanded_metadata.Depth() + 1u == 6 &&
+              expanded_metadata.Type() ==
+                  Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+              expanded_metadata.MetaCompress() &&
+              !expanded_metadata.WriteCompress() &&
+              expanded_metadata.MetaAddr() == 0x20110b00ull,
+          "expanded write metadata storage descriptor fixture is malformed");
+  ValidateStorageTexture(BasicArrayStorageTextureResource(), expanded_metadata,
+                         0x300000);
+
+  const auto r16_depth = PpsaStorageR16DepthTileDescriptor();
+  Require(
+      "BasicStorageTexture", "R16 depth-tile descriptor",
+      r16_depth.Base40() == 0x22e5d70000ull &&
+          r16_depth.Width5() + 1u == 10240 &&
+          r16_depth.Height5() + 1u == 2048 &&
+          r16_depth.Depth() + 1u == 1 &&
+          r16_depth.Format() ==
+              Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm) &&
+          r16_depth.Type() ==
+              Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) &&
+          r16_depth.TileMode() ==
+              Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
+          r16_depth.DstSelXYZW() == DstSel(4, 0, 0, 1) &&
+          IsSupportedStorageSwizzle(r16_depth.Format(),
+                                    r16_depth.DstSelXYZW()) &&
+          IsSupportedStorageTile(
+              r16_depth.Format(), r16_depth.Type(),
+              static_cast<uint32_t>(r16_depth.Width5()) + 1u,
+              static_cast<uint32_t>(r16_depth.Height5()) + 1u,
+              static_cast<uint32_t>(r16_depth.Depth()) + 1u,
+              r16_depth.TileMode(), false) &&
+          SelectStorageColorView(vk::Format::eR16Unorm,
+                                 vk::Format::eR16Unorm,
+                                 r16_depth.DstSelXYZW()) ==
+              VulkanImage::VIEW_STORAGE,
+      "generic storage capabilities rejected the observed R16 depth surface");
+  ValidateStorageTexture(BasicArrayStorageTextureResource(), r16_depth,
+                         0x2800000);
+
+  for (const auto tile :
+       {Prospero::TileMode::kStandard256B,
+        Prospero::TileMode::kStandard4KB,
+        Prospero::TileMode::kStandard64KB, Prospero::TileMode::kPrt,
+        Prospero::TileMode::kRenderTarget}) {
+    Require(
+        "BasicStorageTexture", "generic tile family",
+        IsSupportedStorageTile(
+            Prospero::GpuEnumValue(
+                Prospero::BufferFormat::k16_16_16_16Float),
+            Prospero::GpuEnumValue(Prospero::ImageType::kColor2D), 256, 256,
+            1, Prospero::GpuEnumValue(tile), false),
+        "a tiler-supported storage family remained descriptor-whitelisted");
+  }
+
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
           GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -11071,7 +11383,8 @@ void CheckBasicStorageTextureDescriptor() {
        {"resource", "type", "tile", "mip", "swizzle", "linear-rgb1-read",
         "bgra-read", "r16-float-read", "r8-unorm-read", "yzwx-read",
         "yzwx-format", "array-base-view", "reserved",
-        "metadata", "uint-format", "uint-resource-float-format",
+        "metadata", "metadata-read", "metadata-write-compress", "uint-format",
+        "uint-resource-float-format",
         "depth-tile-read", "depth-tile-extent"}) {
     std::string command = std::string("\"") + path +
                           "\" --storage-texture-descriptor-death " + kind;
@@ -11395,6 +11708,42 @@ void CheckStorageTextureVolumeUploadLayout() {
   std::printf("[host]    %-32s ok\n", "StorageTextureVolumeUpload");
 }
 
+void CheckStorageTextureSingletonVolumeReadbackLayout() {
+  constexpr uint32_t format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+  constexpr uint32_t width = 1;
+  constexpr uint32_t height = 1;
+  constexpr uint32_t depth = 1;
+  constexpr uint32_t levels = 1;
+  constexpr uint32_t tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  const auto pitch = TileGetTexturePitch(format, width, levels, tile);
+  TileSizeAlign total{};
+  TileGetTextureTotalSize(format, width, height, depth, pitch, levels, tile,
+                          true, total);
+  const auto layout = TextureCalcUploadLayout(
+      format, width, height, levels, depth, pitch, tile, total.size, true, true,
+      "StorageTextureSingletonVolumeReadbackTest");
+  const auto uploads = TextureBuildUploadRegions(
+      layout, vk::Format::eR8G8B8A8Unorm, width, height, depth, levels, false,
+      true, TextureUploadDestination::MipLevels);
+  const auto downloads = TextureBuildDownloadRegions(uploads);
+  std::vector<GpuTileInfo> infos;
+  const bool built = TextureBuildGpuTileInfos(
+      total.size, uploads, layout, format, depth, levels, infos);
+
+  Require(
+      "StorageTextureSingletonVolumeReadback", "layout",
+      pitch == 128 && total.size == 0x10000 && layout.volume_texture &&
+          uploads.size() == 1 && downloads.size() == 1 && built &&
+          infos.size() == 1 && uploads[0].dst_level == 0 &&
+          uploads[0].dst_z == 0 && downloads[0].src_level == 0 &&
+          downloads[0].src_z == 0 && downloads[0].offset == uploads[0].offset,
+      "1x1x1 3D storage image could not build its tiled readback plan");
+  std::printf("[host]    %-32s ok\n",
+              "StorageTextureSingletonVolumeReadback");
+}
+
 void CheckStorageTextureVolumeMipRegions() {
   constexpr uint32_t format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
@@ -11666,6 +12015,60 @@ void CheckStorageTextureSampledReuse() {
               vk::Format::eR16G16B16A16Sfloat, true,
               false) == StorageSampledOverlap::ExactImage,
           "exact GPU-owned storage image was not reusable for sampling");
+  ImageInfo mip_view_storage{};
+  mip_view_storage.address = 0x2033670000ull;
+  mip_view_storage.size = 0x560000;
+  mip_view_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16Float);
+  mip_view_storage.width = 2048;
+  mip_view_storage.height = 1024;
+  mip_view_storage.pitch = 2048;
+  mip_view_storage.levels = 11;
+  mip_view_storage.view_levels = 1;
+  mip_view_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  mip_view_storage.swizzle = DstSel(4, 0, 0, 1);
+  mip_view_storage.depth = 1;
+  mip_view_storage.type = image_2d;
+  auto sampled_mip_view = mip_view_storage;
+  sampled_mip_view.base_level = 3;
+  Require(
+      "StorageTextureSampledReuse", "same backing mip view",
+      HasSameStorageImageBacking(sampled_mip_view, mip_view_storage) &&
+          ClassifyStorageSampledOverlap(
+              sampled_mip_view, mip_view_storage, vk::Format::eR16Sfloat,
+              vk::Format::eR16Sfloat, true, false, false, false,
+              true) == StorageSampledOverlap::ExactImage,
+      "sampled mip view did not reuse its GPU-owned full storage backing");
+  ImageInfo single_layer_array_storage{};
+  single_layer_array_storage.address = 0x2010160000ull;
+  single_layer_array_storage.size = 0x10000;
+  single_layer_array_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+  single_layer_array_storage.width = 1;
+  single_layer_array_storage.height = 1;
+  single_layer_array_storage.pitch = 128;
+  single_layer_array_storage.levels = 1;
+  single_layer_array_storage.view_levels = 1;
+  single_layer_array_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  single_layer_array_storage.swizzle = DstSel(6, 5, 4, 7);
+  single_layer_array_storage.depth = 1;
+  single_layer_array_storage.type = image_2d_array;
+  auto single_layer_sampled = single_layer_array_storage;
+  single_layer_sampled.type = image_2d;
+  Require(
+      "StorageTextureSampledReuse", "single-layer 2D/array view",
+      !HasSameStorageImageBacking(single_layer_sampled,
+                                  single_layer_array_storage) &&
+          HasSampleCompatibleStorageImageBacking(single_layer_sampled,
+                                                 single_layer_array_storage) &&
+          ClassifyStorageSampledOverlap(
+              single_layer_sampled, single_layer_array_storage,
+              vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, true,
+              false, false, false,
+              true) == StorageSampledOverlap::ExactImage,
+      "single-layer array storage backing did not accept an equivalent 2D sampled view");
   auto incompatible = storage;
   incompatible.format =
       Prospero::GpuEnumValue(Prospero::BufferFormat::k16_16_16_16UNorm);
@@ -11689,6 +12092,40 @@ void CheckStorageTextureSampledReuse() {
                   vk::Format::eR16G16B16A16Sfloat, true,
                   true) == StorageSampledOverlap::Unsupported,
           "incompatible storage-image state was accepted for sampling");
+  ImageInfo cpu_reinterpreted_sample{};
+  cpu_reinterpreted_sample.address = 0x200f540000ull;
+  cpu_reinterpreted_sample.size = 0x400000;
+  cpu_reinterpreted_sample.format = 130;
+  cpu_reinterpreted_sample.width = 1024;
+  cpu_reinterpreted_sample.height = 1024;
+  cpu_reinterpreted_sample.pitch = 1024;
+  cpu_reinterpreted_sample.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB);
+  cpu_reinterpreted_sample.swizzle = DstSel(6, 5, 4, 7);
+  cpu_reinterpreted_sample.type = image_2d;
+  auto stale_storage = cpu_reinterpreted_sample;
+  stale_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm);
+  stale_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
+  stale_storage.type = image_2d_array;
+  Require(
+      "StorageTextureSampledReuse", "CPU-authoritative reinterpretation",
+      ClassifyStorageSampledOverlap(
+          cpu_reinterpreted_sample, stale_storage,
+          vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, false, true,
+          false, false, false) == StorageSampledOverlap::DiscardStorage &&
+          ClassifyStorageSampledOverlap(
+              cpu_reinterpreted_sample, stale_storage,
+              vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, false,
+              true, false, true, false) ==
+              StorageSampledOverlap::Unsupported &&
+          ClassifyStorageSampledOverlap(
+              cpu_reinterpreted_sample, stale_storage,
+              vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm, false,
+              true, false, false, true) ==
+              StorageSampledOverlap::Unsupported,
+      "CPU-authoritative storage alias was not discarded with strict ownership guards");
   auto separate = storage;
   separate.address += 0x400000;
   Require("StorageTextureSampledReuse", "separate",
@@ -11888,6 +12325,97 @@ void CheckStorageTextureDepthAlias() {
               ClassifyStorageDepthOverlap(storage, false, false, false, true,
                                           depth) == DepthOverlap::Unsupported,
           "incoherent storage-to-depth transition was admitted");
+  ImageInfo raw_depth_storage{};
+  raw_depth_storage.address = 0x20023c0000ull;
+  raw_depth_storage.size = 0x700000;
+  raw_depth_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt);
+  raw_depth_storage.width = 3360;
+  raw_depth_storage.height = 1892;
+  raw_depth_storage.pitch = 3584;
+  raw_depth_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  raw_depth_storage.swizzle = DstSel(4, 0, 0, 1);
+  raw_depth_storage.type =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+  DepthTargetInfo raw_depth{};
+  raw_depth.address = 0x2023ff0000ull;
+  raw_depth.size = 0x1950000;
+  raw_depth.stencil_address = raw_depth_storage.address;
+  raw_depth.stencil_size = raw_depth_storage.size;
+  raw_depth.format = vk::Format::eD32SfloatS8Uint;
+  raw_depth.guest_format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
+  raw_depth.width = 3360;
+  raw_depth.height = 1892;
+  raw_depth.pitch = 3456;
+  raw_depth.bytes_per_element = 4;
+  raw_depth.tile_mode =
+      Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  Require(
+      "StorageTextureDepthAlias", "separate R8 stencil plane",
+      IsStorageStencilPlaneAlias(raw_depth_storage, raw_depth) &&
+          IsMaterializableStorageDepthAlias(raw_depth_storage, raw_depth),
+      "write-only R8 storage range could not materialize its depth target's stencil plane");
+  auto oversized_raw_depth = raw_depth_storage;
+  oversized_raw_depth.size += 0x10000;
+  auto mismatched_raw_depth = raw_depth_storage;
+  mismatched_raw_depth.height--;
+  auto compressed_raw_depth = raw_depth;
+  compressed_raw_depth.htile_address = 0x2010000000ull;
+  compressed_raw_depth.htile_size = 0x10000;
+  auto inconsistent_raw_depth = compressed_raw_depth;
+  inconsistent_raw_depth.htile_size = 0;
+  auto mismatched_stencil_range = raw_depth;
+  mismatched_stencil_range.stencil_address += 0x10000;
+  Require(
+      "StorageTextureDepthAlias", "stencil alias guards",
+      !IsMaterializableStorageDepthAlias(oversized_raw_depth, raw_depth) &&
+          !IsMaterializableStorageDepthAlias(mismatched_raw_depth, raw_depth) &&
+          !IsMaterializableStorageDepthAlias(raw_depth_storage,
+                                             mismatched_stencil_range) &&
+          IsMaterializableStorageDepthAlias(raw_depth_storage,
+                                            compressed_raw_depth) &&
+          !IsMaterializableStorageDepthAlias(raw_depth_storage,
+                                             inconsistent_raw_depth),
+      "stencil alias range, shape, or metadata guards are incorrect");
+  ImageInfo d16_storage{};
+  d16_storage.address = 0x22e5d70000ull;
+  d16_storage.size = 0x2800000;
+  d16_storage.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
+  d16_storage.width = 10240;
+  d16_storage.height = 2048;
+  d16_storage.pitch = 10240;
+  d16_storage.tile =
+      Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+  d16_storage.type =
+      Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray);
+  DepthTargetInfo d16_depth{};
+  d16_depth.address = d16_storage.address;
+  d16_depth.size = d16_storage.size;
+  d16_depth.format = vk::Format::eD16Unorm;
+  d16_depth.guest_format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16UNorm);
+  d16_depth.width = d16_storage.width;
+  d16_depth.height = d16_storage.height;
+  d16_depth.pitch = d16_storage.pitch;
+  d16_depth.bytes_per_element = 2;
+  d16_depth.tile_mode = d16_storage.tile;
+  Require(
+      "StorageTextureDepthAlias", "D16/R16 main plane",
+      IsMaterializableStorageDepthAlias(d16_storage, d16_depth),
+      "one-layer R16 storage could not materialize its matching D16 depth allocation");
+  auto wrong_d16_format = d16_storage;
+  wrong_d16_format.format =
+      Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt);
+  auto wrong_d16_pitch = d16_storage;
+  wrong_d16_pitch.pitch--;
+  Require(
+      "StorageTextureDepthAlias", "D16/R16 guards",
+      !IsMaterializableStorageDepthAlias(wrong_d16_format, d16_depth) &&
+          !IsMaterializableStorageDepthAlias(wrong_d16_pitch, d16_depth),
+      "incompatible D16 storage reinterpretation was accepted");
   storage.address = 0x2000000000ull;
   Require("StorageTextureDepthAlias", "disjoint",
           ClassifyStorageDepthOverlap(storage, true, true, true, true, depth) ==
@@ -12489,12 +13017,21 @@ void CheckBufferImageWrites() {
       Case{"target partial", target, target_size - 4, target, target_size,
            BufferImageBinding::RenderTarget, true, true,
            BufferImageWrite::Unsupported},
+      Case{"target GPU-owned formatted prefix", 0x2033770000ull, 0x18d8000,
+           0x2033770000ull, 0x1950000, BufferImageBinding::RenderTarget, true,
+           true, BufferImageWrite::SynchronizeRenderTarget},
       Case{"target CPU-owned", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, false, true,
-           BufferImageWrite::Unsupported},
+           BufferImageWrite::InvalidateRenderTarget},
       Case{"target unformatted", target, target_size, target, target_size,
            BufferImageBinding::RenderTarget, true, false,
            BufferImageWrite::Unsupported},
+      Case{"target clean partial raw", 0x20442c0000ull, 0x2000,
+           0x20442c0000ull, 0x1c0000, BufferImageBinding::RenderTarget, false,
+           false, BufferImageWrite::InvalidateRenderTarget},
+      Case{"target clean partial unaligned", 0x20442c0000ull, 0x1fff,
+           0x20442c0000ull, 0x1c0000, BufferImageBinding::RenderTarget, false,
+           false, BufferImageWrite::Unsupported},
       Case{"target unaligned", target + 0x100, target_size, target + 0x100,
            target_size, BufferImageBinding::RenderTarget, true, true,
            BufferImageWrite::Unsupported},
@@ -13045,6 +13582,29 @@ void CheckImageOverlapResolution() {
                                       true, true, false,
                                       true) == StorageImageOverlap::Unsupported,
           "GPU-owned sampled subrange was admitted as storage backing");
+  constexpr uint64_t storage_target_address = 0x20f8e40000ull;
+  constexpr uint64_t storage_target_size = 0x560000;
+  constexpr uint64_t cached_target_size = 0x7e0000;
+  Require(
+      "ImageOverlapResolution", "storage materializes contained render target",
+      ClassifyStorageImageOverlap(
+          storage_target_address, storage_target_size, storage_target_address,
+          cached_target_size, false, true, false, true) ==
+          StorageImageOverlap::MaterializeImage,
+      "GPU-owned render-target prefix was not selected for materialization");
+  Require("ImageOverlapResolution", "storage retires clean color image",
+          ClassifyStorageImageOverlap(
+              storage_target_address, storage_target_size,
+              storage_target_address, cached_target_size, false, false, true,
+              false) == StorageImageOverlap::RetireImage,
+          "guest-current color-image prefix was not selected for retirement");
+  Require(
+      "ImageOverlapResolution", "storage rejects unisolated GPU image",
+      ClassifyStorageImageOverlap(
+          storage_target_address + 1, storage_target_size,
+          storage_target_address, cached_target_size, false, true, false,
+          true) == StorageImageOverlap::Unsupported,
+      "unaligned GPU-owned image alias was admitted for materialization");
   ImageInfo page_left = sampled;
   page_left.size = TRACKER_PAGE_SIZE / 2;
   ImageInfo same_page = page_left;
@@ -13131,8 +13691,14 @@ void CheckImageOverlapResolution() {
   Require("ImageOverlapResolution", "host copy GPU render target",
           ClassifyHostWriteOverlap(dma_address, dma_size, target_address,
                                    target_size, true, true,
+                                   false, true) ==
+              HostWriteOverlap::SynchronizeImage,
+          "host-backed copy did not synchronize its GPU-owned render target");
+  Require("ImageOverlapResolution", "host fill GPU sampled image",
+          ClassifyHostWriteOverlap(fill_address, fill_size, texture_address,
+                                   texture_size, true, true,
                                    false) == HostWriteOverlap::Unsupported,
-          "host-backed copy was admitted over a GPU-owned render target");
+          "host-backed fill synchronized a GPU-owned non-target image");
   Require("ImageOverlapResolution", "host copy partial clean render target",
           ClassifyHostWriteOverlap(target_address + 0x1000, 0x1000,
                                    target_address, target_size, true, false,
@@ -14513,6 +15079,48 @@ void CheckClipControlDepthClipState() {
   std::printf("[host]    %-32s ok\n", "ClipControlDepthClipState");
 }
 
+void CheckRecycledWaitRegMemLabel() {
+  constexpr uint64_t address = 0x0000001020e69040ull;
+
+  Require("RecycledWaitRegMemLabel", "next entry",
+          TestRecycledWaitRegMemLabel(address, 0x20e69020, 1, UINT32_MAX, 32, 3, 0),
+          "adjacent recycled label was not recognized");
+  Require("RecycledWaitRegMemLabel", "prior entry",
+          TestRecycledWaitRegMemLabel(0x0000001020e55d20ull, 0x20e55d40, 1,
+                                      UINT32_MAX, 32, 3, 0),
+          "reverse adjacent recycled label was not recognized");
+  Require("RecycledWaitRegMemLabel", "free-list span",
+          TestRecycledWaitRegMemLabel(0x0000001020efc2e0ull, 0x20efafe0, 1,
+                                      UINT32_MAX, 32, 3, 0),
+          "non-adjacent recycled label was not recognized");
+
+  Require("RecycledWaitRegMemLabel", "strict contract",
+          !TestRecycledWaitRegMemLabel(address, 0, 1, UINT32_MAX, 32, 3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 1, 1, UINT32_MAX, 32, 3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69020, 2, UINT32_MAX, 32,
+                                            3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69020, 1, 0xffff, 32, 3,
+                                            0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69020, 1, UINT32_MAX, 64,
+                                            3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69020, 1, UINT32_MAX, 32,
+                                            4, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69020, 1, UINT32_MAX, 32,
+                                            3, 1),
+          "a non-completion WAIT_REG_MEM contract was accepted");
+  Require("RecycledWaitRegMemLabel", "strict pool shape",
+          !TestRecycledWaitRegMemLabel(address + 4, 0x20e69020, 1, UINT32_MAX, 32,
+                                       3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20e69024, 1, UINT32_MAX, 32,
+                                            3, 0) &&
+              !TestRecycledWaitRegMemLabel(0x0000002020e69040ull, 0x20e69020, 1,
+                                            UINT32_MAX, 32, 3, 0) &&
+              !TestRecycledWaitRegMemLabel(address, 0x20d69020, 1, UINT32_MAX, 32,
+                                            3, 0),
+          "an address outside the observed label pool shape was accepted");
+  std::printf("[host]    %-32s ok\n", "RecycledWaitRegMemLabel");
+}
+
 void CheckPm4WaitResume() {
   GraphicsInitJmpTables();
   CommandProcessor processor;
@@ -14738,6 +15346,7 @@ int main(int argc, char **argv) {
   CheckColorResolveLayers();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
+  CheckStorageTextureSingletonVolumeReadbackLayout();
   CheckStorageTextureVolumeMipRegions();
   CheckStorageTextureGpuOwnedRebindState();
   CheckStorageTextureSampledReuse();
@@ -14763,6 +15372,7 @@ int main(int argc, char **argv) {
 #endif
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
+  CheckRecycledWaitRegMemLabel();
   CheckPm4WaitResume();
   CheckPm4CeCompletion();
   CheckEmbeddedFetchVertexOffset();
@@ -14770,6 +15380,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   VulkanHarness vulkan;
   vulkan.CheckCommandPoolGrowth();
+  vulkan.CheckPartialBufferUnmapRetirement();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckQueryRegionImageClassification();
   vulkan.CheckSampledAliasWriteTransitions();

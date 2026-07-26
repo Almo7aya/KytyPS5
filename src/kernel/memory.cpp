@@ -1283,15 +1283,46 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
                          VirtualMemory::Mode mode, GpuAccessMode gpu_mode) {
 	Common::LockGuard lock(m_mutex);
 
+	if (len == 0 || phys_addr > UINT64_MAX - len) {
+		return false;
+	}
+
 	auto next = m_physical.upper_bound(phys_addr);
 	if (next == m_physical.begin()) {
 		return false;
 	}
 	const auto& block = std::prev(next)->second;
 	if (block.pool_expansion || phys_addr < block.start_addr ||
-	    phys_addr >= block.start_addr + block.size ||
-	    len > block.start_addr + block.size - phys_addr) {
+	    phys_addr >= block.start_addr + block.size) {
 		return false;
+	}
+
+	// Direct-memory allocators may build one logical arena from several adjacent
+	// sceKernelAllocateDirectMemory results. A subsequent mapping is allowed to cross those
+	// allocation-record boundaries as long as the whole physical span is allocated with the same
+	// memory type. Keep one mapping record so the existing partial-unmap and alias-release paths
+	// continue to treat the virtual mapping atomically.
+	const auto memory_type = block.memory_type;
+	auto       current     = phys_addr;
+	const auto end         = phys_addr + len;
+	auto       allocation  = std::prev(next);
+	while (current < end) {
+		const auto& current_block = allocation->second;
+		if (current_block.pool_expansion || current_block.memory_type != memory_type ||
+		    current < current_block.start_addr ||
+		    current >= current_block.start_addr + current_block.size) {
+			return false;
+		}
+
+		current = std::min(end, current_block.start_addr + current_block.size);
+		if (current == end) {
+			break;
+		}
+
+		++allocation;
+		if (allocation == m_physical.end() || allocation->first != current) {
+			return false;
+		}
 	}
 
 	AllocatedBlock mapping = block;
@@ -1312,14 +1343,44 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 bool PhysicalMemory::CanMapDirect(uint64_t phys_addr, size_t len) {
 	Common::LockGuard lock(m_mutex);
 
+	if (len == 0 || phys_addr > UINT64_MAX - len) {
+		return false;
+	}
+
 	auto next = m_physical.upper_bound(phys_addr);
 	if (next == m_physical.begin()) {
 		return false;
 	}
-	const auto& block = std::prev(next)->second;
-	return !block.pool_expansion && phys_addr >= block.start_addr &&
-	       phys_addr < block.start_addr + block.size &&
-	       len <= block.start_addr + block.size - phys_addr;
+	auto        allocation = std::prev(next);
+	const auto& block      = allocation->second;
+	if (block.pool_expansion || phys_addr < block.start_addr ||
+	    phys_addr >= block.start_addr + block.size) {
+		return false;
+	}
+
+	const auto memory_type = block.memory_type;
+	auto       current     = phys_addr;
+	const auto end         = phys_addr + len;
+	while (current < end) {
+		const auto& current_block = allocation->second;
+		if (current_block.pool_expansion || current_block.memory_type != memory_type ||
+		    current < current_block.start_addr ||
+		    current >= current_block.start_addr + current_block.size) {
+			return false;
+		}
+
+		current = std::min(end, current_block.start_addr + current_block.size);
+		if (current == end) {
+			return true;
+		}
+
+		++allocation;
+		if (allocation == m_physical.end() || allocation->first != current) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 bool PhysicalMemory::ReleasePoolExpansion(uint64_t phys_addr, size_t len) {

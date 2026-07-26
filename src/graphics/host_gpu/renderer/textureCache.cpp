@@ -207,6 +207,7 @@ struct TextureCache::CachedImage {
 	bool             gpu_modified        = false;
 	bool             buffer_modified     = false;
 	bool             stencil_initialized = false;
+	bool             stencil_detached    = false;
 	bool             registered          = false;
 
 	~CachedImage() {
@@ -220,7 +221,8 @@ struct TextureCache::CachedImage {
 	}
 
 	[[nodiscard]] uint32_t RangeCount() const {
-		return kind == Kind::DepthTarget && depth.stencil_address != 0 ? 2u : 1u;
+		return kind == Kind::DepthTarget && depth.stencil_address != 0 && !stencil_detached ? 2u
+		                                                                                  : 1u;
 	}
 	[[nodiscard]] BufferImageBinding BufferBinding() const {
 		switch (kind) {
@@ -487,6 +489,12 @@ struct TextureCache::ReadbackWorker {
 	[[nodiscard]] ReadbackTransfer DownloadDepthTarget(CachedImage& cached,
 	                                                   bool         require_fault_range = true) {
 		const auto& info = cached.depth;
+		if (cached.stencil_detached) {
+			EXIT("TextureCache: cannot read back a depth target with detached stencil ownership, "
+			     "depth=0x%016" PRIx64 "+0x%016" PRIx64 " stencil=0x%016" PRIx64
+			     "+0x%016" PRIx64 "\n",
+			     info.address, info.size, info.stencil_address, info.stencil_size);
+		}
 		if (info.samples != 1 || cached.image->samples != 1) {
 			EXIT("TextureCache: multisampled depth-image readback is unsupported, samples=%u/%u\n",
 			     info.samples, cached.image->samples);
@@ -656,7 +664,8 @@ struct TextureCache::ReadbackWorker {
 		return transfer;
 	}
 
-	[[nodiscard]] ReadbackTransfer DownloadColorImage(CachedImage& cached) {
+	[[nodiscard]] ReadbackTransfer DownloadColorImage(CachedImage& cached,
+	                                                  bool publish_buffer = true) {
 		const bool storage = cached.kind == CachedImage::Kind::StorageTexture;
 		const bool target  = cached.kind == CachedImage::Kind::RenderTarget;
 		const auto info =
@@ -666,20 +675,18 @@ struct TextureCache::ReadbackWorker {
 		const bool linear = info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kLinear);
 		const bool tiled_target = target && IsTiledRenderTarget(cached.target);
 		const bool tiled_storage =
+		    storage && !linear &&
+		    IsSupportedStorageTile(cached.info.format, cached.info.type, cached.info.width,
+		                           cached.info.height, cached.info.depth, cached.info.tile, false);
+		const bool storage_array  = storage && TextureIsLayeredTexture(cached.info.type);
+		const bool storage_volume = storage && TextureIs3DTexture(cached.info.type);
+		const bool storage_2d =
 		    storage &&
-		    (info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-		     info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB));
-		bool single_layer_storage = false;
-		if (storage) {
-			switch (static_cast<Prospero::ImageType>(cached.info.type)) {
-				case Prospero::ImageType::kColor2D:
-				case Prospero::ImageType::kColor2DArray:
-					single_layer_storage = cached.info.depth == 1;
-					break;
-				default: break;
-			}
-		}
-		const auto    layers = target ? cached.target.layers : 1u;
+		    cached.info.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
+		    cached.info.depth == 1;
+		const bool storage_shape = storage_2d || storage_array || storage_volume;
+		const auto layers         = target ? cached.target.layers : 1u;
+		const auto transfer_depth = storage ? cached.info.depth : layers;
 		TileSizeAlign target_mip_layout {};
 		const bool    target_mip_chain =
 		    target && info.levels > 1 && layers == 1 && tiled_target &&
@@ -691,55 +698,48 @@ struct TextureCache::ReadbackWorker {
 		    cached.image->extent.width == info.width &&
 		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
 		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
-		// A compute-generated storage mip chain uses the render-target 64 KiB block layout, so it
-		// reads back through the same tiled path as a mipped color target.
-		TileSizeAlign storage_mip_layout {};
-		const bool    storage_mip_chain =
-		    storage && cached.info.levels > 1 && single_layer_storage &&
-		    cached.info.base_level == 0 && cached.info.base_array == 0 &&
-		    info.tile_mode == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-		    TileGetRenderTargetMipLayout(info.width, info.height, info.pitch,
-		                                 info.bytes_per_element, info.levels, storage_mip_layout,
-		                                 nullptr, nullptr) &&
-		    storage_mip_layout.align == 65536 && storage_mip_layout.size == info.size &&
-		    cached.image != nullptr && cached.image->format == info.format &&
-		    cached.image->extent.width == info.width &&
-		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
-		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
-		const bool basic_storage =
-		    !storage ||
-		    (single_layer_storage && cached.info.base_level == 0 && cached.info.base_array == 0 &&
-		     (linear || tiled_storage) && (cached.info.levels == 1 || storage_mip_chain));
+		const bool basic_storage = !storage || (storage_shape && (linear || tiled_storage));
 		if (info.samples != 1 || (!linear && !tiled_target && !tiled_storage) || !basic_storage ||
-		    (info.levels != 1 && !target_mip_chain && !storage_mip_chain) || layers == 0 ||
-		    info.size > UINT32_MAX) {
+		    (target && info.levels != 1 && !target_mip_chain) || layers == 0 ||
+		    transfer_depth == 0 || info.size > UINT32_MAX) {
 			EXIT("TextureCache: unsupported color-image readback layout, addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64
-			     " extent=%ux%u pitch=%u bpe=%u levels=%u samples=%u tile=%u kind=%u\n",
-			     info.address, info.size, info.width, info.height, info.pitch,
-			     info.bytes_per_element, info.levels, info.samples, info.tile_mode,
-			     static_cast<uint32_t>(cached.kind));
+			     " extent=%ux%ux%u pitch=%u bpe=%u levels=%u samples=%u tile=%u kind=%u "
+			     "type=%u base_level=%u base_array=%u\n",
+			     info.address, info.size, info.width, info.height, transfer_depth, info.pitch,
+			     info.bytes_per_element, info.levels, info.samples,
+			     info.tile_mode, static_cast<uint32_t>(cached.kind),
+			     storage ? cached.info.type : 0, storage ? cached.info.base_level : 0,
+			     storage ? cached.info.base_array : 0);
 		}
 		const auto slice_size     = info.size / layers;
 		const bool meta_overlap   = cache.HasMetaOverlapLocked(info.address, info.size);
 		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
-		if (meta_overlap || buffer_overlap) {
+		const bool buffer_cpu_modified =
+		    buffer_overlap && cache.m_buffer_cache.IsRegionCpuModified(info.address, info.size);
+		const bool buffer_gpu_modified =
+		    buffer_overlap && cache.m_buffer_cache.IsRegionGpuModified(info.address, info.size);
+		if (meta_overlap || buffer_cpu_modified || buffer_gpu_modified) {
 			EXIT("TextureCache: color-image readback storage is unsupported, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " meta=%d buffer=%d kind=%u\n",
-			     info.address, info.size, meta_overlap, buffer_overlap,
+			     " size=0x%016" PRIx64
+			     " meta=%d buffer=%d buffer_cpu=%d buffer_gpu=%d kind=%u\n",
+			     info.address, info.size, meta_overlap, buffer_overlap, buffer_cpu_modified,
+			     buffer_gpu_modified,
 			     static_cast<uint32_t>(cached.kind));
 		}
 		std::vector<ImageBufferCopy> regions;
 		std::vector<BufferImageCopy> tiled_regions;
 		TextureUploadLayout          tiled_layout {};
 		const bool                   gpu_tiled = tiled_target || tiled_storage;
-		if (gpu_tiled) {
+		if (gpu_tiled || storage) {
 			const auto format = storage
 			                        ? cached.info.format
 			                        : ImageOps::RenderTargetTransferFormat(info.bytes_per_element);
 			tiled_layout = TextureCalcUploadLayout(format, info.width, info.height, info.levels,
-			                                       layers, info.pitch, info.tile_mode, info.size,
-			                                       false, false, "RenderTargetReadback");
+			                                       transfer_depth, info.pitch, info.tile_mode,
+			                                       info.size, storage, storage_volume,
+			                                       storage ? "StorageTextureReadback"
+			                                               : "RenderTargetReadback");
 			if (target_mip_chain &&
 			    (tiled_layout.tile_family != TileBlockFamily::RenderTarget64KB ||
 			     tiled_layout.pitch != info.pitch)) {
@@ -748,8 +748,10 @@ struct TextureCache::ReadbackWorker {
 				     info.address, info.size, info.pitch, tiled_layout.pitch, info.levels);
 			}
 			tiled_regions = TextureBuildUploadRegions(tiled_layout, info.format, info.width,
-			                                          info.height, layers, info.levels, layers > 1,
-			                                          false, TextureUploadDestination::MipLevels);
+			                                          info.height, transfer_depth, info.levels,
+			                                          storage ? storage_array : layers > 1,
+			                                          storage_volume,
+			                                          TextureUploadDestination::MipLevels);
 			regions       = TextureBuildDownloadRegions(tiled_regions);
 		} else {
 			regions = Transfer::MakeLayeredImageBufferCopies(layers, slice_size, info.pitch,
@@ -762,7 +764,8 @@ struct TextureCache::ReadbackWorker {
 			                        : ImageOps::RenderTargetTransferFormat(info.bytes_per_element);
 			guest.resize(info.size);
 			EXIT_NOT_IMPLEMENTED(!TextureBuildGpuTileInfos(info.size, tiled_regions, tiled_layout,
-			                                               format, layers, info.levels, infos));
+			                                               format, transfer_depth, info.levels,
+			                                               infos));
 			Transfer::DownloadTiledImage(guest.data(), info.size, info.size, infos, regions,
 			                             *cached.image, cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
@@ -772,6 +775,9 @@ struct TextureCache::ReadbackWorker {
 			Transfer::DownloadImage(download.data(), info.size, regions, *cached.image,
 			                        cached.image->layout);
 			Libs::LibKernel::Memory::WriteBacking(info.address, download.data(), info.size);
+		}
+		if (buffer_overlap && publish_buffer) {
+			cache.m_buffer_cache.PublishImageBacking(info.address, info.size);
 		}
 		ReadbackTransfer transfer;
 		transfer.Add(info.address, info.size);
@@ -819,8 +825,8 @@ struct TextureCache::ReadbackWorker {
 				     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
 			}
 
-			const auto transfer =
-			    depth_target ? DownloadDepthTarget(*selected) : DownloadColorImage(*selected);
+			const auto transfer = depth_target ? DownloadDepthTarget(*selected)
+			                                   : DownloadColorImage(*selected, false);
 
 			if (!cache.m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 				EXIT("TextureCache: readback fault page is not GPU-modified, addr=0x%016" PRIx64
@@ -861,6 +867,13 @@ struct TextureCache::ReadbackWorker {
 					EXIT("TextureCache: completed image readback retained GPU ownership, "
 					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 					     range.address, range.size);
+				}
+				if (cache.m_buffer_cache.HasPageOverlap(range.address, range.size)) {
+					// BufferCache completes the same write fault before TextureCache's release
+					// phase, so the faulting page may already be CPU-dirty even though the guest
+					// instruction has not executed yet. Preserve that state while publishing the
+					// complete image contents downloaded immediately before fault completion.
+					cache.m_buffer_cache.PublishImageBacking(range.address, range.size, true);
 				}
 			}
 			selected->gpu_modified = false;
@@ -1070,11 +1083,7 @@ bool EqualStorageBacking(const ImageInfo& left, const ImageInfo& right) {
 	// base_level and base_array are per-binding view selections, not backing properties: the backing
 	// is always created as the full mip chain and layer array, so bindings that differ only in the
 	// selected mip or layer share one cached image.
-	return left.address == right.address && left.size == right.size &&
-	       left.format == right.format && left.width == right.width &&
-	       left.height == right.height && left.pitch == right.pitch &&
-	       left.levels == right.levels && left.tile == right.tile && left.depth == right.depth &&
-	       left.type == right.type;
+	return left.format == right.format && HasSameStorageImageBacking(left, right);
 }
 
 bool Equal(const RenderTargetInfo& left, const RenderTargetInfo& right) {
@@ -1313,32 +1322,58 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 
 void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 	std::vector<CachedImage*> retire;
+	std::vector<CachedImage*> materialize;
 	for (auto* cached: FindImagesInRegionLocked(requested.address, requested.size, true)) {
 		const bool tracker_gpu =
 		    m_memory_tracker.IsRegionGpuModified(cached->Address(), cached->Size());
+		const bool cpu_dirty =
+		    m_memory_tracker.IsRegionCpuModified(cached->Address(), cached->Size()) ||
+		    (cached->kind == CachedImage::Kind::StorageTexture && cached->info.IsCpuDirty());
 		switch (ClassifyStorageImageOverlap(
 		    requested.address, requested.size, cached->Address(), cached->Size(),
 		    cached->kind == CachedImage::Kind::Texture, cached->gpu_modified,
 		    cached->buffer_modified, tracker_gpu)) {
 			case StorageImageOverlap::None: continue;
-			case StorageImageOverlap::RetireSampled:
-			case StorageImageOverlap::RetireStorage: retire.push_back(cached); continue;
+			case StorageImageOverlap::RetireSampled: retire.push_back(cached); continue;
+			case StorageImageOverlap::RetireImage:
+				if (cached->kind == CachedImage::Kind::RenderTarget ||
+				    cached->kind == CachedImage::Kind::StorageTexture) {
+					retire.push_back(cached);
+					continue;
+				}
+				break;
+			case StorageImageOverlap::MaterializeImage:
+				if ((cached->kind == CachedImage::Kind::RenderTarget ||
+				     cached->kind == CachedImage::Kind::StorageTexture) &&
+				    !cpu_dirty) {
+					retire.push_back(cached);
+					materialize.push_back(cached);
+					continue;
+				}
+				break;
 			case StorageImageOverlap::PageNeighbor: continue;
-			case StorageImageOverlap::Unsupported:
-				EXIT("TextureCache: unsupported storage-image byte alias, requested=0x%016" PRIx64
-				     "+0x%016" PRIx64 " existing=0x%016" PRIx64 "+0x%016" PRIx64
-				     " kind=%u gpu=%d/%d buffer=%d\n",
-				     requested.address, requested.size, cached->Address(), cached->Size(),
-				     static_cast<uint32_t>(cached->kind), cached->gpu_modified, tracker_gpu,
-				     cached->buffer_modified);
+			case StorageImageOverlap::Unsupported: break;
 		}
+		EXIT("TextureCache: unsupported storage-image byte alias, requested=0x%016" PRIx64
+		     "+0x%016" PRIx64 " existing=0x%016" PRIx64 "+0x%016" PRIx64
+		     " kind=%u gpu=%d/%d buffer=%d cpu_dirty=%d\n",
+		     requested.address, requested.size, cached->Address(), cached->Size(),
+		     static_cast<uint32_t>(cached->kind), cached->gpu_modified, tracker_gpu,
+		     cached->buffer_modified, cpu_dirty);
 	}
-	// Every exact byte overlap was classified above: only clean sampled images are retired and all
-	// retained byte aliases remain fatal. A retired full mip chain can still contain a cached,
-	// byte-disjoint subresource outside this storage request. The multi-owner index keeps those
-	// retained pages tracked and UnregisterImageLocked releases only pages whose final owner left.
+	// A retired full image can still contain a cached, byte-disjoint subresource outside this
+	// storage request. The multi-owner index keeps those retained pages tracked and
+	// UnregisterImageLocked releases only pages whose final owner left.
+	if (!materialize.empty()) {
+		Transfer::WaitForQueueIdle();
+	}
 	for (auto* cached: retire) {
 		if (cached->gpu_modified) {
+			if (std::find(materialize.begin(), materialize.end(), cached) == materialize.end()) {
+				EXIT("TextureCache: storage-image retirement lost materialization requirement, "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " kind=%u\n",
+				     cached->Address(), cached->Size(), static_cast<uint32_t>(cached->kind));
+			}
 			const auto transfer = m_readback->DownloadColorImage(*cached);
 			for (const auto& range: transfer.Ranges()) {
 				m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
@@ -1346,15 +1381,15 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 			}
 			cached->gpu_modified = false;
 		}
-		// A buffer-backed storage image keeps its authoritative bytes in guest memory (the buffer
-		// cache retains the backing), so the replacement allocation reads them from there. Clear the
-		// stale-host marker so the image retires through the clean path.
+		// A materialized image or buffer-backed storage image keeps its authoritative bytes in guest
+		// memory, so the replacement allocation reads them from there. Clear the stale-host marker
+		// so the old Vulkan shape retires through the clean path.
 		cached->buffer_modified = false;
 	}
 	RetireImages(retire);
 }
 
-void TextureCache::RetireStorageDepthAliasLocked(const ImageInfo& requested) {
+void TextureCache::DetachStorageDepthAliasLocked(const ImageInfo& requested) {
 	CachedImage* selected = nullptr;
 	for (auto* entry: FindImagesInRegionLocked(requested.address, requested.size, true)) {
 		auto& cached = *entry;
@@ -1363,38 +1398,66 @@ void TextureCache::RetireStorageDepthAliasLocked(const ImageInfo& requested) {
 			continue;
 		}
 		const auto& depth = cached.depth;
-		const bool  exact_d32_uint =
-		    cached.gpu_modified && !cached.buffer_modified && depth.address == requested.address &&
-		    depth.size == requested.size && depth.stencil_address == 0 && depth.stencil_size == 0 &&
-		    depth.htile_address == 0 && depth.htile_size == 0 && depth.layers == 1 &&
-		    depth.format == vk::Format::eD32Sfloat &&
-		    depth.guest_format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float) &&
-		    depth.bytes_per_element == 4 && depth.width == requested.width &&
-		    depth.height == requested.height && depth.pitch == requested.pitch &&
-		    requested.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
-		    requested.tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
-		    requested.type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) &&
-		    requested.depth == 1 && requested.levels == 1;
-		if (!exact_d32_uint || selected != nullptr) {
+		bool tracker_gpu = false;
+		for (uint32_t range = 0; range < cached.RangeCount(); range++) {
+			tracker_gpu |=
+			    m_memory_tracker.IsRegionGpuModified(cached.Address(range), cached.Size(range));
+		}
+		const bool exact = !cached.buffer_modified &&
+		                   cached.gpu_modified == tracker_gpu &&
+		                   IsMaterializableStorageDepthAlias(requested, depth);
+		if (!exact || selected != nullptr) {
 			EXIT("TextureCache: unsupported storage/depth-target alias, requested=0x%016" PRIx64
 			     "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
-			     " exact=%d ambiguous=%d\n",
-			     requested.address, requested.size, depth.address, depth.size, exact_d32_uint,
-			     selected != nullptr);
+			     " stencil=0x%016" PRIx64 "+0x%016" PRIx64
+			     " exact=%d stencil_alias=%d ambiguous=%d\n",
+			     requested.address, requested.size, depth.address, depth.size,
+			     depth.stencil_address, depth.stencil_size, exact,
+			     IsStorageStencilPlaneAlias(requested, depth), selected != nullptr);
 		}
 		selected = &cached;
 	}
 	if (selected == nullptr) {
 		return;
 	}
-	Transfer::WaitForQueueIdle();
-	const auto transfer = m_readback->DownloadDepthTarget(*selected, false);
-	for (const auto& range: transfer.Ranges()) {
-		m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
-		                                            [](uint64_t, uint64_t) noexcept {});
+	if (IsStorageStencilPlaneAlias(requested, selected->depth)) {
+		if (selected->stencil_detached) {
+			EXIT("TextureCache: storage alias cannot detach stencil ownership twice, "
+			     "requested=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+			     requested.address, requested.size);
+		}
+		// The storage descriptor aliases only Prospero's separate stencil plane. Keep the native
+		// depth aspect resident and move byte ownership for the stencil range to the storage image.
+		// The old Vulkan stencil aspect becomes inaccessible until a later clear rebinds the target.
+		UnregisterImageLocked(*selected, false);
+		selected->stencil_detached    = true;
+		selected->stencil_initialized = false;
+		RegisterImageLocked(*selected);
+		return;
 	}
-	selected->gpu_modified = false;
-	RetireImages({selected});
+	if (selected->stencil_detached) {
+		EXIT("TextureCache: depth storage alias has separately owned stencil contents, "
+		     "requested=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+		     requested.address, requested.size);
+	}
+
+	// A depth allocation can be exposed directly as write-only R16_UNORM, R32_FLOAT, or
+	// R32_UINT storage. Vulkan cannot create a color storage view of a depth image, so preserve
+	// the complete native depth/stencil contents in guest layout and retire the depth allocation
+	// before the color storage image is created.
+	std::vector<CachedImage*> retire {selected};
+	RequireRetirementIsolation(retire, "storage depth target", requested.address, requested.size);
+	if (selected->gpu_modified) {
+		Transfer::WaitForQueueIdle();
+		const auto transfer = m_readback->DownloadDepthTarget(*selected, false);
+		for (const auto& range: transfer.Ranges()) {
+			m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
+			                                            [](uint64_t, uint64_t) noexcept {});
+		}
+		selected->gpu_modified = false;
+	}
+	RetireDepthMetadataLocked(retire);
+	RetireImages(retire);
 }
 
 TextureCache::~TextureCache() {
@@ -1445,6 +1508,7 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 	}
 	std::shared_ptr<CachedImage> storage_match;
 	std::vector<CachedImage*>    storage_retire;
+	std::vector<CachedImage*>    storage_discard;
 	const auto                   requested_view_format = TextureGetFormat(info.format);
 	for (auto& cached: m_images) {
 		if (cached->kind != CachedImage::Kind::StorageTexture) {
@@ -1472,6 +1536,9 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 			case StorageSampledOverlap::RetireStorage:
 				storage_retire.push_back(cached.get());
 				break;
+			case StorageSampledOverlap::DiscardStorage:
+				storage_discard.push_back(cached.get());
+				break;
 			case StorageSampledOverlap::Unsupported:
 				EXIT("TextureCache: unsupported sampled/storage image alias, "
 				     "requested=0x%016" PRIx64 "+0x%016" PRIx64 " storage=0x%016" PRIx64
@@ -1493,10 +1560,11 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 				     cached->info.base_array);
 		}
 	}
-	if (storage_match != nullptr && !storage_retire.empty()) {
-		EXIT("TextureCache: sampled binding has both exact and mip storage owners, "
-		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " mip_owners=%zu\n",
-		     info.address, info.size, storage_retire.size());
+	if (storage_match != nullptr && (!storage_retire.empty() || !storage_discard.empty())) {
+		EXIT("TextureCache: sampled binding has both exact and replaceable storage owners, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " materialize=%zu discard=%zu\n",
+		     info.address, info.size, storage_retire.size(), storage_discard.size());
 	}
 	if (storage_match != nullptr) {
 		if (m_memory_tracker.IsRegionCpuModified(info.address, info.size) ||
@@ -1533,6 +1601,27 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 			cached->gpu_modified = false;
 		}
 		RetireImages(storage_retire);
+	}
+	if (!storage_discard.empty()) {
+		for (auto* cached: storage_discard) {
+			if (cached->gpu_modified || cached->buffer_modified ||
+			    m_memory_tracker.IsRegionGpuModified(cached->info.address, cached->info.size)) {
+				EXIT("TextureCache: stale sampled storage owner regained GPU ownership, "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				     " gpu=%d buffer=%d tracker_gpu=%d\n",
+				     cached->info.address, cached->info.size, cached->gpu_modified,
+				     cached->buffer_modified,
+				     m_memory_tracker.IsRegionGpuModified(cached->info.address,
+				                                          cached->info.size));
+			}
+			// The record is about to be removed; clearing its per-image invalidation state does
+			// not consume the guest write. Unregistering the final owner marks the backing CPU
+			// dirty, and creation of the sampled image uploads those authoritative bytes.
+			if (cached->info.IsCpuDirty()) {
+				cached->info.RefreshComplete();
+			}
+		}
+		RetireImages(storage_discard);
 	}
 	if (m_memory_tracker.IsRegionCpuModified(info.address, info.size)) {
 		MarkSampledAliasesCpuDirtyLocked(info.address, info.size);
@@ -1633,14 +1722,14 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	const bool supported_depth_tile =
 	    info.tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
 	    IsSupportedStorageDepthTile(info.format, info.type, info.width, info.height, info.depth);
+	const bool supported_tile =
+	    IsSupportedStorageTile(info.format, info.type, info.width, info.height, info.depth,
+	                           info.tile, false);
 	if (info.address == 0 || info.size == 0 || info.address >= TRACKER_ADDRESS_SIZE ||
 	    info.size > TRACKER_ADDRESS_SIZE - info.address || info.width == 0 || info.height == 0 ||
 	    info.depth == 0 || info.levels == 0 || info.levels > 16 || info.base_level >= info.levels ||
 	    info.view_levels != 1 || !supported_type ||
-	    (info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kLinear) &&
-	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) &&
-	     info.tile != Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) &&
-	     !supported_depth_tile) ||
+	    !supported_tile ||
 	    !IsSupportedStorageSwizzle(info.format, info.swizzle)) {
 		EXIT("TextureCache: unsupported storage-image request, command=%p "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
@@ -1675,9 +1764,8 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	}
 	FaultSafeTextureLock lock(this, m_lock);
 	ResolveImageMetadataOverlapsLocked(info.address, info.size);
-	if (supported_depth_tile &&
-	    info.format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt)) {
-		RetireStorageDepthAliasLocked(info);
+	if (supported_depth_tile) {
+		DetachStorageDepthAliasLocked(info);
 	}
 
 	std::shared_ptr<CachedImage> match;
@@ -1747,12 +1835,23 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	cached->info = info;
 	vk::ComponentMapping components {};
 	cached->image = ImageOps::CreateTexture(info, true, components);
-	m_memory_tracker.ForEachUploadRange(
-	    info.address, info.size, true, [](uint64_t, uint64_t) noexcept {},
-	    [&]() noexcept {
-		    m_tiler.DetileImage(*static_cast<GpuTextureVulkanImage*>(cached->image), cached->info,
-		                        source, false, true);
-	    });
+	if (supported_depth_tile) {
+		// Depth-tiled storage descriptors admitted here are write-only. Establish GPU ownership
+		// without detiling stale guest bytes, and initialize/transition the color image on the
+		// recording command so the first shader write does not require an immediate queue submit.
+		m_memory_tracker.ForEachUploadRange(
+		    info.address, info.size, true, [](uint64_t, uint64_t) noexcept {},
+		    []() noexcept {});
+		Transfer::ClearColorImage(command, *cached->image, vk::ClearColorValue {},
+		                          vk::ImageLayout::eGeneral);
+	} else {
+		m_memory_tracker.ForEachUploadRange(
+		    info.address, info.size, true, [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept {
+			    m_tiler.DetileImage(*static_cast<GpuTextureVulkanImage*>(cached->image),
+			                        cached->info, source, false, true);
+		    });
+	}
 	cached->gpu_modified = true;
 	ImageOps::CreateTextureViews(*static_cast<GpuTextureVulkanImage*>(cached->image), info, true,
 	                             components);
@@ -1837,10 +1936,14 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	std::lock_guard       transaction(m_resource_mutex);
 	BufferImageCopySource target_source {nullptr, 0, info.address, info.size, true};
 	const bool target_buffer_overlap = m_buffer_cache.HasPageOverlap(info.address, info.size);
+	bool       target_buffer_dirty   = false;
 	if (target_buffer_overlap) {
 		// A render target may use a containing native buffer after dirty bytes are published or
 		// coherent guest backing for a clean partial view. ObtainBufferForImage keeps GPU-dirty
 		// partial ownership and inconsistent state as hard failures.
+		target_buffer_dirty =
+		    m_buffer_cache.IsRegionCpuModified(info.address, info.size) ||
+		    m_buffer_cache.IsRegionGpuModified(info.address, info.size);
 		target_source = m_buffer_cache.ObtainBufferForImage(info.address, info.size);
 	}
 	FaultSafeTextureLock         lock(this, m_lock);
@@ -1856,12 +1959,13 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	if (match != nullptr) {
 		ResolveImageMetadataOverlapsLocked(info.address, info.size);
 		if (info.samples > 1 && (match->buffer_modified ||
+		                         target_buffer_dirty ||
 		                         m_memory_tracker.IsRegionCpuModified(info.address, info.size))) {
 			EXIT("TextureCache: multisampled render-target refresh is unsupported, "
 			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " samples=%u\n",
 			     info.address, info.size, info.samples);
 		}
-		if (match->buffer_modified) {
+		if (match->buffer_modified || target_buffer_dirty) {
 			if (match->gpu_modified ||
 			    !IsCoherentGuestImageSource(target_source, info.address, info.size)) {
 				EXIT("TextureCache: render-target refresh has invalid buffer ownership, "
@@ -2193,6 +2297,65 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		match = cached;
 	}
 	if (match != nullptr) {
+		if (match->stencil_detached) {
+			std::shared_ptr<CachedImage> storage;
+			for (const auto& candidate: m_images) {
+				if (candidate->kind != CachedImage::Kind::StorageTexture ||
+				    !IsStorageStencilPlaneAlias(candidate->info, match->depth)) {
+					continue;
+				}
+				if (storage != nullptr) {
+					EXIT("TextureCache: detached stencil has multiple storage owners, "
+					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+					     info.stencil_address, info.stencil_size);
+				}
+				storage = candidate;
+			}
+			const bool tracker_gpu =
+			    storage != nullptr &&
+			    m_memory_tracker.IsRegionGpuModified(storage->info.address, storage->info.size);
+			// Preserve storage output unless this binding explicitly clears stencil. Even when the
+			// current pass does not access stencil, a later compatible bind may load it.
+			const bool preserve_stencil = has_stencil && !info.stencil_load_clear;
+			if (storage == nullptr || !has_stencil || !storage->gpu_modified ||
+			    storage->buffer_modified || storage->info.IsCpuDirty() || !tracker_gpu) {
+				EXIT("TextureCache: detached stencil cannot return to depth ownership, "
+				     "stencil=0x%016" PRIx64 "+0x%016" PRIx64
+				     " storage=%p preserve=%d gpu=%d buffer=%d cpu=%d tracker=%d "
+				     "access=%d clear=%d\n",
+				     info.stencil_address, info.stencil_size,
+				     static_cast<const void*>(storage.get()), preserve_stencil,
+				     storage != nullptr && storage->gpu_modified,
+				     storage != nullptr && storage->buffer_modified,
+				     storage != nullptr && storage->info.IsCpuDirty(), tracker_gpu,
+				     info.stencil_access, info.stencil_load_clear);
+			}
+
+			// Unless the returning target explicitly clears stencil, bridge the R8 color storage
+			// image into the retained depth/stencil image entirely on-GPU. This also preserves the
+			// result for a later stencil-accessing bind when the current pass does not use it. Then
+			// restore the target's stencil range while keeping per-page GPU ownership continuous.
+			command.RetainResourceUntilFence(storage);
+			if (preserve_stencil) {
+				Transfer::CopyImageViaBuffer(
+				    command, *storage->image, vk::ImageAspectFlagBits::eColor, *match->image,
+				    vk::ImageAspectFlagBits::eStencil, 1,
+				    vk::ImageLayout::eDepthStencilAttachmentOptimal);
+			}
+			storage->gpu_modified = false;
+			UnregisterImageLocked(*storage, false);
+			const auto storage_owner =
+			    std::find(m_images.begin(), m_images.end(), storage);
+			if (storage_owner == m_images.end()) {
+				EXIT("TextureCache: detached stencil storage owner disappeared\n");
+			}
+			m_images.erase(storage_owner);
+
+			UnregisterImageLocked(*match, false);
+			match->stencil_detached    = false;
+			match->stencil_initialized = preserve_stencil || info.stencil_load_clear;
+			RegisterImageLocked(*match);
+		}
 		const bool depth_cpu_modified =
 		    m_memory_tracker.IsRegionCpuModified(info.address, info.size);
 		const bool stencil_cpu_modified =
@@ -2703,6 +2866,10 @@ void TextureCache::RefreshVideoOut(VideoOutVulkanImage& image, bool render_targe
 			     source.cpu_current, source.address, source.size, cached.buffer_modified);
 		}
 		cached.buffer_modified = false;
+		// ObtainBufferForImage resolves the BufferCache tracker, but VideoOut has an independent
+		// image tracker. Publish the now-current guest backing there so the upload below cannot be
+		// skipped merely because the image itself did not observe the original buffer write.
+		m_memory_tracker.MarkRegionAsCpuModified(info.address, info.size);
 	}
 	m_memory_tracker.ForEachUploadRange(
 	    info.address, info.size, false, [](uint64_t, uint64_t) noexcept {},
@@ -2906,69 +3073,159 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t vaddr, 
 }
 
 void TextureCache::MarkGpuWritten(VulkanImage& image) {
-	std::lock_guard      transaction(m_resource_mutex);
-	FaultSafeTextureLock lock(this, m_lock);
-	for (auto& cached: m_images) {
-		if (cached->image != &image) {
-			continue;
+	std::lock_guard                transaction(m_resource_mutex);
+	std::shared_ptr<CachedImage>   selected;
+	bool                           cached_buffer_modified = false;
+	bool                           cached_gpu_modified    = false;
+	{
+		FaultSafeTextureLock lock(this, m_lock);
+		const auto it = std::find_if(m_images.begin(), m_images.end(),
+		                             [&image](const auto& cached) {
+			                             return cached->image == &image;
+		                             });
+		if (it == m_images.end()) {
+			EXIT("TextureCache: GPU-written image is not registered, image=%p\n",
+			     static_cast<const void*>(&image));
 		}
-		if (cached->kind != CachedImage::Kind::RenderTarget &&
-		    cached->kind != CachedImage::Kind::DepthTarget &&
-		    cached->kind != CachedImage::Kind::VideoOut) {
+		selected = *it;
+		if (selected->kind != CachedImage::Kind::RenderTarget &&
+		    selected->kind != CachedImage::Kind::DepthTarget &&
+		    selected->kind != CachedImage::Kind::VideoOut) {
 			EXIT("TextureCache: sampled texture cannot be marked GPU-written, image=%p kind=%u\n",
-			     static_cast<const void*>(&image), static_cast<uint32_t>(cached->kind));
+			     static_cast<const void*>(&image), static_cast<uint32_t>(selected->kind));
 		}
-		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-			if (m_buffer_cache.HasPageOverlap(cached->Address(i), cached->Size(i))) {
-				const bool cpu_modified =
-				    m_buffer_cache.IsRegionCpuModified(cached->Address(i), cached->Size(i));
-				const bool gpu_modified =
-				    m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i));
-				if (cpu_modified || gpu_modified) {
-					EXIT(
-					    "TextureCache: GPU-written image aliases a dirty buffer, addr=0x%016" PRIx64
-					    " size=0x%016" PRIx64 " cpu_modified=%d gpu_modified=%d\n",
-					    cached->Address(i), cached->Size(i), cpu_modified, gpu_modified);
-				}
+		cached_buffer_modified = selected->buffer_modified;
+		cached_gpu_modified    = selected->gpu_modified;
+	}
+
+	// Render-target and VideoOut lookup normally reconcile BufferCache ownership before reaching
+	// this point. MarkGpuWritten is the final ownership boundary, however, and display surfaces can
+	// bypass FindRenderTarget entirely. Resolve a late or directly-bound dirty buffer here before
+	// granting exclusive GPU image ownership. Depth/stencil has multiple aspects and remains on its
+	// dedicated FindDepthTarget transition path.
+	if (!cached_gpu_modified &&
+	    (selected->kind == CachedImage::Kind::RenderTarget ||
+	     selected->kind == CachedImage::Kind::VideoOut)) {
+		const auto address        = selected->Address();
+		const auto size           = selected->Size();
+		const bool buffer_overlap = m_buffer_cache.HasPageOverlap(address, size);
+		const bool buffer_dirty =
+		    cached_buffer_modified ||
+		    (buffer_overlap && (m_buffer_cache.IsRegionCpuModified(address, size) ||
+		                        m_buffer_cache.IsRegionGpuModified(address, size)));
+		if (buffer_dirty) {
+			BufferImageCopySource source {nullptr, 0, address, size, true};
+			if (buffer_overlap) {
+				source = m_buffer_cache.ObtainBufferForImage(address, size);
 			}
-			if (m_memory_tracker.IsRegionCpuModified(cached->Address(i), cached->Size(i))) {
-				EXIT("TextureCache: GPU-write begins while image range is CPU-modified, "
+			if (!IsCoherentGuestImageSource(source, address, size)) {
+				EXIT("TextureCache: GPU-write buffer source is inconsistent, image=%p kind=%u "
+				     "addr=0x%016" PRIx64 "+0x%016" PRIx64
+				     " source=%p source_addr=0x%016" PRIx64 "+0x%016" PRIx64 " current=%d\n",
+				     static_cast<const void*>(&image), static_cast<uint32_t>(selected->kind),
+				     address, size, static_cast<const void*>(source.buffer), source.address,
+				     source.size, source.cpu_current);
+			}
+
+			FaultSafeTextureLock lock(this, m_lock);
+			const auto owner = std::find(m_images.begin(), m_images.end(), selected);
+			if (owner == m_images.end() || selected->image != &image ||
+			    selected->gpu_modified) {
+				EXIT("TextureCache: GPU-write image ownership changed during buffer refresh, "
+				     "image=%p kind=%u registered=%d gpu_modified=%d\n",
+				     static_cast<const void*>(&image), static_cast<uint32_t>(selected->kind),
+				     owner != m_images.end(), selected->gpu_modified);
+			}
+			m_memory_tracker.MarkRegionAsCpuModified(address, size);
+			m_memory_tracker.ForEachUploadRange(
+			    address, size, false, [](uint64_t, uint64_t) noexcept {},
+			    [&]() noexcept {
+				    if (selected->kind == CachedImage::Kind::RenderTarget) {
+					    if (selected->target.samples != 1) {
+						    EXIT("TextureCache: multisampled GPU-write buffer refresh is unsupported, "
+						         "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " samples=%u\n",
+						         address, size, selected->target.samples);
+					    }
+					    ImageOps::UploadRenderTarget(
+					        *static_cast<RenderTextureVulkanImage*>(selected->image),
+					        selected->target, true);
+				    } else {
+					    if (selected->video_out.compression !=
+					        VideoOutCompression::Uncompressed) {
+						    EXIT("TextureCache: compressed VideoOut GPU-write buffer refresh is "
+						         "unsupported, addr=0x%016" PRIx64 " size=0x%016" PRIx64
+						         " compression=%u\n",
+						         address, size,
+						         static_cast<uint32_t>(selected->video_out.compression));
+					    }
+					    ImageOps::UploadVideoOut(
+					        *static_cast<VideoOutVulkanImage*>(selected->image),
+					        selected->video_out, true);
+				    }
+			    });
+			selected->buffer_modified = false;
+		}
+	}
+
+	FaultSafeTextureLock lock(this, m_lock);
+	const auto owner = std::find(m_images.begin(), m_images.end(), selected);
+	if (owner == m_images.end() || selected->image != &image) {
+		EXIT("TextureCache: GPU-written image lost its cache owner, image=%p\n",
+		     static_cast<const void*>(&image));
+	}
+	auto& cached = selected;
+	for (uint32_t i = 0; i < cached->RangeCount(); i++) {
+		if (m_buffer_cache.HasPageOverlap(cached->Address(i), cached->Size(i))) {
+			const bool cpu_modified =
+			    m_buffer_cache.IsRegionCpuModified(cached->Address(i), cached->Size(i));
+			const bool gpu_modified =
+			    m_buffer_cache.IsRegionGpuModified(cached->Address(i), cached->Size(i));
+			if (cpu_modified || gpu_modified) {
+				EXIT(
+				    "TextureCache: GPU-written image aliases a dirty buffer, addr=0x%016" PRIx64
+				    " size=0x%016" PRIx64
+				    " kind=%u cpu_modified=%d gpu_modified=%d buffer_modified=%d "
+				    "image_gpu_modified=%d\n",
+				    cached->Address(i), cached->Size(i),
+				    static_cast<uint32_t>(cached->kind), cpu_modified, gpu_modified,
+				    cached->buffer_modified, cached->gpu_modified);
+			}
+		}
+		if (m_memory_tracker.IsRegionCpuModified(cached->Address(i), cached->Size(i))) {
+			EXIT("TextureCache: GPU-write begins while image range is CPU-modified, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     cached->Address(i), cached->Size(i));
+		}
+	}
+	if (cached->kind == CachedImage::Kind::DepthTarget) {
+		if ((cached->depth.htile_address == 0) != (cached->depth.htile_size == 0)) {
+			EXIT("TextureCache: depth target has incomplete HTile range, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     cached->depth.htile_address, cached->depth.htile_size);
+		}
+		if (cached->depth.htile_address != 0) {
+			auto meta = m_surface_metas.find(cached->depth.htile_address);
+			if (meta == m_surface_metas.end() ||
+			    meta->second.size != cached->depth.htile_size) {
+				EXIT("TextureCache: depth target HTile metadata is missing or mismatched, "
 				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-				     cached->Address(i), cached->Size(i));
-			}
-		}
-		if (cached->kind == CachedImage::Kind::DepthTarget) {
-			if ((cached->depth.htile_address == 0) != (cached->depth.htile_size == 0)) {
-				EXIT("TextureCache: depth target has incomplete HTile range, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 "\n",
 				     cached->depth.htile_address, cached->depth.htile_size);
 			}
-			if (cached->depth.htile_address != 0) {
-				auto meta = m_surface_metas.find(cached->depth.htile_address);
-				if (meta == m_surface_metas.end() ||
-				    meta->second.size != cached->depth.htile_size) {
-					EXIT("TextureCache: depth target HTile metadata is missing or mismatched, "
-					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-					     cached->depth.htile_address, cached->depth.htile_size);
-				}
-				m_buffer_cache.ValidateGpuAccess(cached->depth.htile_address,
-				                                 cached->depth.htile_size, false, true);
-				m_metadata_tracker.ForEachUploadRange(
-				    cached->depth.htile_address, cached->depth.htile_size, true,
-				    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
-				meta->second.gpu_modified = true;
-			}
+			m_buffer_cache.ValidateGpuAccess(cached->depth.htile_address,
+			                                 cached->depth.htile_size, false, true);
+			m_metadata_tracker.ForEachUploadRange(
+			    cached->depth.htile_address, cached->depth.htile_size, true,
+			    [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+			meta->second.gpu_modified = true;
 		}
-		if (!cached->gpu_modified) {
-			for (uint32_t i = 0; i < cached->RangeCount(); i++) {
-				m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
-			}
-			cached->gpu_modified = true;
-		}
-		return;
 	}
-	EXIT("TextureCache: GPU-written image is not registered, image=%p\n",
-	     static_cast<const void*>(&image));
+	if (!cached->gpu_modified) {
+		for (uint32_t i = 0; i < cached->RangeCount(); i++) {
+			m_memory_tracker.MarkRegionAsGpuModified(cached->Address(i), cached->Size(i));
+		}
+		cached->gpu_modified = true;
+	}
+	return;
 }
 
 void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
@@ -2981,17 +3238,29 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	FaultSafeTextureLock lock(this, m_lock);
 	const bool           metadata_overlap = HasMetaOverlapLocked(vaddr, size);
 	bool                 found            = false;
+	CachedImage*         synchronize      = nullptr;
 	for (const auto& cached: m_images) {
 		for (uint32_t range = 0; range < cached->RangeCount(); range++) {
-			// CPU-current depth targets use the same tracked guest refresh path as sampled and
-			// color images. GPU-owned targets and metadata aliases remain unsupported below.
+			// CPU-current images use the tracked guest refresh path. A GPU-owned color target can
+			// additionally publish its complete backing before the partial host write; other
+			// GPU-owned image kinds and metadata aliases remain unsupported.
 			const bool host_refreshable =
 			    IsHostWriteRefreshable(cached->BufferBinding(), cached->buffer_modified);
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,
-			                                 cached->gpu_modified, metadata_overlap)) {
+			                                 cached->gpu_modified, metadata_overlap,
+			                                 cached->kind == CachedImage::Kind::RenderTarget)) {
 				case HostWriteOverlap::None: break;
 				case HostWriteOverlap::InvalidateImage: found = true; break;
+				case HostWriteOverlap::SynchronizeImage:
+					if (synchronize != nullptr && synchronize != cached.get()) {
+						EXIT("TextureCache: host write aliases multiple GPU-owned color images, "
+						     "write=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+						     vaddr, size);
+					}
+					synchronize = cached.get();
+					found       = true;
+					break;
 				case HostWriteOverlap::Unsupported:
 					EXIT("TextureCache: host write aliases unsupported image, "
 					     "write=0x%016" PRIx64 "+0x%016" PRIx64 " image=0x%016" PRIx64
@@ -3008,14 +3277,79 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	if (synchronize != nullptr) {
+		SynchronizeColorImageBackingLocked(*synchronize, vaddr, size, false);
+	}
 	// Explicitly invalidate on a write fault. The resource transaction is already held here, so
 	// writing first would recursively enter the cache.
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	MarkSampledAliasesCpuDirtyLocked(vaddr, size);
 }
 
-void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint64_t write_address,
-                                                       uint64_t write_size) {
+void TextureCache::PrepareGpuBufferRead(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("TextureCache: invalid GPU buffer-read range, addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	FaultSafeTextureLock       lock(this, m_lock);
+	std::vector<CachedImage*> synchronize;
+	for (const auto& cached: m_images) {
+		if (!cached->gpu_modified || !cached->OverlapsRange(vaddr, size, false)) {
+			continue;
+		}
+		if (cached->buffer_modified ||
+		    (cached->kind != CachedImage::Kind::RenderTarget &&
+		     cached->kind != CachedImage::Kind::StorageTexture)) {
+			EXIT("TextureCache: unsupported GPU-owned image/buffer read alias, "
+			     "read=0x%016" PRIx64 "+0x%016" PRIx64 " image=0x%016" PRIx64
+			     "+0x%016" PRIx64 " kind=%u gpu_modified=%d buffer_modified=%d\n",
+			     vaddr, size, cached->Address(), cached->Size(),
+			     static_cast<uint32_t>(cached->kind), cached->gpu_modified,
+			     cached->buffer_modified);
+		}
+		for (const auto* selected: synchronize) {
+			for (uint32_t left = 0; left < selected->RangeCount(); left++) {
+				for (uint32_t right = 0; right < cached->RangeCount(); right++) {
+					if (ImageRangeOverlaps(selected->Address(left), selected->Size(left),
+					                       cached->Address(right), cached->Size(right))) {
+						EXIT("TextureCache: ambiguous GPU-owned image/buffer read alias, "
+						     "read=0x%016" PRIx64 "+0x%016" PRIx64
+						     " first=0x%016" PRIx64 "+0x%016" PRIx64
+						     " second=0x%016" PRIx64 "+0x%016" PRIx64 "\n",
+						     vaddr, size, selected->Address(left), selected->Size(left),
+						     cached->Address(right), cached->Size(right));
+					}
+				}
+			}
+		}
+		synchronize.push_back(cached.get());
+	}
+	if (synchronize.empty()) {
+		EXIT("TextureCache: GPU buffer read expected a GPU-owned image overlap, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	// A read-only buffer may begin before an image or cover only part of it. Publish each complete
+	// native image to guest backing so both the overlapping bytes and the untouched image bytes
+	// remain coherent. Mark only the intersecting bytes CPU-current in BufferCache so an existing
+	// clean native buffer is refreshed without making the cached image buffer-owned.
+	for (auto* cached: synchronize) {
+		const auto image_address = cached->Address();
+		const auto image_end     = image_address + cached->Size();
+		const auto read_end      = vaddr + size;
+		const auto overlap_begin = std::max(vaddr, image_address);
+		const auto overlap_end   = std::min(read_end, image_end);
+		EXIT_IF(overlap_begin >= overlap_end);
+		SynchronizeColorImageBackingLocked(*cached, overlap_begin, overlap_end - overlap_begin,
+		                                   false);
+		m_buffer_cache.PublishImageBacking(overlap_begin, overlap_end - overlap_begin);
+	}
+}
+
+void TextureCache::SynchronizeColorImageBackingLocked(CachedImage& cached, uint64_t write_address,
+                                                      uint64_t write_size, bool publish_buffer) {
 	const bool       render_target = cached.kind == CachedImage::Kind::RenderTarget;
 	const bool       video_out     = cached.kind == CachedImage::Kind::VideoOut;
 	const bool       storage       = cached.kind == CachedImage::Kind::StorageTexture;
@@ -3168,12 +3502,14 @@ void TextureCache::SynchronizeColorImageToBufferLocked(CachedImage& cached, uint
 	}
 	m_memory_tracker.ForEachDownloadRange<true>(target.address, target.size,
 	                                            [](uint64_t, uint64_t) noexcept {});
-	// Only the impending buffer-write range needs publication into BufferCache ownership. The
-	// complete image backing was reconstructed above so a later partial-buffer rebind can detile
-	// the coherent mip chain without requiring one cached buffer to contain the whole image.
-	m_buffer_cache.PublishImageBacking(write_address, write_size);
+	if (publish_buffer) {
+		// Only the impending buffer-write range needs publication into BufferCache ownership. The
+		// complete image backing was reconstructed above so a later partial-buffer rebind can detile
+		// the coherent mip chain without requiring one cached buffer to contain the whole image.
+		m_buffer_cache.PublishImageBacking(write_address, write_size);
+	}
 	cached.gpu_modified    = false;
-	cached.buffer_modified = true;
+	cached.buffer_modified = publish_buffer;
 }
 
 void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint64_t write_address,
@@ -3309,13 +3645,13 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t vaddr, uint64_t size,
 		case BufferImageWrite::InvalidateRenderTarget: cached.buffer_modified = true; return true;
 		case BufferImageWrite::SynchronizeRenderTarget:
 		case BufferImageWrite::SynchronizeStorageTexture:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+			SynchronizeColorImageBackingLocked(cached, vaddr, size, true);
 			return true;
 		case BufferImageWrite::SynchronizeDepthTarget:
 			SynchronizeDepthImageToBufferLocked(cached, vaddr, size);
 			return true;
 		case BufferImageWrite::SynchronizeVideoOut:
-			SynchronizeColorImageToBufferLocked(cached, vaddr, size);
+			SynchronizeColorImageBackingLocked(cached, vaddr, size, true);
 			return true;
 		case BufferImageWrite::None:
 		case BufferImageWrite::Unsupported:
@@ -3382,35 +3718,74 @@ RenderTextureVulkanImage* TextureCache::FindRenderTargetByRange(CommandBuffer& c
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	FaultSafeTextureLock lock(this, m_lock);
-	CachedImage*         found = nullptr;
-	for (auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
-		if (cached->kind != CachedImage::Kind::RenderTarget ||
-		    !ImageRangeOverlaps(vaddr, size, cached->Address(), cached->Size())) {
-			continue;
+	std::lock_guard transaction(m_resource_mutex);
+	CachedImage*    found = nullptr;
+	{
+		FaultSafeTextureLock lock(this, m_lock);
+		for (auto* cached: FindImagesInRegionLocked(vaddr, size, false)) {
+			if (cached->kind != CachedImage::Kind::RenderTarget ||
+			    !ImageRangeOverlaps(vaddr, size, cached->Address(), cached->Size())) {
+				continue;
+			}
+			const auto slice_size =
+			    cached->target.layers != 0 ? cached->target.size / cached->target.layers : 0;
+			const bool contained = vaddr == cached->target.address && slice_size != 0 &&
+			                       cached->target.size % cached->target.layers == 0 &&
+			                       size <= cached->target.size && size % slice_size == 0;
+			if (!contained) {
+				continue;
+			}
+			if (found != nullptr) {
+				EXIT(
+				    "TextureCache: incompatible or ambiguous render-target range, addr=0x%016" PRIx64
+				    " size=0x%016" PRIx64 " cached=0x%016" PRIx64 "+0x%016" PRIx64
+				    " previous=%p\n",
+				    vaddr, size, cached->Address(), cached->Size(),
+				    static_cast<const void*>(found));
+			}
+			found = cached;
 		}
-		const auto slice_size =
-		    cached->target.layers != 0 ? cached->target.size / cached->target.layers : 0;
-		const bool contained = vaddr == cached->target.address && slice_size != 0 &&
-		                       cached->target.size % cached->target.layers == 0 &&
-		                       size <= cached->target.size && size % slice_size == 0;
-		if (!contained) {
-			continue;
-		}
-		if (found != nullptr) {
-			EXIT("TextureCache: incompatible or ambiguous render-target range, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " cached=0x%016" PRIx64 "+0x%016" PRIx64 " previous=%p\n",
-			     vaddr, size, cached->Address(), cached->Size(), static_cast<const void*>(found));
-		}
-		found = cached;
 	}
 	if (found == nullptr) {
 		return nullptr;
 	}
+	const auto target_address = found->target.address;
+	const auto target_size    = found->target.size;
+	const bool buffer_overlap = m_buffer_cache.HasPageOverlap(target_address, target_size);
+	bool       buffer_dirty   = found->buffer_modified;
+	BufferImageCopySource source {nullptr, 0, target_address, target_size, true};
+	if (buffer_overlap) {
+		buffer_dirty |= m_buffer_cache.IsRegionCpuModified(target_address, target_size) ||
+		                m_buffer_cache.IsRegionGpuModified(target_address, target_size);
+		source = m_buffer_cache.ObtainBufferForImage(target_address, target_size);
+	}
+
+	FaultSafeTextureLock lock(this, m_lock);
 	const auto owner = std::find_if(m_images.begin(), m_images.end(),
 	                                [found](const auto& image) { return image.get() == found; });
 	if (owner == m_images.end()) {
 		EXIT("TextureCache: page-table render target has no cache owner\n");
+	}
+	if (buffer_dirty) {
+		if (found->gpu_modified || found->target.samples != 1 ||
+		    !IsCoherentGuestImageSource(source, target_address, target_size)) {
+			EXIT("TextureCache: render-target range refresh has invalid ownership, "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			     " gpu_modified=%d samples=%u source=%p current=%d\n",
+			     target_address, target_size, found->gpu_modified, found->target.samples,
+			     static_cast<const void*>(source.buffer), source.cpu_current);
+		}
+		m_memory_tracker.MarkRegionAsCpuModified(target_address, target_size);
+	}
+	if (!found->gpu_modified &&
+	    m_memory_tracker.IsRegionCpuModified(target_address, target_size)) {
+		m_memory_tracker.ForEachUploadRange(
+		    target_address, target_size, false, [](uint64_t, uint64_t) noexcept {},
+		    [&]() noexcept {
+			    ImageOps::UploadRenderTarget(
+			        *static_cast<RenderTextureVulkanImage*>(found->image), found->target, true);
+		    });
+		found->buffer_modified = false;
 	}
 	command.RetainResourceUntilFence(*owner);
 	return static_cast<RenderTextureVulkanImage*>(found->image);

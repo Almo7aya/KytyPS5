@@ -15,6 +15,7 @@
 #include "libs/errno.h"
 
 #include <array>
+#include <cstring>
 #include <limits>
 #include <optional>
 
@@ -64,13 +65,8 @@ static void SubmitLabel(CommandBuffer& buffer, LabelCallback callback_1 = nullpt
 	LabelDelete(*label);
 }
 
-static bool CompleteDisplayBufferFlip(const uint64_t* args) {
-	EXIT_IF(args == nullptr);
-	Presentation::DisplayBufferCompleteFlipFromGpu(args[0]);
-	return true;
-}
-
 enum class EndOfPipeCompletion { None, Interrupt, Flip, FlipAndInterrupt };
+enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 
 struct EndOfPipeSignal {
 	CommandBuffer*          buffer          = nullptr;
@@ -79,11 +75,12 @@ struct EndOfPipeSignal {
 	std::array<uint32_t, 4> debug_args      = {};
 	uint64_t                debug_data      = 0;
 	std::optional<uint64_t> destination;
+	std::optional<EndOfPipeWriteSize> write_size;
+	uint64_t                write_value     = 0;
 	EndOfPipeCompletion     completion      = EndOfPipeCompletion::None;
 	uint64_t                completion_data = 0;
 };
 
-enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
 
 static bool TriggerEopEventCallback(const uint64_t* args) {
@@ -92,14 +89,47 @@ static bool TriggerEopEventCallback(const uint64_t* args) {
 	return true;
 }
 
-static bool TriggerDefaultEopEventCallback(const uint64_t* /*args*/) {
-	GetRenderContext().TriggerEopEvent(0);
+static bool CompleteEndOfPipeSignal(const uint64_t* args) {
+	EXIT_IF(args == nullptr);
+	const auto destination = args[0];
+	const auto value       = args[1];
+	const auto width       = static_cast<uint32_t>(args[2]);
+	const auto completion  = static_cast<EndOfPipeCompletion>(args[3]);
+	const auto data        = args[4];
+
+	if (width != 0) {
+		if (destination == 0 ||
+		    (width != static_cast<uint32_t>(EndOfPipeWriteSize::Dword) &&
+		     width != static_cast<uint32_t>(EndOfPipeWriteSize::Qword))) {
+			EXIT("invalid deferred end-of-pipe write: dst=0x%016" PRIx64 " width=%u\n",
+			     destination, width);
+		}
+		std::memcpy(reinterpret_cast<void*>(destination), &value, width);
+	}
+
+	switch (completion) {
+		case EndOfPipeCompletion::None: break;
+		case EndOfPipeCompletion::Interrupt:
+			GetRenderContext().TriggerEopEvent(static_cast<uint32_t>(data));
+			break;
+		case EndOfPipeCompletion::Flip:
+			Presentation::DisplayBufferCompleteFlipFromGpu(data);
+			break;
+		case EndOfPipeCompletion::FlipAndInterrupt:
+			Presentation::DisplayBufferCompleteFlipFromGpu(data);
+			GetRenderContext().TriggerEopEvent(0);
+			break;
+		default: EXIT("invalid deferred end-of-pipe completion\n");
+	}
 	return true;
 }
 
 static void ValidateEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	if (signal.destination.has_value()) {
 		EXIT_IF(*signal.destination == 0);
+	}
+	if (signal.write_size.has_value() && !signal.destination.has_value()) {
+		EXIT("end-of-pipe memory write has no destination\n");
 	}
 	EXIT_IF(signal.buffer == nullptr);
 	(void)signal.buffer->Handle();
@@ -111,20 +141,14 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	                            signal.debug_args[0], signal.debug_args[1], signal.debug_args[2],
 	                            signal.debug_args[3], signal.debug_data);
 
-	const uint64_t args[LABEL_ARGS_MAX] = {signal.completion_data};
-	switch (signal.completion) {
-		case EndOfPipeCompletion::None: return;
-		case EndOfPipeCompletion::Interrupt:
-			SubmitLabel(*signal.buffer, nullptr, TriggerEopEventCallback, args);
-			return;
-		case EndOfPipeCompletion::Flip:
-			SubmitLabel(*signal.buffer, CompleteDisplayBufferFlip, nullptr, args);
-			return;
-		case EndOfPipeCompletion::FlipAndInterrupt:
-			SubmitLabel(*signal.buffer, CompleteDisplayBufferFlip, TriggerDefaultEopEventCallback,
-			            args);
-			return;
+	if (!signal.write_size.has_value() && signal.completion == EndOfPipeCompletion::None) {
+		return;
 	}
+	const uint64_t args[LABEL_ARGS_MAX] = {
+	    signal.destination.value_or(0), signal.write_value,
+	    signal.write_size.has_value() ? static_cast<uint32_t>(*signal.write_size) : 0u,
+	    static_cast<uint32_t>(signal.completion), signal.completion_data};
+	SubmitLabel(*signal.buffer, CompleteEndOfPipeSignal, nullptr, args);
 }
 
 static CommandBufferDebugOp DebugOperation(EndOfPipeWriteAction action) {
@@ -159,6 +183,8 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	                                 : std::array {width, value_low, value_high, 0u},
 	    .debug_data      = destination,
 	    .destination     = destination,
+	    .write_size      = size,
+	    .write_value     = value,
 	    .completion      = interrupt ? EndOfPipeCompletion::Interrupt : EndOfPipeCompletion::None,
 	    .completion_data = context_id != 0 ? context_id : value,
 	};
@@ -170,6 +196,16 @@ void TriggerAgcUserInterrupt() {
 	auto result = LibKernel::EventQueue::KernelTriggerUserEventForAll(AGC_USER_INTERRUPT_EVENT,
 	                                                                  reinterpret_cast<void*>(tsc));
 	EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_ENOENT);
+}
+
+static bool TriggerAgcUserInterruptCallback(const uint64_t* /*args*/) {
+	TriggerAgcUserInterrupt();
+	return true;
+}
+
+void TriggerAgcUserInterruptAtEndOfPipe(CommandBuffer& buffer) {
+	ValidateEndOfPipeSignal({.buffer = &buffer});
+	SubmitLabel(buffer, nullptr, TriggerAgcUserInterruptCallback);
 }
 
 void TriggerEopEvent(uint32_t context_id) {
@@ -203,7 +239,7 @@ void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst
 
 void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
                                   uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -213,7 +249,7 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
 
 void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
                                                uint64_t* dst_gpu_addr, uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -293,6 +329,8 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	                        static_cast<uint32_t>(flip_mode), value},
 	    .debug_data      = static_cast<uint64_t>(flip_arg),
 	    .destination     = destination,
+	    .write_size      = EndOfPipeWriteSize::Dword,
+	    .write_value     = value,
 	    .completion      = EndOfPipeCompletion::FlipAndInterrupt,
 	    .completion_data = request_id,
 	});
@@ -310,6 +348,8 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	                        static_cast<uint32_t>(flip_mode), value},
 	    .debug_data      = static_cast<uint64_t>(flip_arg),
 	    .destination     = destination,
+	    .write_size      = EndOfPipeWriteSize::Dword,
+	    .write_value     = value,
 	    .completion      = EndOfPipeCompletion::Flip,
 	    .completion_data = request_id,
 	});

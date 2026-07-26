@@ -2,6 +2,8 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEVIEW_H_
 
 #include "common/assert.h"
+#include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/imageInfo.h"
 #include "graphics/shader/recompiler/ShaderIR.h"
@@ -9,35 +11,67 @@
 
 namespace Libs::Graphics {
 
+[[nodiscard]] inline bool IsValidStorageSwizzle(uint32_t swizzle) noexcept {
+	if ((swizzle & ~0xfffu) != 0) {
+		return false;
+	}
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		switch (GetDstSel(swizzle, channel)) {
+			case 0:
+			case 1:
+			case 4:
+			case 5:
+			case 6:
+			case 7: break;
+			default: return false;
+		}
+	}
+	return true;
+}
+
 [[nodiscard]] inline bool IsSupportedStorageSwizzle(uint32_t format, uint32_t swizzle) noexcept {
-	const bool single_channel =
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UNorm) ||
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) ||
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16UInt) ||
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) ||
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k16Float) ||
-	    format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32Float);
-	return swizzle == DstSel(4, 5, 6, 7) ||
-	       (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1) ||
-	                           swizzle == DstSel(4, 4, 4, 4))) ||
-	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32UInt) &&
-	        swizzle == DstSel(4, 5, 0, 1)) ||
-	       ((format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UNorm) ||
-	         format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8_8_8_8UInt)) &&
-	        (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
-	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32_32_32_32Float) &&
-	        swizzle == DstSel(5, 6, 7, 4));
+	// Storage views stay identity-mapped in Vulkan. Guest destination selection is lowered into
+	// the storage load/store shader, so every syntactically valid selector mapping is supported
+	// independently of component width or count.
+	return Prospero::NumBytesPerElement(format) != 0 && IsValidStorageSwizzle(swizzle);
 }
 
 [[nodiscard]] inline bool IsSupportedStorageDepthTile(uint32_t format, uint32_t type,
                                                       uint32_t width, uint32_t height,
                                                       uint32_t depth) noexcept {
-	return (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt) &&
-	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && width != 0 &&
-	        height != 0 && depth == 1) ||
-	       (format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32UInt) &&
-	        type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && width != 0 &&
-	        height != 0 && depth == 1);
+	const bool shape =
+	    (type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2D) && depth == 1) ||
+	    (type == Prospero::GpuEnumValue(Prospero::ImageType::kColor2DArray) && depth != 0);
+	TileBlockLayout layout {};
+	return width != 0 && height != 0 && shape &&
+	       TileGetBlockLayout(TileBlockFamily::Depth64KB,
+	                          Prospero::NumBytesPerElement(format), layout);
+}
+
+[[nodiscard]] inline bool IsSupportedStorageTile(uint32_t format, uint32_t type, uint32_t width,
+                                                 uint32_t height, uint32_t depth, uint32_t tile,
+                                                 bool guest_read) noexcept {
+	const bool volume =
+	    type == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
+	switch (static_cast<Prospero::TileMode>(tile)) {
+		case Prospero::TileMode::kLinear:
+			return Prospero::NumBytesPerElement(format) != 0;
+		case Prospero::TileMode::kStandard256B:
+			return !volume && TileIsStandard256BTextureSupported(format);
+		case Prospero::TileMode::kStandard4KB:
+			return TileIsStandard4KBTextureSupported(format);
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt: return TileIsStandard64KBTextureSupported(format);
+		case Prospero::TileMode::kRenderTarget: {
+			TileBlockLayout layout {};
+			return TileGetBlockLayout(TileBlockFamily::RenderTarget64KB,
+			                          Prospero::RenderTargetBytesPerElement(format), layout);
+		}
+		case Prospero::TileMode::kDepth:
+			return !guest_read &&
+			       IsSupportedStorageDepthTile(format, type, width, height, depth);
+	}
+	return false;
 }
 
 [[noreturn]] inline void UnsupportedColorView(const char* usage, vk::Format image_format,
@@ -171,21 +205,9 @@ IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& r
 
 [[nodiscard]] inline int SelectStorageColorView(vk::Format image_format, vk::Format view_format,
                                                 uint32_t swizzle) noexcept {
-	const bool single_channel =
-	    view_format == vk::Format::eR8Unorm || view_format == vk::Format::eR8Uint ||
-	    view_format == vk::Format::eR16Uint || view_format == vk::Format::eR32Uint ||
-	    view_format == vk::Format::eR16Sfloat || view_format == vk::Format::eR32Sfloat;
-	const bool swizzle_ok =
-	    swizzle == DstSel(4, 5, 6, 7) ||
-	    (single_channel && (swizzle == DstSel(4, 0, 0, 0) || swizzle == DstSel(4, 0, 0, 1) ||
-	                        swizzle == DstSel(4, 4, 4, 4))) ||
-	    (view_format == vk::Format::eR32G32Uint && swizzle == DstSel(4, 5, 0, 1)) ||
-	    ((view_format == vk::Format::eR8G8B8A8Unorm || view_format == vk::Format::eR8G8B8A8Uint) &&
-	     (swizzle == DstSel(4, 5, 6, 1) || swizzle == DstSel(6, 5, 4, 7))) ||
-	    (view_format == vk::Format::eR32G32B32A32Sfloat && swizzle == DstSel(5, 6, 7, 4));
 	if ((image_format != view_format &&
 	     !IsBgraSrgbStorageView(image_format, view_format, swizzle)) ||
-	    !swizzle_ok) {
+	    !IsValidStorageSwizzle(swizzle)) {
 		UnsupportedColorView("storage", image_format, view_format, swizzle);
 	}
 	return VulkanImage::VIEW_STORAGE;

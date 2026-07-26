@@ -55,6 +55,14 @@ void CommandScheduler::FinishCurrent() {
 	m_recording = true;
 }
 
+void CommandScheduler::DebugDumpFenceStatus() const {
+	for (const auto& buffer: m_buffers) {
+		if (buffer != nullptr) {
+			buffer->DebugDumpFenceStatus();
+		}
+	}
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active() || m_current >= BufferCount);
 }

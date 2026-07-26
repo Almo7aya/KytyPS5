@@ -22,6 +22,7 @@ public:
 	CommandBuffer& FlushAndGetSubmitted();
 	void           Finish();
 	void           FinishCurrent();
+	void           DebugDumpFenceStatus() const;
 
 	[[nodiscard]] bool   Active() const noexcept { return m_current >= 0; }
 	void                 CheckActive() const;

@@ -827,7 +827,8 @@ void CopyImageViaBuffer(CommandBuffer& buffer, VulkanImage& src_image,
                         vk::ImageAspectFlags dst_aspect, uint32_t bytes_per_element,
                         vk::ImageLayout dst_layout) {
 	if (!IsSingleImageAspect(src_aspect) || !IsSingleImageAspect(dst_aspect) ||
-	    (bytes_per_element != 2 && bytes_per_element != 4) || src_image.layers != 1 ||
+	    (bytes_per_element != 1 && bytes_per_element != 2 && bytes_per_element != 4) ||
+	    src_image.layers != 1 ||
 	    dst_image.layers != 1 || src_image.mip_levels != 1 || dst_image.mip_levels != 1 ||
 	    src_image.extent.width == 0 || src_image.extent.height == 0 ||
 	    src_image.extent.width != dst_image.extent.width ||
@@ -939,13 +940,18 @@ void BlitToSwapchain(CommandBuffer& buffer, VulkanImage& src_image,
 }
 
 void ClearColorImage(CommandBuffer& buffer, VulkanImage& image, const vk::ClearColorValue& color) {
+	ClearColorImage(buffer, image, color, vk::ImageLayout::eTransferSrcOptimal);
+}
+
+void ClearColorImage(CommandBuffer& buffer, VulkanImage& image, const vk::ClearColorValue& color,
+                     vk::ImageLayout final_layout) {
 	auto vk_buffer = buffer.Handle();
 	SetImageLayout(vk_buffer, image, 0, 1, vk::ImageAspectFlagBits::eColor, image.layout,
 	               vk::ImageLayout::eTransferDstOptimal);
-	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eColor, 0, 1, 0, image.layers};
 	vk_buffer.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
 	SetImageLayout(vk_buffer, image, 0, 1, vk::ImageAspectFlagBits::eColor,
-	               vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal);
+	               vk::ImageLayout::eTransferDstOptimal, final_layout);
 }
 
 void UploadImage(VulkanImage& dst_image, const void* src_data, uint64_t size, uint32_t src_pitch,

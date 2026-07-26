@@ -99,6 +99,8 @@ void CopyImageViaBuffer(CommandBuffer& buffer, VulkanImage& src_image,
                         vk::ImageLayout dst_layout);
 void BlitToSwapchain(CommandBuffer& buffer, VulkanImage& src_image, VulkanSwapchain& dst_swapchain);
 void ClearColorImage(CommandBuffer& buffer, VulkanImage& image, const vk::ClearColorValue& color);
+void ClearColorImage(CommandBuffer& buffer, VulkanImage& image, const vk::ClearColorValue& color,
+                     vk::ImageLayout final_layout);
 void UploadImage(VulkanImage& dst_image, const void* src_data, uint64_t size, uint32_t src_pitch,
                  vk::ImageLayout dst_layout);
 void UploadImage(DepthStencilVulkanImage& dst_image, const void* src_data, uint64_t size,

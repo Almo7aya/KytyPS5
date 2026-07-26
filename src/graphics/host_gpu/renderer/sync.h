@@ -16,6 +16,7 @@ namespace Sync {
 [[nodiscard]] uint64_t ReadReferenceClock();
 
 void TriggerAgcUserInterrupt();
+void TriggerAgcUserInterruptAtEndOfPipe(CommandBuffer& buffer);
 void TriggerEopEvent(uint32_t context_id);
 void TriggerEopEventAtEndOfPipe(CommandBuffer& buffer, uint32_t context_id);
 

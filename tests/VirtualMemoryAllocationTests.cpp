@@ -580,6 +580,68 @@ void TestDirectPhysicalFreeRangeReuseAndCoalescing() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestDirectMapAcrossAdjacentAllocations() {
+	const char*        test      = "DirectMapAcrossAdjacentAllocations";
+	constexpr uint64_t part_size = SceKernelPageSize * 2;
+	constexpr uint64_t map_size  = SceKernelPageSize * 2;
+	const auto         end       = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+
+	int64_t left_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, part_size, SceKernelPageSize, SceKernelMtypeC, &left_phys),
+	        "KernelAllocateDirectMemory(left)");
+
+	int64_t right_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            left_phys + static_cast<int64_t>(part_size), end, part_size, SceKernelPageSize,
+	            SceKernelMtypeC, &right_phys),
+	        "KernelAllocateDirectMemory(right)");
+	Check(test, right_phys == left_phys + static_cast<int64_t>(part_size),
+	      "test allocations were not physically adjacent");
+
+	const auto map_phys = left_phys + static_cast<int64_t>(SceKernelPageSize);
+	void*      first     = nullptr;
+	void*      second    = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &first, map_size, SceKernelProtCpuRw, 0, map_phys, SceKernelPageSize,
+	            "cross_alloc_a"),
+	        "KernelMapNamedDirectMemory(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &second, map_size, SceKernelProtCpuRw, 0, map_phys, SceKernelPageSize,
+	            "cross_alloc_b"),
+	        "KernelMapNamedDirectMemory(second)");
+
+	auto* first_bytes  = static_cast<uint8_t*>(first);
+	auto* second_bytes = static_cast<uint8_t*>(second);
+	*reinterpret_cast<uint64_t*>(first_bytes + SceKernelPageSize - 8) =
+	    0x4b5954594c454654ull; // "KYTYLEFT"
+	*reinterpret_cast<uint64_t*>(first_bytes + SceKernelPageSize) =
+	    0x4b59545952474854ull; // "KYTYRGHT"
+	Check(test,
+	      *reinterpret_cast<const uint64_t*>(second_bytes + SceKernelPageSize - 8) ==
+	              0x4b5954594c454654ull &&
+	          *reinterpret_cast<const uint64_t*>(second_bytes + SceKernelPageSize) ==
+	              0x4b59545952474854ull,
+	      "aliases diverged at an adjacent allocation boundary");
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(first), map_size),
+	        "KernelMunmap(first)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(second), map_size),
+	        "KernelMunmap(second)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(left_phys, part_size),
+	        "KernelReleaseDirectMemory(left)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(right_phys, part_size),
+	        "KernelReleaseDirectMemory(right)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectAlignmentStaysWithinSearchRange() {
 	const char*        test         = "DirectAlignmentStaysWithinSearchRange";
 	constexpr int64_t  search_start = SceKernelPageSize * 2;
@@ -1469,6 +1531,7 @@ int main() {
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);
+	RunTest(TestDirectMapAcrossAdjacentAllocations);
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);

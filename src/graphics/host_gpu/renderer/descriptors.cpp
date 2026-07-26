@@ -359,14 +359,9 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    descriptor.BaseArray5() <= descriptor.Depth();
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::GpuEnumValue(Prospero::ImageType::kColor3D);
-	const bool supported_depth_tile =
-	    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) && !resource.read &&
-	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
-	    IsSupportedStorageDepthTile(descriptor.Format(), descriptor.Type(), width, height, depth);
-	const bool supported_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kLinear) ||
-	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget) ||
-	                            tile == Prospero::GpuEnumValue(Prospero::TileMode::kStandard4KB) ||
-	                            supported_depth_tile;
+	const bool supported_tile =
+	    IsSupportedStorageTile(descriptor.Format(), descriptor.Type(), width, height, depth, tile,
+	                           resource.read);
 	const bool supported_swizzle =
 	    IsSupportedStorageSwizzle(descriptor.Format(), descriptor.DstSelXYZW()) &&
 	    (descriptor.DstSelXYZW() == DstSel(4, 5, 6, 7) || !resource.read);
@@ -379,23 +374,35 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
 
-static bool IsSupportedStorageTextureEncoding(const ShaderTextureResource& descriptor) {
+static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageResource& resource,
+                                              const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
 	constexpr uint32_t field5_expected      = 0x00700000u;
 	constexpr uint32_t field5_max_mip_mask  = 0x000000f0u;
+	constexpr uint32_t field6_non_metadata_mask = 0x00007fffu;
 	const uint32_t     expected_field3 = descriptor.DstSelXYZW() |
 	                                     (static_cast<uint32_t>(descriptor.BaseLevel()) << 12u) |
 	                                     (static_cast<uint32_t>(descriptor.LastLevel()) << 16u) |
 	                                     (static_cast<uint32_t>(descriptor.TileMode()) << 20u) |
 	                                     (static_cast<uint32_t>(descriptor.Type()) << 28u);
+	// Kyty keeps storage images expanded in Vulkan. A write-only guest descriptor may still carry
+	// DCC state so hardware can invalidate compressed blocks while issuing uncompressed stores.
+	// The metadata has no representation in the host image and is therefore inert here. Compressed
+	// reads and compression-producing writes still require real DCC support and remain rejected.
+	const bool expanded_write_metadata =
+	    !resource.read && resource.written && descriptor.MetaCompress() &&
+	    !descriptor.WriteCompress() && descriptor.MetaAddr() != 0 &&
+	    (descriptor.fields[6] & field6_non_metadata_mask) == 0;
+	const bool metadata_ok =
+	    (descriptor.fields[6] == 0 && descriptor.fields[7] == 0) || expanded_write_metadata;
 	return (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	       (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	       descriptor.fields[3] == expected_field3 &&
 	       descriptor.fields[4] ==
 	           (descriptor.Depth() | (static_cast<uint32_t>(descriptor.BaseArray5()) << 16u)) &&
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected &&
-	       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
+	       metadata_ok;
 }
 
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -403,7 +410,7 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
-	const bool encoding_ok   = IsSupportedStorageTextureEncoding(descriptor);
+	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource =
 	    resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint;
 	const bool format_ok = Prospero::IsSupportedTextureFormat(format) &&
@@ -569,13 +576,13 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 				    IsSupportedDepthTextureEncoding(descriptor) &&
 				    IsDepthUintTextureReinterpretation(image->format, descriptor.Format(),
 				                                       view_format);
-				const bool uint_storage_reinterpret =
+				const bool storage_depth_alias =
 				    storage && IsSupportedStorageImageResource(resource) &&
 				    IsSupportedStorageTextureDescriptor(resource, descriptor) &&
-				    IsSupportedStorageTextureEncoding(descriptor) &&
-				    IsDepthUintTextureReinterpretation(image->format, descriptor.Format(),
-				                                       view_format);
-				if (uint_reinterpret || uint_storage_reinterpret) {
+				    IsSupportedStorageTextureEncoding(resource, descriptor) &&
+				    tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth) &&
+				    IsSupportedStorageDepthTile(format, descriptor.Type(), width, height, depth);
+				if (uint_reinterpret || storage_depth_alias) {
 					image = nullptr;
 				} else {
 					const auto depth_view = ResolveTargetTextureView(
@@ -594,34 +601,44 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 					    depth_view.type, depth_view.base_layer, depth_view.layer_count);
 				}
 			} else {
-				if (!(storage ? IsSupportedStorageImageResource(resource)
-				              : IsSupportedSampledColorResource(resource)) ||
-				    image->type != VulkanImageType::RenderTexture || width != image->extent.width ||
-				    height != image->extent.height ||
-				    (storage ? levels != image->mip_levels || base_level != 0
-				             : levels != image->mip_levels || base_level >= levels) ||
-				    target_view.type ==
-				        static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM) ||
-				    target_view.base_layer >= image->layers ||
-				    target_view.layer_count > image->layers - target_view.base_layer) {
-					EXIT("unsupported cached render-target image view: storage=%d resource=%u "
-					     "dimension=%u"
-					     " image_type=%u layers=%u extent=%ux%u/%ux%u depth=%u"
-					     " levels=%u/%u base_level=%u base_array=%u descriptor_type=%u\n",
-					     storage, static_cast<uint32_t>(resource.kind),
-					     static_cast<uint32_t>(resource.dimension),
-					     static_cast<uint32_t>(image->type), image->layers, width, height,
-					     image->extent.width, image->extent.height, depth, levels,
-					     image->mip_levels, base_level, descriptor.BaseArray5(),
-					     static_cast<uint32_t>(type));
+				const bool compatible =
+				    (storage ? IsSupportedStorageImageResource(resource)
+				             : IsSupportedSampledColorResource(resource)) &&
+				    image->type == VulkanImageType::RenderTexture &&
+				    width == image->extent.width && height == image->extent.height &&
+				    (storage ? levels == image->mip_levels && base_level == 0
+				             : levels == image->mip_levels && base_level < levels) &&
+				    target_view.type !=
+				        static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM) &&
+				    target_view.base_layer < image->layers &&
+				    target_view.layer_count <= image->layers - target_view.base_layer;
+				if (!compatible) {
+					if (storage) {
+						// This descriptor aliases the target's guest bytes but cannot be represented
+						// by a Vulkan view of its native shape. Fall through to FindStorageTexture,
+						// which materializes and retires the target before creating the requested
+						// storage allocation.
+						image = nullptr;
+					} else {
+						EXIT("unsupported cached render-target image view: storage=%d resource=%u "
+						     "dimension=%u"
+						     " image_type=%u layers=%u extent=%ux%u/%ux%u depth=%u"
+						     " levels=%u/%u base_level=%u base_array=%u descriptor_type=%u\n",
+						     storage, static_cast<uint32_t>(resource.kind),
+						     static_cast<uint32_t>(resource.dimension),
+						     static_cast<uint32_t>(image->type), image->layers, width, height,
+						     image->extent.width, image->extent.height, depth, levels,
+						     image->mip_levels, base_level, descriptor.BaseArray5(),
+						     static_cast<uint32_t>(type));
+					}
 				}
-				if (storage) {
+				if (image != nullptr && storage) {
 					view       = SelectStorageColorView(image->format, view_format, swizzle);
 					image_view = GetRenderContext().GetTextureCache().GetRenderTargetStorageView(
 					    *static_cast<RenderTextureVulkanImage*>(image), view_format, base_level,
 					    view_levels, target_view.type, target_view.base_layer,
 					    target_view.layer_count);
-				} else {
+				} else if (image != nullptr) {
 					image_view = GetRenderContext().GetTextureCache().GetSampledColorView(
 					    *image, view_format, swizzle, base_level, view_levels, target_view.type,
 					    target_view.base_layer, target_view.layer_count);
@@ -659,6 +676,9 @@ NativeTexture(uint64_t submit_id, CommandBuffer& command_buffer,
 				}
 				image = video.image;
 				view  = VulkanImage::VIEW_STORAGE;
+				// A registered display surface bypasses FindStorageTexture. Reconcile any aliased
+				// buffer ownership before granting writable storage-image ownership.
+				GetRenderContext().GetTextureCache().RefreshVideoOut(*video.image, true);
 				GetRenderContext().GetTextureCache().MarkGpuWritten(*image);
 			} else {
 				const bool exact =
