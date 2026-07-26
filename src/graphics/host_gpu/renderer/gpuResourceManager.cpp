@@ -33,11 +33,10 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!m_page_manager.IsMapped(fault_vaddr, 1)) {
 		return false;
 	}
-	if (LabelInCallback()) {
-		EXIT("unsupported guest-memory fault from an asynchronous GPU label callback, "
-		     "addr=0x%016" PRIx64 " access=%u\n",
-		     fault_vaddr, static_cast<uint32_t>(access));
-	}
+	// GPU label callbacks run guest code on the dedicated label thread with no label lock held (see
+	// LabelManager::ThreadRun, which unlocks before firing). Such a thread is just another non-command-
+	// processor faulting thread, so a guest access to GPU-tracked memory can be resolved through the
+	// normal non-CP fault path below rather than aborting.
 	if (auto* cp = GraphicsRunCurrentCommandProcessor(); cp != nullptr) {
 		cp->BeginReadbackTransaction();
 		bool handled = false;

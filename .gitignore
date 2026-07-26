@@ -5,3 +5,6 @@ build/
 _Build/vscode-clang/
 _Build
 _SaveData
+_Shaders
+_RenderDoc
+_DownloadData

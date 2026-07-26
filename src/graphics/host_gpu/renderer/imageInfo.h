@@ -437,8 +437,11 @@ enum class BufferImageWrite : uint8_t {
 	switch (binding) {
 		case BufferImageBinding::Texture: return true;
 		case BufferImageBinding::RenderTarget:
-		case BufferImageBinding::DepthTarget: return !buffer_modified;
-		case BufferImageBinding::StorageTexture:
+		case BufferImageBinding::DepthTarget:
+		// A CPU-current storage texture that is not buffer-owned is just a stale device copy of guest
+		// memory. A host write into it can invalidate the cached image (it re-uploads from guest on the
+		// next bind), the same as a render/depth target.
+		case BufferImageBinding::StorageTexture: return !buffer_modified;
 		case BufferImageBinding::VideoOut:
 		case BufferImageBinding::Unsupported: return false;
 	}
@@ -916,7 +919,11 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 	const bool image_page_aligned = ((image_address | image_size) & (TRACKER_PAGE_SIZE - 1)) == 0;
 	switch (binding) {
 		case BufferImageBinding::Texture:
-			return contained && image_page_aligned && !image_gpu_modified
+			// A raw buffer write that lands inside a clean sampled image, or that fully encloses one
+			// (image_contained), overwrites the image's guest bytes, so the cached image is stale and
+			// must be invalidated. Enclosing writes are common when a streaming pool reuses the memory
+			// of a smaller retired texture for a larger allocation.
+			return (contained || image_contained) && image_page_aligned && !image_gpu_modified
 			           ? BufferImageWrite::InvalidateTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::VideoOut:

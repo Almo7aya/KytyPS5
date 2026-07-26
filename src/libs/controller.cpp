@@ -209,7 +209,10 @@ void GameController::AddState(const ControllerState& state) {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	// The keyboard (KEYBOARD_CONTROLLER_ID) always merges into the active pad state, even when a
+	// game controller currently holds the active slot. Otherwise a connected gamepad steals the
+	// active id and keyboard input is silently dropped.
+	if (m_active_id == id || id == KEYBOARD_CONTROLLER_ID) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();
@@ -227,7 +230,7 @@ void GameController::Button(int id, uint32_t button, bool down) {
 void GameController::Axis(int id, Controller::Axis axis, int value) {
 	Common::LockGuard lock(m_mutex);
 
-	if (m_active_id == id) {
+	if (m_active_id == id || id == KEYBOARD_CONTROLLER_ID) {
 		auto state = GetLastState();
 
 		state.time = LibKernel::KernelGetProcessTime();

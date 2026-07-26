@@ -687,16 +687,19 @@ struct TextureCache::ReadbackWorker {
 		const bool storage_shape = storage_2d || storage_array || storage_volume;
 		const auto layers         = target ? cached.target.layers : 1u;
 		const auto transfer_depth = storage ? cached.info.depth : layers;
+		// A render-target mip chain lays out each array slice (cube face) as its own mip chain,
+		// padded to a 65536-aligned per-slice stride. TileGetRenderTargetMipLayout returns the
+		// single-slice size, so for layered (e.g. cube) targets the total is per_slice * layers.
 		TileSizeAlign target_mip_layout {};
 		const bool    target_mip_chain =
-		    target && info.levels > 1 && layers == 1 && tiled_target &&
+		    target && info.levels > 1 && layers >= 1 && tiled_target && info.size % layers == 0 &&
 		    TileGetRenderTargetMipLayout(info.width, info.height, info.pitch,
 		                                 info.bytes_per_element, info.levels, target_mip_layout,
 		                                 nullptr, nullptr) &&
-		    target_mip_layout.align == 65536 && target_mip_layout.size == info.size &&
+		    target_mip_layout.align == 65536 && target_mip_layout.size == info.size / layers &&
 		    cached.image != nullptr && cached.image->format == info.format &&
 		    cached.image->extent.width == info.width &&
-		    cached.image->extent.height == info.height && cached.image->layers == 1 &&
+		    cached.image->extent.height == info.height && cached.image->layers == layers &&
 		    cached.image->mip_levels == info.levels && cached.image->samples == 1;
 		const bool basic_storage = !storage || (storage_shape && (linear || tiled_storage));
 		if (info.samples != 1 || (!linear && !tiled_target && !tiled_storage) || !basic_storage ||
