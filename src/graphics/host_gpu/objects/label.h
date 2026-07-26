@@ -20,6 +20,8 @@ void   LabelDelete(Label& label);
 void   LabelSet(CommandBuffer& buffer, Label& label);
 void   LabelDrain();
 [[nodiscard]] bool LabelInCallback() noexcept;
+// Diagnostic: number of GPU labels with outstanding submissions plus callbacks currently in flight.
+[[nodiscard]] uint64_t LabelPendingCount() noexcept;
 
 } // namespace Libs::Graphics
 

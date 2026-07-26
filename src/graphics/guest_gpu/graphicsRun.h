@@ -25,6 +25,9 @@ void GraphicsRunSubmitFlipPreparation();
 void GraphicsRunWait();
 void GraphicsRunDone();
 int  GraphicsRunGetFrameNum();
+// Diagnostic: print whether the GPU command processor is currently blocked on a WAIT_REG_MEM
+// (memory-value) wait and, if so, the address/value/ref/retries it is stuck on.
+void GraphicsRunDumpGpuWait();
 [[nodiscard]] bool              GraphicsRunIsCommandProcessorThread() noexcept;
 [[nodiscard]] CommandProcessor* GraphicsRunCurrentCommandProcessor() noexcept;
 void                            GraphicsRunFinishScheduler();

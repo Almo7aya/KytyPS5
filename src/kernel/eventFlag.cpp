@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/waitWatch.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -296,8 +297,9 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	const auto mode = DecodeEventFlagWaitMode(wait_mode);
+	Kyty::WaitWatch::Scope watch("eventflag", reinterpret_cast<uint64_t>(ef), bit_pattern);
+	auto result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
 

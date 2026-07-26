@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -328,6 +329,18 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 	return false;
 }
 
+// Diagnostic snapshot of the command processor's current WAIT_REG_MEM stall, read by the watchdog.
+namespace {
+struct GpuWaitSnapshot {
+	std::atomic<uint64_t> address {0};
+	std::atomic<uint64_t> value {0};
+	std::atomic<uint64_t> ref {0};
+	std::atomic<uint64_t> retries {0};
+	std::atomic<uint64_t> submit {0};
+};
+GpuWaitSnapshot g_gpu_wait; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+} // namespace
+
 bool TestRecycledWaitRegMemLabel(uint64_t address, uint64_t value, uint64_t ref, uint64_t mask,
                                  uint32_t width, uint32_t func, uint32_t wait_op) {
 	// Native AGC code can publish a CPU completion label, observe it, and return the
@@ -365,6 +378,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			     m_submit_id, width, address, static_cast<uint64_t>(value), m_wait_reg_retries);
 		}
 		m_wait_reg_retries = 0;
+		g_gpu_wait.retries.store(0, std::memory_order_relaxed);
 		return;
 	}
 
@@ -403,6 +417,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			     m_wait_reg_retries);
 		}
 		m_wait_reg_retries = 0;
+		g_gpu_wait.retries.store(0, std::memory_order_relaxed);
 		return;
 	}
 
@@ -418,6 +433,11 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 			GetScheduler().DebugDumpFenceStatus();
 		}
 	}
+	g_gpu_wait.address.store(address, std::memory_order_relaxed);
+	g_gpu_wait.value.store(static_cast<uint64_t>(value), std::memory_order_relaxed);
+	g_gpu_wait.ref.store(static_cast<uint64_t>(ref), std::memory_order_relaxed);
+	g_gpu_wait.submit.store(m_submit_id, std::memory_order_relaxed);
+	g_gpu_wait.retries.store(m_wait_reg_retries, std::memory_order_relaxed);
 	SuspendPm4();
 }
 
@@ -505,8 +525,11 @@ void Gpu::Enqueue(Submission submission) {
 
 void Gpu::WaitForIdle() {
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || m_submission_count != 0) {
-		m_idle.Wait(&m_queue_mutex);
+	if (m_processing || m_submission_count != 0) {
+		Kyty::WaitWatch::Scope watch("gpu_idle", m_submission_count, 0);
+		while (m_processing || m_submission_count != 0) {
+			m_idle.Wait(&m_queue_mutex);
+		}
 	}
 }
 
@@ -661,10 +684,14 @@ void Gpu::PauseSubmissions() {
 	if (g_gpu_mutex_owned) {
 		EXIT("GPU submissions are already paused by this thread\n");
 	}
+	Kyty::WaitWatch::Scope watch("gpu_pause_lock", 0, 0);
 	g_gpu_mutex_owned = true;
 	m_submission_mutex.Lock();
 	WaitLocked();
-	LabelDrain();
+	{
+		Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
+		LabelDrain();
+	}
 }
 
 void Gpu::ResumeSubmissions() {
@@ -1655,6 +1682,22 @@ int GraphicsRunGetFrameNum() {
 	EXIT_IF(g_gpu == nullptr);
 
 	return g_gpu->GetFrameNum();
+}
+
+void GraphicsRunDumpGpuWait() {
+	const uint64_t retries = g_gpu_wait.retries.load(std::memory_order_relaxed);
+	if (retries == 0) {
+		std::printf("  gpu: not blocked on WAIT_REG_MEM\n");
+	} else {
+		std::printf("  gpu: WAIT_REG_MEM BLOCKED submit=%llu addr=0x%016llx value=0x%016llx "
+		            "ref=0x%016llx retries=%llu\n",
+		            static_cast<unsigned long long>(g_gpu_wait.submit.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_gpu_wait.address.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_gpu_wait.value.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(g_gpu_wait.ref.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(retries));
+	}
+	std::fflush(stdout);
 }
 
 bool GraphicsRunIsCommandProcessorThread() noexcept {

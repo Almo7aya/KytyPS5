@@ -64,6 +64,15 @@ public:
 	void   Set(CommandBuffer& buffer, Label& label);
 	void   Drain();
 
+	[[nodiscard]] uint64_t Pending() {
+		Common::LockGuard lock(m_mutex);
+		uint64_t          count = m_callbacks_in_flight;
+		for (const auto* label: m_labels) {
+			count += static_cast<uint64_t>(label->submissions.size());
+		}
+		return count;
+	}
+
 private:
 	static void ThreadRun(void* data);
 
@@ -343,6 +352,10 @@ void LabelDrain() {
 
 bool LabelInCallback() noexcept {
 	return g_in_label_callback;
+}
+
+uint64_t LabelPendingCount() noexcept {
+	return g_label_manager != nullptr ? g_label_manager->Pending() : 0;
 }
 
 } // namespace Libs::Graphics

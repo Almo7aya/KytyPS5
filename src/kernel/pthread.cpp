@@ -9,6 +9,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/waitWatch.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1159,12 +1160,19 @@ static int NativeMutexLock(PthreadMutexPrivate* mutex, KernelUseconds* timeout_u
 	}
 
 	if (timeout_us == nullptr) {
-		while (mutex->owner != nullptr) {
-			mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-			if (mutex->owner != nullptr) {
-				lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				lock.lock();
+		if (mutex->owner != nullptr) {
+			// Contended blocking lock: record the mutex and the holder's guest thread id so the
+			// watchdog can trace a deadlock chain. Only entered when actually contended, so the
+			// uncontended fast path stays untouched.
+			const uint64_t holder = static_cast<uint32_t>(mutex->owner->guest.thread_id);
+			Kyty::WaitWatch::Scope watch("mutex", reinterpret_cast<uint64_t>(mutex), holder);
+			while (mutex->owner != nullptr) {
+				mutex->cv.wait_for(lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+				if (mutex->owner != nullptr) {
+					lock.unlock();
+					KernelDispatchPendingSignalForCurrentThread();
+					lock.lock();
+				}
 			}
 		}
 	} else if (*timeout_us == 0) {
@@ -3040,12 +3048,15 @@ int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
 		return cond_value->sequence != sequence || thread->cond_sequence != thread_sequence;
 	};
 
-	while (!ready()) {
-		cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
+	{
+		Kyty::WaitWatch::Scope watch("cond", reinterpret_cast<uint64_t>(cond_value), 0);
+		while (!ready()) {
+			cond_value->cv.wait_for(cond_lock, std::chrono::microseconds(SIGNAL_APC_POLL_MICROS));
+			if (!ready()) {
+				cond_lock.unlock();
+				KernelDispatchPendingSignalForCurrentThread();
+				cond_lock.lock();
+			}
 		}
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -3186,6 +3197,8 @@ static void* RunThread(void* arg) {
 	os_thread_id = static_cast<uint64_t>(GetCurrentThreadId());
 #endif
 	thread->host_thread_id = os_thread_id;
+
+	Kyty::WaitWatch::SetThreadName(thread->name.c_str(), thread->guest.thread_id, os_thread_id);
 
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",

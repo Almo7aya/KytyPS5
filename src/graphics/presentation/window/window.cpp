@@ -1070,4 +1070,8 @@ void WindowUpdateTitle() {
 	SDL_SetWindowTitle(g_window_ctx->window, fps.c_str());
 }
 
+int WindowGetPresentedFrame() {
+	return g_window_game.m_frame_num;
+}
+
 } // namespace Libs::Graphics

@@ -12,6 +12,9 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/objects/label.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -25,6 +28,7 @@
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 
@@ -159,7 +163,44 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 }
 
+// Diagnostic watchdog: when the presented-frame counter stops advancing, dump every guest thread's
+// current blocking primitive so we can distinguish a deadlock (threads parked on a wait) from a
+// thrash (threads still churning) from a GPU stall (labels pending). Prints on stdout.
+static void WatchdogRun(void* /*unused*/) {
+	int      last_frame     = -1;
+	uint64_t last_change_ms = Kyty::WaitWatch::NowMs();
+	bool     dumped         = false;
+	for (;;) {
+		Common::Thread::Sleep(1000);
+		const int      frame = Libs::Graphics::WindowGetPresentedFrame();
+		const uint64_t now   = Kyty::WaitWatch::NowMs();
+		if (frame != last_frame) {
+			last_frame     = frame;
+			last_change_ms = now;
+			dumped         = false;
+			continue;
+		}
+		const uint64_t stalled = now - last_change_ms;
+		if (stalled >= 5000 && !dumped) {
+			std::printf("=== WATCHDOG: presented frame %d stalled %llums, gpu_labels_pending=%llu ===\n",
+			            frame, static_cast<unsigned long long>(stalled),
+			            static_cast<unsigned long long>(Libs::Graphics::LabelPendingCount()));
+			Kyty::WaitWatch::Dump("stall#1");
+			Libs::Graphics::GraphicsRunDumpGpuWait();
+			Common::Thread::Sleep(2000);
+			std::printf("=== WATCHDOG: gpu_labels_pending=%llu (2s later) ===\n",
+			            static_cast<unsigned long long>(Libs::Graphics::LabelPendingCount()));
+			Kyty::WaitWatch::Dump("stall#2");
+			Libs::Graphics::GraphicsRunDumpGpuWait();
+			dumped = true;
+		}
+	}
+}
+
 static void Execute() {
+	Common::Thread watchdog(WatchdogRun, nullptr);
+	watchdog.Detach();
+
 	int thread_model = 1;
 
 	if (thread_model == 0) {
