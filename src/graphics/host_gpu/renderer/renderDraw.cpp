@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/waitWatch.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -697,9 +698,13 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoVS");
 	}
-	if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
-	                         state.vs_shader)) {
-		EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+	{
+		Kyty::WaitWatch::Scope w("shader_vs", vertex_shader_info.es_regs.data_addr, // KYTY_DIAG
+		                         vertex_shader_info.hs_regs.data_addr);
+		if (!ShaderCompileInfoVS(vertex_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
+		                         state.vs_shader)) {
+			EXIT("ShaderCompileInfoVS failed for draw %s\n", draw.name);
+		}
 	}
 
 	if (!state.ps_active) {
@@ -708,9 +713,12 @@ static void RefreshShaders(RenderCommandBuffer& buffer, const DrawCallInfo& draw
 	if (log_phases) {
 		LogDrawPhase(draw.name, "ShaderCompileInfoPS");
 	}
-	if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
-	                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
-		EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
+	{
+		Kyty::WaitWatch::Scope w("shader_ps", pixel_shader_info.ps_regs.data_addr, 0); // KYTY_DIAG
+		if (!ShaderCompileInfoPS(pixel_shader_info, shader_regs, lane_mask_mode, state.vs_input_info,
+		                         target_export_mapping, state.ps_input_info, state.ps_shader)) {
+			EXIT("ShaderCompileInfoPS failed for draw %s\n", draw.name);
+		}
 	}
 }
 
@@ -964,7 +972,15 @@ void RenderDrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t i
 	                    index_count, flags, type, instance_count,
 	                    reinterpret_cast<uint64_t>(index_addr));
 
-	Common::LockGuard lock(GetRenderContext().GetMutex());
+	auto& ctx_mutex = GetRenderContext().GetMutex(); // KYTY_DIAG scoped lock to localize draw stalls
+	{
+		Kyty::WaitWatch::Scope w("render_ctx_lock", submit_id, 0);
+		ctx_mutex.Lock();
+	}
+	struct CtxUnlock {
+		Common::Mutex& m;
+		~CtxUnlock() { m.Unlock(); }
+	} ctx_unlock {ctx_mutex};
 
 	if (index_count == 0) {
 		return;
@@ -1063,12 +1079,20 @@ void RenderDrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer, uint32_t i
 	index_source.type = index_type;
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false, true,
-	                            state)) {
+	bool            prepared = false;
+	{
+		Kyty::WaitWatch::Scope w("draw_prepare", submit_id, 0); // KYTY_DIAG
+		prepared = PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, false,
+		                                  true, state);
+	}
+	if (!prepared) {
 		return;
 	}
 
-	RefreshShaders(buffer, draw, true, state);
+	{
+		Kyty::WaitWatch::Scope w("draw_shaders", submit_id, 0); // KYTY_DIAG
+		RefreshShaders(buffer, draw, true, state);
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 

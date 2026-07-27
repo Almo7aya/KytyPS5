@@ -383,6 +383,17 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 		}
 
 		program.instructions.push_back(inst);
+		// A decoder that reports success but a zero word_count would leave word_index unchanged and
+		// spin this loop forever (observed hanging the GTA III level-load pixel-shader compile). Treat
+		// it as a decode error and surface the offending instruction so the specific decoder can be
+		// fixed, rather than deadlocking the GPU worker.
+		if (inst.word_count == 0) {
+			if (error != nullptr) {
+				*error = fmt::format("zero-length instruction at pc 0x{:08x}, raw=0x{:08x}, opcode={}",
+				                     pc, word, static_cast<uint32_t>(inst.opcode));
+			}
+			return false;
+		}
 		word_index += inst.word_count;
 
 		if (IsControlFlowBranch(inst.opcode)) {

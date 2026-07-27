@@ -245,7 +245,10 @@ void CommandProcessor::FinishReadbackTransaction() {
 	if (m_readback_finished) {
 		return;
 	}
-	GetScheduler().FinishCurrent();
+	{
+		Kyty::WaitWatch::Scope w("gpu_readback", 0, 0); // KYTY_DIAG
+		GetScheduler().FinishCurrent();
+	}
 	m_readback_finished = true;
 }
 
@@ -901,6 +904,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
+		// KYTY_DIAG: record the opcode currently being handled so a stall dump shows which PM4 packet
+		// the worker is stuck in (arg0 of the gpu_pm4 scope).
+		Kyty::WaitWatch::Self().arg0.store(opcode, std::memory_order_relaxed);
 		const auto packet_dw =
 		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
