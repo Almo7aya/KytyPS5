@@ -88,14 +88,14 @@ public:
 
 private:
 	struct CachedBuffer;
-	struct ReadbackWorker;
+	struct Readback;
 
 	GraphicContext&               m_graphics;
 	Common::Mutex                 m_mutex;
 	std::shared_ptr<VulkanBuffer> m_null_buffer;
 	// TODO: add LRU cache
 	std::map<uint64_t, std::unique_ptr<CachedBuffer>> m_buffers;
-	std::unique_ptr<ReadbackWorker>                   m_readback;
+	std::unique_ptr<Readback>                         m_readback;
 	RangeSet                                          m_gpu_modified_ranges;
 	MemoryTracker                                     m_memory_tracker;
 	PageManager&                                      m_page_manager;

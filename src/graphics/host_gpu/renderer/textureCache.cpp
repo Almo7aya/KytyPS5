@@ -349,17 +349,7 @@ TextureCache::FindImagesInRegionLocked(uint64_t vaddr, uint64_t size, bool page_
 	                    : m_image_owner_index.Query(vaddr, size);
 }
 
-struct TextureCache::ReadbackWorker {
-	enum class State : uint32_t {
-		Idle,
-		Claimed,
-		Requested,
-		Ready,
-		Installed,
-		Completed,
-		Stopping,
-		Stopped
-	};
+struct TextureCache::ImageReadback {
 	struct ReadbackRange {
 		uint64_t address;
 		uint64_t size;
@@ -378,24 +368,17 @@ struct TextureCache::ReadbackWorker {
 			return {ranges.data(), count};
 		}
 	};
-	static_assert(std::atomic<State>::is_always_lock_free);
 
-	explicit ReadbackWorker(TextureCache& owner): cache(owner), thread([this] { Run(); }) {}
+	enum class Phase : uint32_t { None, Ready, Installed };
 
-	~ReadbackWorker() {
-		auto expected = State::Idle;
-		if (!state.compare_exchange_strong(expected, State::Stopping, std::memory_order_acq_rel)) {
-			EXIT("TextureCache: cannot stop readback worker from state %u\n",
-			     static_cast<uint32_t>(expected));
-		}
-		state.notify_all();
-		thread.join();
-		if (state.load(std::memory_order_acquire) != State::Stopped) {
-			EXIT("TextureCache: readback worker did not reach stopped state\n");
-		}
-	}
+	explicit ImageReadback(TextureCache& owner): cache(owner) {}
 
-	void Request(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
+	// Synchronous readback. Page-fault handling is serialized by the resource mutex
+	// (GpuResourceManager::HandleFault), so the download runs on the faulting thread itself:
+	// no worker thread and no cross-thread waits. While any lock is held this thread waits
+	// only on its own GPU fence, which retires independently of other threads.
+
+	void Begin(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
 		const bool command_thread            = GraphicsRunIsCommandProcessorThread();
 		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld() || command_thread;
 		const bool unsafe_gpu_lock = GraphicsRunGpuLockHeld() && !submissions_prepaused_now;
@@ -408,84 +391,126 @@ struct TextureCache::ReadbackWorker {
 			     GraphicsRunSubmissionLockHeld(), GraphicsRunGpuLockHeld(), LabelInCallback(),
 			     g_texture_cache_lock_owner, g_texture_fault_owner);
 		}
-		State expected = State::Idle;
-		while (!state.compare_exchange_weak(expected, State::Claimed, std::memory_order_acq_rel)) {
-			if (expected == State::Stopping || expected == State::Stopped) {
-				EXIT("TextureCache: image readback requested while worker is stopping, state=%u\n",
-				     static_cast<uint32_t>(expected));
-			}
-			state.wait(expected, std::memory_order_acquire);
-			expected = State::Idle;
+		if (phase != Phase::None) {
+			EXIT("TextureCache: reentrant image readback request, vaddr=0x%016" PRIx64 "\n", vaddr);
 		}
-		access                = fault_access;
-		vaddr                 = fault_vaddr;
-		size                  = fault_size;
-		submissions_prepaused = submissions_prepaused_now;
-		command_request       = command_thread;
-		state.store(State::Requested, std::memory_order_release);
-		state.notify_all();
-		while (true) {
-			const auto current = state.load(std::memory_order_acquire);
-			if (current == State::Ready) {
-				return;
-			}
-			if (current != State::Requested) {
-				EXIT("TextureCache: invalid state while waiting for image readback, state=%u\n",
-				     static_cast<uint32_t>(current));
-			}
-			state.wait(current, std::memory_order_acquire);
+		access = fault_access;
+		vaddr  = fault_vaddr;
+		size   = fault_size;
+
+		// This runs on the faulting thread inside fault resolution; permit the download's GPU
+		// watcher removal (see PageManager::FaultReadbackScope).
+		PageManager::FaultReadbackScope readback_scope;
+		std::optional<GraphicsRunSubmissionLock> submissions;
+		if (!submissions_prepaused_now) {
+			submissions.emplace();
 		}
+		Kyty::WaitWatch::Scope rb_scope("rb_download", vaddr, size); // KYTY_DIAG
+		lock_held            = std::make_unique<FaultSafeTextureLock>(&cache, cache.m_lock);
+		CachedImage* selected = cache.FindGpuReadbackPageCandidateLocked(vaddr, size);
+		const bool   render_target =
+		    selected != nullptr && selected->kind == CachedImage::Kind::RenderTarget;
+		const bool storage_texture =
+		    selected != nullptr && selected->kind == CachedImage::Kind::StorageTexture;
+		const bool depth_target =
+		    selected != nullptr && selected->kind == CachedImage::Kind::DepthTarget;
+		if ((!render_target && !storage_texture && !depth_target) || !selected->gpu_modified ||
+		    selected->buffer_modified || selected->image == nullptr) {
+			EXIT("TextureCache: unsupported GPU image readback owner, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " access=%u image=%p kind=%u gpu_modified=%d "
+			     "buffer_modified=%d vulkan_image=%p\n",
+			     vaddr, size, static_cast<uint32_t>(access), static_cast<const void*>(selected),
+			     selected != nullptr ? static_cast<uint32_t>(selected->kind) : UINT32_MAX,
+			     selected != nullptr && selected->gpu_modified,
+			     selected != nullptr && selected->buffer_modified,
+			     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
+		}
+
+		transfer = depth_target ? DownloadDepthTarget(*selected)
+		                        : DownloadColorImage(*selected, false);
+
+		if (!cache.m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+			EXIT("TextureCache: readback fault page is not GPU-modified, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     vaddr, size);
+		}
+		const auto fault_page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		const auto page_end   = fault_page + TRACKER_PAGE_SIZE;
+		for (const auto& range: transfer.Ranges()) {
+			const auto range_end = range.address + range.size;
+			if (fault_page < range_end && page_end > range.address) {
+				if (fault_page > range.address) {
+					cache.m_memory_tracker.ForEachDownloadRange<true>(
+					    range.address, fault_page - range.address,
+					    [](uint64_t, uint64_t) noexcept {});
+				}
+				if (page_end < range_end) {
+					cache.m_memory_tracker.ForEachDownloadRange<true>(
+					    page_end, range_end - page_end, [](uint64_t, uint64_t) noexcept {});
+				}
+			} else {
+				cache.m_memory_tracker.ForEachDownloadRange<true>(
+				    range.address, range.size, [](uint64_t, uint64_t) noexcept {});
+			}
+		}
+		this->selected = selected;
+		phase          = Phase::Ready;
 	}
 
 	[[nodiscard]] bool Complete(PageFaultAccess fault_access, uint64_t fault_vaddr,
 	                            uint64_t fault_size) noexcept {
-		const auto current = state.load(std::memory_order_acquire);
-		if (current == State::Idle || current == State::Stopping || current == State::Stopped) {
+		if (phase == Phase::None) {
 			return false;
 		}
-		if (current != State::Ready) {
+		if (phase != Phase::Ready) {
 			EXIT("TextureCache: active image readback has invalid completion state %u\n",
-			     static_cast<uint32_t>(current));
+			     static_cast<uint32_t>(phase));
 		}
 		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
 			EXIT("TextureCache: mismatched active image readback completion\n");
 		}
-		state.store(State::Installed, std::memory_order_release);
-		state.notify_all();
+		phase = Phase::Installed;
 		return true;
 	}
 
 	[[nodiscard]] bool IsReady(PageFaultAccess fault_access, uint64_t fault_vaddr,
 	                           uint64_t fault_size) const noexcept {
-		return state.load(std::memory_order_acquire) == State::Ready && access == fault_access &&
-		       vaddr == fault_vaddr && size == fault_size;
+		return phase == Phase::Ready && access == fault_access && vaddr == fault_vaddr &&
+		       size == fault_size;
 	}
 
 	void Release(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
-		const auto current = state.load(std::memory_order_acquire);
-		if (current == State::Idle || current == State::Stopping || current == State::Stopped) {
+		if (phase == Phase::None) {
 			return;
 		}
-		if (current != State::Installed) {
+		if (phase != Phase::Installed) {
 			EXIT("TextureCache: active image readback has invalid release state %u\n",
-			     static_cast<uint32_t>(current));
+			     static_cast<uint32_t>(phase));
 		}
 		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
 			EXIT("TextureCache: mismatched active image readback release\n");
 		}
-		state.store(State::Completed, std::memory_order_release);
-		state.notify_all();
-		while (true) {
-			const auto current = state.load(std::memory_order_acquire);
-			if (current == State::Idle) {
-				break;
+		// Still inside fault resolution on the faulting thread; the release-phase publication may
+		// touch GPU watchers (see PageManager::FaultReadbackScope).
+		PageManager::FaultReadbackScope readback_scope;
+		for (const auto& range: transfer.Ranges()) {
+			if (cache.m_memory_tracker.IsRegionGpuModified(range.address, range.size)) {
+				EXIT("TextureCache: completed image readback retained GPU ownership, "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     range.address, range.size);
 			}
-			if (current != State::Completed) {
-				EXIT("TextureCache: invalid state while releasing image readback, state=%u\n",
-				     static_cast<uint32_t>(current));
+			if (cache.m_buffer_cache.HasPageOverlap(range.address, range.size)) {
+				// BufferCache completes the same write fault before TextureCache's release
+				// phase, so the faulting page may already be CPU-dirty even though the guest
+				// instruction has not executed yet. Preserve that state while publishing the
+				// complete image contents downloaded immediately before fault completion.
+				cache.m_buffer_cache.PublishImageBacking(range.address, range.size, true);
 			}
-			state.wait(current, std::memory_order_acquire);
 		}
+		selected->gpu_modified = false;
+		selected               = nullptr;
+		phase                  = Phase::None;
+		lock_held.reset();
 	}
 
 	[[nodiscard]] ReadbackTransfer DownloadDepthTarget(CachedImage& cached,
@@ -813,127 +838,17 @@ struct TextureCache::ReadbackWorker {
 		return transfer;
 	}
 
-	void Run() noexcept {
-		Kyty::WaitWatch::SetThreadName("TextureReadback", -4,
-		                               Kyty::WaitWatch::CurrentHostTid()); // KYTY_DIAG
-		while (true) {
-			auto current = state.load(std::memory_order_acquire);
-			while (current == State::Idle) {
-				state.wait(current, std::memory_order_acquire);
-				current = state.load(std::memory_order_acquire);
-			}
-			if (current == State::Stopping) {
-				state.store(State::Stopped, std::memory_order_release);
-				state.notify_all();
-				return;
-			}
-			if (current != State::Requested) {
-				EXIT("TextureCache: readback worker received unsupported state %u\n",
-				     static_cast<uint32_t>(current));
-			}
 
-			// The request came from the command-processor (GPU worker) thread while it is blocked in a
-			// page fault: it holds no submission lock and can never park, but it is also not submitting
-			// GPU work. Adopt an already-paused state so nested submission locks (e.g. inside
-			// BufferCache::UnmapMemory via WriteBacking->TryTransferBacking) become no-ops instead of
-			// trying to (re-)pause the stuck worker -- that self-wait was the readback deadlock.
-			std::optional<GraphicsRunSubmissionLock>        submissions;
-			std::optional<GraphicsRunAdoptedSubmissionPause> adopted;
-			if (command_request) {
-				adopted.emplace();
-			} else if (!submissions_prepaused) {
-				submissions.emplace();
-			}
-			Kyty::WaitWatch::Scope rb_scope("rb_download", vaddr, size); // KYTY_DIAG
-			FaultSafeTextureLock lock(&cache, cache.m_lock);
-			CachedImage*         selected = cache.FindGpuReadbackPageCandidateLocked(vaddr, size);
-			const bool           render_target =
-			    selected != nullptr && selected->kind == CachedImage::Kind::RenderTarget;
-			const bool storage_texture =
-			    selected != nullptr && selected->kind == CachedImage::Kind::StorageTexture;
-			const bool depth_target =
-			    selected != nullptr && selected->kind == CachedImage::Kind::DepthTarget;
-			if ((!render_target && !storage_texture && !depth_target) || !selected->gpu_modified ||
-			    selected->buffer_modified || selected->image == nullptr) {
-				EXIT("TextureCache: unsupported GPU image readback owner, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 " access=%u image=%p kind=%u gpu_modified=%d "
-				     "buffer_modified=%d vulkan_image=%p\n",
-				     vaddr, size, static_cast<uint32_t>(access), static_cast<const void*>(selected),
-				     selected != nullptr ? static_cast<uint32_t>(selected->kind) : UINT32_MAX,
-				     selected != nullptr && selected->gpu_modified,
-				     selected != nullptr && selected->buffer_modified,
-				     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
-			}
-
-			const auto transfer = depth_target ? DownloadDepthTarget(*selected)
-			                                   : DownloadColorImage(*selected, false);
-
-			if (!cache.m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
-				EXIT("TextureCache: readback fault page is not GPU-modified, addr=0x%016" PRIx64
-				     " size=0x%016" PRIx64 "\n",
-				     vaddr, size);
-			}
-			const auto fault_page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-			const auto page_end   = fault_page + TRACKER_PAGE_SIZE;
-			for (const auto& range: transfer.Ranges()) {
-				const auto range_end = range.address + range.size;
-				if (fault_page < range_end && page_end > range.address) {
-					if (fault_page > range.address) {
-						cache.m_memory_tracker.ForEachDownloadRange<true>(
-						    range.address, fault_page - range.address,
-						    [](uint64_t, uint64_t) noexcept {});
-					}
-					if (page_end < range_end) {
-						cache.m_memory_tracker.ForEachDownloadRange<true>(
-						    page_end, range_end - page_end, [](uint64_t, uint64_t) noexcept {});
-					}
-				} else {
-					cache.m_memory_tracker.ForEachDownloadRange<true>(
-					    range.address, range.size, [](uint64_t, uint64_t) noexcept {});
-				}
-			}
-
-			state.store(State::Ready, std::memory_order_release);
-			state.notify_all();
-			while ((current = state.load(std::memory_order_acquire)) != State::Completed) {
-				if (current != State::Ready && current != State::Installed) {
-					EXIT("TextureCache: invalid image readback completion state %u\n",
-					     static_cast<uint32_t>(current));
-				}
-				state.wait(current, std::memory_order_acquire);
-			}
-			for (const auto& range: transfer.Ranges()) {
-				if (cache.m_memory_tracker.IsRegionGpuModified(range.address, range.size)) {
-					EXIT("TextureCache: completed image readback retained GPU ownership, "
-					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-					     range.address, range.size);
-				}
-				if (cache.m_buffer_cache.HasPageOverlap(range.address, range.size)) {
-					// BufferCache completes the same write fault before TextureCache's release
-					// phase, so the faulting page may already be CPU-dirty even though the guest
-					// instruction has not executed yet. Preserve that state while publishing the
-					// complete image contents downloaded immediately before fault completion.
-					cache.m_buffer_cache.PublishImageBacking(range.address, range.size, true);
-				}
-			}
-			selected->gpu_modified = false;
-			submissions_prepaused  = false;
-			command_request        = false;
-			state.store(State::Idle, std::memory_order_release);
-			state.notify_all();
-		}
-	}
-
-	TextureCache&        cache;
-	std::atomic<State>   state {State::Idle};
-	PageFaultAccess      access                = PageFaultAccess::Unknown;
-	uint64_t             vaddr                 = 0;
-	uint64_t             size                  = 0;
-	bool                 submissions_prepaused = false;
-	bool                 command_request       = false;
-	std::vector<uint8_t> download;
-	std::vector<uint8_t> guest;
-	std::thread          thread;
+	TextureCache&                         cache;
+	std::unique_ptr<FaultSafeTextureLock> lock_held;
+	CachedImage*                          selected = nullptr;
+	ReadbackTransfer                      transfer {};
+	PageFaultAccess                       access   = PageFaultAccess::Unknown;
+	uint64_t                              vaddr    = 0;
+	uint64_t                              size     = 0;
+	Phase                                 phase    = Phase::None;
+	std::vector<uint8_t>                  download;
+	std::vector<uint8_t>                  guest;
 };
 
 void TextureCache::RequireRetirementIsolation(const std::vector<CachedImage*>& retire,
@@ -1215,7 +1130,7 @@ TextureCache::TextureCache(GraphicContext& graphics, PageManager& page_manager,
 		EXIT("TextureCache: construction is restricted to the main thread\n");
 	}
 	m_dummy_textures = std::make_unique<DummyTextureCache>();
-	m_readback       = std::make_unique<ReadbackWorker>(*this);
+	m_readback       = std::make_unique<ImageReadback>(*this);
 }
 
 TextureCache::CachedImage* TextureCache::FindGpuReadbackPageCandidateLocked(uint64_t vaddr,
@@ -4346,7 +4261,7 @@ bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint
 			if (GraphicsRunIsCommandProcessorThread()) {
 				GraphicsRunFinishScheduler();
 			}
-			m_readback->Request(access, vaddr, size);
+			m_readback->Begin(access, vaddr, size);
 			action = m_memory_tracker.BeginCpuFault(vaddr, size, access);
 			if (action != CpuFaultAction::Download) {
 				EXIT("TextureCache: downloaded image did not retain the active fault page "

@@ -114,19 +114,35 @@ class FaultSafeCacheLock final {
 public:
 	FaultSafeCacheLock(const void* owner, Common::Mutex& mutex): m_mutex(mutex) {
 		if (g_cache_lock_owner != nullptr) {
-			EXIT("BufferCache: recursive cache lock acquisition, current=%p\n",
-			     static_cast<const void*>(g_cache_lock_owner));
+			// The only legitimate re-entry is an inline fault-triggered readback. The faulting
+			// thread already holds this mutex from an outer cache operation (e.g.
+			// ObtainBufferForImage / ObtainBuffer) that faulted on a GPU-owned page it was about to
+			// read and that it will resume once the fault is resolved. The readback runs on that
+			// same thread against a structurally stable cache (the outer op is suspended
+			// mid-instruction, not mid-mutation of m_buffers), and the ownership transfer it
+			// performs is exactly what the outer op needs before it continues -- so proceed on the
+			// already-held lock instead of dead-locking on it. Any other re-entry is a real bug.
+			if (!PageManager::InFaultReadback()) {
+				EXIT("BufferCache: recursive cache lock acquisition, current=%p\n",
+				     static_cast<const void*>(g_cache_lock_owner));
+			}
+			m_reentrant = true;
+			return;
 		}
 		g_cache_lock_owner = owner;
 		m_mutex.Lock();
 	}
 	~FaultSafeCacheLock() {
+		if (m_reentrant) {
+			return;
+		}
 		m_mutex.Unlock();
 		g_cache_lock_owner = nullptr;
 	}
 
 private:
 	Common::Mutex& m_mutex;
+	bool           m_reentrant = false;
 };
 
 uint64_t AlignDown(uint64_t value) {
@@ -173,21 +189,8 @@ struct BufferCache::CachedBuffer {
 	std::shared_ptr<VulkanBuffer> buffer;
 };
 
-struct BufferCache::ReadbackWorker {
+struct BufferCache::Readback {
 	static constexpr uint32_t MAX_RANGES = READBACK_MAX_RANGES;
-	enum class State : uint32_t {
-		Uninitialized,
-		InitRequested,
-		Idle,
-		Claimed,
-		Requested,
-		Ready,
-		Installed,
-		Completed,
-		Stopping,
-		Stopped
-	};
-	static_assert(std::atomic<State>::is_always_lock_free);
 
 	struct Range {
 		uint64_t address = 0;
@@ -195,222 +198,80 @@ struct BufferCache::ReadbackWorker {
 		uint32_t offset  = 0;
 	};
 
-	explicit ReadbackWorker(BufferCache& owner): cache(owner), thread([this] { Run(); }) {}
+	enum class Phase : uint32_t { None, Ready, Installed };
 
-	~ReadbackWorker() {
-		auto expected = State::Idle;
-		if (!state.compare_exchange_strong(expected, State::Stopping, std::memory_order_acq_rel)) {
-			expected = State::Uninitialized;
-			if (!state.compare_exchange_strong(expected, State::Stopping,
-			                                   std::memory_order_acq_rel)) {
-				EXIT("BufferCache: cannot stop readback worker from state %u\n",
-				     static_cast<uint32_t>(expected));
-			}
-		}
-		state.notify_all();
-		thread.join();
-		if (state.load(std::memory_order_acquire) != State::Stopped) {
-			EXIT("BufferCache: readback worker did not reach stopped state\n");
-		}
-	}
+	explicit Readback(BufferCache& owner): cache(owner) {}
 
-	void Prepare() {
-		auto current = state.load(std::memory_order_acquire);
-		while (current == State::InitRequested ||
-		       (current == State::Claimed &&
-		        (command == nullptr || mapped == nullptr || readback.buffer == nullptr))) {
-			state.wait(current, std::memory_order_acquire);
-			current = state.load(std::memory_order_acquire);
-		}
-		if (current != State::Uninitialized) {
-			if (current == State::Stopping || current == State::Stopped) {
-				EXIT("BufferCache: cannot prepare a stopping readback worker, state=%u\n",
-				     static_cast<uint32_t>(current));
-			}
-			if (command == nullptr || mapped == nullptr || readback.buffer == nullptr) {
-				EXIT("BufferCache: initialized readback worker has invalid resources, state=%u "
-				     "command=%p mapped=%p buffer=%p\n",
-				     static_cast<uint32_t>(current), static_cast<const void*>(command.get()),
-				     static_cast<const void*>(mapped), static_cast<const void*>(readback.buffer));
-			}
+	~Readback() { ReleaseResources(); }
+
+	// Synchronous readback. Page-fault handling is serialized by the resource mutex
+	// (GpuResourceManager::HandleFault), so the download runs on the faulting thread itself:
+	// no worker thread and no cross-thread waits. While any lock is held this thread waits
+	// only on its own GPU fence, which retires independently of other threads.
+
+	void EnsureResources() {
+		if (command != nullptr) {
 			return;
 		}
-		auto expected = State::Uninitialized;
-		if (!state.compare_exchange_strong(expected, State::Claimed, std::memory_order_acq_rel)) {
-			EXIT("BufferCache: readback prepare requires uninitialized state, state=%u\n",
-			     static_cast<uint32_t>(expected));
+		readback.usage           = vk::BufferUsageFlagBits::eTransferDst;
+		readback.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
+		                           vk::MemoryPropertyFlagBits::eHostCoherent |
+		                           vk::MemoryPropertyFlagBits::eHostCached;
+		cache.m_graphics.CreateBuffer(READBACK_CAPACITY, readback);
+		cache.m_graphics.MapMemory(readback.memory, mapped);
+		command = std::make_unique<CommandBuffer>();
+	}
+
+	void ReleaseResources() {
+		command.reset();
+		if (mapped != nullptr) {
+			cache.m_graphics.UnmapMemory(readback.memory);
+			mapped = nullptr;
 		}
-		state.store(State::InitRequested, std::memory_order_release);
-		state.notify_all();
-		while ((current = state.load(std::memory_order_acquire)) != State::Idle) {
-			if (current != State::InitRequested) {
-				EXIT("BufferCache: invalid readback initialization state %u\n",
-				     static_cast<uint32_t>(current));
-			}
-			state.wait(current, std::memory_order_acquire);
-		}
-		if (command == nullptr || mapped == nullptr || readback.buffer == nullptr) {
-			EXIT("BufferCache: readback initialization produced invalid resources, command=%p "
-			     "mapped=%p buffer=%p\n",
-			     static_cast<const void*>(command.get()), static_cast<const void*>(mapped),
-			     static_cast<const void*>(readback.buffer));
+		if (readback.buffer != nullptr) {
+			cache.m_graphics.DeleteBuffer(readback);
 		}
 	}
 
-	void Request(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
+	void Begin(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
 		const bool command_thread            = GraphicsRunIsCommandProcessorThread();
 		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld() || command_thread;
 		const bool unsafe_gpu_lock = GraphicsRunGpuLockHeld() && !submissions_prepaused_now;
-		if (unsafe_gpu_lock || LabelInCallback() || g_cache_lock_owner != nullptr ||
-		    command == nullptr || mapped == nullptr || readback.buffer == nullptr) {
-			EXIT("BufferCache: unsafe readback request context, command_thread=%d "
+		// g_cache_lock_owner may be set: the faulting thread can already hold m_mutex from an outer
+		// cache operation it will resume after the fault (see FaultSafeCacheLock reentrancy). That
+		// is the legitimate inline-readback case, not the old readback-worker deadlock, so it is no
+		// longer rejected here.
+		if (unsafe_gpu_lock || LabelInCallback()) {
+			EXIT("BufferCache: unsafe readback context, command_thread=%d "
 			     "submission_lock=%d "
-			     "gpu_lock=%d label_callback=%d cache_lock=%p command=%p mapped=%p "
-			     "buffer=%p\n",
+			     "gpu_lock=%d label_callback=%d cache_lock=%p\n",
 			     command_thread, GraphicsRunSubmissionLockHeld(), GraphicsRunGpuLockHeld(),
-			     LabelInCallback(), static_cast<const void*>(g_cache_lock_owner),
-			     static_cast<const void*>(command.get()), static_cast<const void*>(mapped),
-			     static_cast<const void*>(readback.buffer));
+			     LabelInCallback(), static_cast<const void*>(g_cache_lock_owner));
 		}
-		State expected = State::Idle;
-		while (!state.compare_exchange_weak(expected, State::Claimed, std::memory_order_acq_rel)) {
-			if (expected == State::Stopping || expected == State::Stopped) {
-				EXIT("BufferCache: readback requested while worker is stopping, state=%u\n",
-				     static_cast<uint32_t>(expected));
-			}
-			state.wait(expected, std::memory_order_acquire);
-			expected = State::Idle;
+		if (phase != Phase::None) {
+			EXIT("BufferCache: reentrant readback request, vaddr=0x%016" PRIx64 "\n", vaddr);
 		}
-		access                = fault_access;
-		vaddr                 = fault_vaddr;
-		size                  = fault_size;
-		range_count           = 0;
-		submissions_prepaused = submissions_prepaused_now;
-		state.store(State::Requested, std::memory_order_release);
-		state.notify_all();
-		while (true) {
-			const auto current = state.load(std::memory_order_acquire);
-			if (current == State::Ready) {
-				break;
-			}
-			if (current != State::Requested) {
-				EXIT("BufferCache: invalid state while waiting for readback, state=%u\n",
-				     static_cast<uint32_t>(current));
-			}
-			state.wait(current, std::memory_order_acquire);
-		}
-	}
+		EnsureResources();
+		access      = fault_access;
+		vaddr       = fault_vaddr;
+		size        = fault_size;
+		range_count = 0;
 
-	[[nodiscard]] bool Complete(PageFaultAccess fault_access, uint64_t fault_vaddr,
-	                            uint64_t fault_size) noexcept {
-		const auto current = state.load(std::memory_order_acquire);
-		if (current == State::Uninitialized || current == State::InitRequested ||
-		    current == State::Idle || current == State::Stopping || current == State::Stopped) {
-			return false;
+		// Runs inline on the faulting thread during fault resolution; mark the readback so the
+		// cache lock tolerates re-entry when the faulting thread already holds it from an outer
+		// cache operation (see FaultSafeCacheLock / PageManager::FaultReadbackScope).
+		PageManager::FaultReadbackScope readback_scope;
+		std::optional<GraphicsRunSubmissionLock> submissions;
+		if (!submissions_prepaused_now) {
+			submissions.emplace();
 		}
-		if (current != State::Ready) {
-			EXIT("BufferCache: active readback has invalid completion state %u\n",
-			     static_cast<uint32_t>(current));
-		}
-		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
-			EXIT("BufferCache: mismatched active readback completion\n");
-		}
-		if (range_count == 0 || range_count > MAX_RANGES) {
-			EXIT("BufferCache: invalid completed readback range count %u\n", range_count);
-		}
-		for (uint32_t i = 0; i < range_count; i++) {
-			const auto& range = ranges[i];
-			Libs::LibKernel::Memory::WriteBacking(range.address, data.data() + range.offset,
-			                                      range.size);
-		}
-		if (!cache.m_memory_tracker.CompleteCpuFault(vaddr, size, access, true)) {
-			EXIT("BufferCache: failed to complete downloaded CPU fault, addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 " access=%u\n",
-			     vaddr, size, static_cast<uint32_t>(access));
-		}
-		state.store(State::Installed, std::memory_order_release);
-		state.notify_all();
-		return true;
-	}
-
-	void Release(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
-		const auto current = state.load(std::memory_order_acquire);
-		if (current == State::Uninitialized || current == State::InitRequested ||
-		    current == State::Idle || current == State::Stopping || current == State::Stopped) {
-			return;
-		}
-		if (current != State::Installed) {
-			EXIT("BufferCache: active readback has invalid release state %u\n",
-			     static_cast<uint32_t>(current));
-		}
-		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
-			EXIT("BufferCache: mismatched active readback release\n");
-		}
-		state.store(State::Completed, std::memory_order_release);
-		state.notify_all();
-		while (true) {
-			const auto current = state.load(std::memory_order_acquire);
-			if (current == State::Idle) {
-				break;
-			}
-			if (current != State::Completed) {
-				EXIT("BufferCache: invalid state while releasing readback, state=%u\n",
-				     static_cast<uint32_t>(current));
-			}
-			state.wait(current, std::memory_order_acquire);
-		}
-	}
-
-	void Run() noexcept {
-		while (true) {
-			auto current = state.load(std::memory_order_acquire);
-			while (current == State::Uninitialized || current == State::Idle) {
-				state.wait(current, std::memory_order_acquire);
-				current = state.load(std::memory_order_acquire);
-			}
-			if (current == State::Stopping) {
-				command.reset();
-				if (mapped != nullptr) {
-					cache.m_graphics.UnmapMemory(readback.memory);
-					mapped = nullptr;
-				}
-				if (readback.buffer != nullptr) {
-					cache.m_graphics.DeleteBuffer(readback);
-				}
-				state.store(State::Stopped, std::memory_order_release);
-				state.notify_all();
-				return;
-			}
-			if (current == State::InitRequested) {
-				if (command != nullptr || mapped != nullptr || readback.buffer != nullptr) {
-					EXIT("BufferCache: invalid resources before readback initialization, "
-					     "command=%p mapped=%p buffer=%p\n",
-					     static_cast<const void*>(command.get()), static_cast<const void*>(mapped),
-					     static_cast<const void*>(readback.buffer));
-				}
-				readback.usage           = vk::BufferUsageFlagBits::eTransferDst;
-				readback.memory.property = vk::MemoryPropertyFlagBits::eHostVisible |
-				                           vk::MemoryPropertyFlagBits::eHostCoherent |
-				                           vk::MemoryPropertyFlagBits::eHostCached;
-				cache.m_graphics.CreateBuffer(READBACK_CAPACITY, readback);
-				cache.m_graphics.MapMemory(readback.memory, mapped);
-				command = std::make_unique<CommandBuffer>();
-				state.store(State::Idle, std::memory_order_release);
-				state.notify_all();
-				continue;
-			}
-			if (current != State::Requested) {
-				EXIT("BufferCache: worker received unsupported state %u\n",
-				     static_cast<uint32_t>(current));
-			}
-
-			std::optional<GraphicsRunSubmissionLock> submissions;
-			if (!submissions_prepaused) {
-				submissions.emplace();
-			}
-			const auto         page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-			FaultSafeCacheLock lock(&cache, cache.m_mutex);
-			auto               it = cache.m_buffers.upper_bound(vaddr);
+		const auto                              page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		uint32_t                                data_offset = 0;
+		std::array<vk::BufferCopy, MAX_RANGES>          copies {};
+		std::array<vk::BufferMemoryBarrier, MAX_RANGES> barriers {};
+		{
+			FaultSafeCacheLock     lock(&cache, cache.m_mutex);
+			auto                   it = cache.m_buffers.upper_bound(vaddr);
 			if (it == cache.m_buffers.begin()) {
 				EXIT("BufferCache: readback address has no cached buffer, addr=0x%016" PRIx64 "\n",
 				     vaddr);
@@ -423,9 +284,6 @@ struct BufferCache::ReadbackWorker {
 				     " page=0x%016" PRIx64 " buffer=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 				     vaddr, page, cached.vaddr, cached.size);
 			}
-			uint32_t                                        data_offset = 0;
-			std::array<vk::BufferCopy, MAX_RANGES>          copies {};
-			std::array<vk::BufferMemoryBarrier, MAX_RANGES> barriers {};
 			cache.m_gpu_modified_ranges.ForEachIntersection(
 			    page, TRACKER_PAGE_SIZE, [&](RangeSet::Range range) {
 				    if (range_count == MAX_RANGES || (range.address - cached.vaddr) % 4 != 0 ||
@@ -465,6 +323,8 @@ struct BufferCache::ReadbackWorker {
 				    " count=%u bytes=%u\n",
 				    page, range_count, data_offset);
 			}
+			// The copy and its fence are driven by this thread alone; the cache lock is
+			// never held across a wait on another thread's progress.
 			auto vk_buffer = command->Handle();
 			command->Begin();
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
@@ -476,35 +336,70 @@ struct BufferCache::ReadbackWorker {
 			command->Execute();
 			command->WaitForFenceAndReset();
 			std::memcpy(data.data(), mapped, data_offset);
-			state.store(State::Ready, std::memory_order_release);
-			state.notify_all();
-			while ((current = state.load(std::memory_order_acquire)) != State::Completed) {
-				if (current != State::Ready && current != State::Installed) {
-					EXIT("BufferCache: invalid readback completion state %u\n",
-					     static_cast<uint32_t>(current));
-				}
-				state.wait(current, std::memory_order_acquire);
-			}
-			cache.m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
-			submissions_prepaused = false;
-			state.store(State::Idle, std::memory_order_release);
-			state.notify_all();
 		}
+		phase = Phase::Ready;
+	}
+
+	[[nodiscard]] bool Complete(PageFaultAccess fault_access, uint64_t fault_vaddr,
+	                            uint64_t fault_size) noexcept {
+		if (phase == Phase::None) {
+			return false;
+		}
+		if (phase != Phase::Ready) {
+			EXIT("BufferCache: active readback has invalid completion state %u\n",
+			     static_cast<uint32_t>(phase));
+		}
+		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
+			EXIT("BufferCache: mismatched active readback completion\n");
+		}
+		if (range_count == 0 || range_count > MAX_RANGES) {
+			EXIT("BufferCache: invalid completed readback range count %u\n", range_count);
+		}
+		for (uint32_t i = 0; i < range_count; i++) {
+			const auto& range = ranges[i];
+			Libs::LibKernel::Memory::WriteBacking(range.address, data.data() + range.offset,
+			                                      range.size);
+		}
+		if (!cache.m_memory_tracker.CompleteCpuFault(vaddr, size, access, true)) {
+			EXIT("BufferCache: failed to complete downloaded CPU fault, addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " access=%u\n",
+			     vaddr, size, static_cast<uint32_t>(access));
+		}
+		phase = Phase::Installed;
+		return true;
+	}
+
+	void Release(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
+		if (phase == Phase::None) {
+			return;
+		}
+		if (phase != Phase::Installed) {
+			EXIT("BufferCache: active readback has invalid release state %u\n",
+			     static_cast<uint32_t>(phase));
+		}
+		if (access != fault_access || vaddr != fault_vaddr || size != fault_size) {
+			EXIT("BufferCache: mismatched active readback release\n");
+		}
+		const auto                      page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+		PageManager::FaultReadbackScope readback_scope;
+		{
+			FaultSafeCacheLock lock(&cache, cache.m_mutex);
+			cache.m_gpu_modified_ranges.Subtract(page, TRACKER_PAGE_SIZE);
+		}
+		phase = Phase::None;
 	}
 
 	BufferCache&                           cache;
-	std::atomic<State>                     state {State::Uninitialized};
-	VulkanBuffer                           readback {};
-	void*                                  mapped = nullptr;
 	std::unique_ptr<CommandBuffer>         command;
-	PageFaultAccess                        access                = PageFaultAccess::Unknown;
-	uint64_t                               vaddr                 = 0;
-	uint64_t                               size                  = 0;
-	uint32_t                               range_count           = 0;
-	bool                                   submissions_prepaused = false;
+	VulkanBuffer                           readback {};
+	void*                                  mapped      = nullptr;
+	PageFaultAccess                        access      = PageFaultAccess::Unknown;
+	uint64_t                               vaddr       = 0;
+	uint64_t                               size        = 0;
+	uint32_t                               range_count = 0;
+	Phase                                  phase       = Phase::None;
 	std::array<Range, MAX_RANGES>          ranges {};
 	std::array<uint8_t, READBACK_CAPACITY> data {};
-	std::thread                            thread;
 };
 
 BufferCache::BufferCache(GraphicContext& graphics, PageManager& page_manager,
@@ -512,7 +407,7 @@ BufferCache::BufferCache(GraphicContext& graphics, PageManager& page_manager,
     : m_graphics(graphics), m_memory_tracker(page_manager), m_page_manager(page_manager),
       m_resource_mutex(resource_mutex) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	m_readback = std::make_unique<ReadbackWorker>(*this);
+	m_readback = std::make_unique<Readback>(*this);
 }
 
 BufferCache::~BufferCache() {
@@ -564,7 +459,7 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 	}
 	{
 		Kyty::WaitWatch::Scope w("gpu_rbreq", vaddr, 0); // KYTY_DIAG
-		m_readback->Request(access, vaddr, size);
+		m_readback->Begin(access, vaddr, size);
 	}
 	return true;
 }
@@ -715,9 +610,6 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		} else {
 			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
-	}
-	if (is_written) {
-		m_readback->Prepare();
 	}
 	FaultSafeCacheLock lock(this, m_mutex);
 

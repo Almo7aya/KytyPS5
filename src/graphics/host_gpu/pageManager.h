@@ -29,6 +29,21 @@ public:
 		uint64_t     m_size  = 0;
 	};
 
+	// Permits the inline, fault-triggered readback (buffer/texture cache) to adjust GPU page
+	// watchers on the pages it downloads while the faulting thread is inside fault resolution
+	// (g_in_fault_resolution set). This is exactly the watcher bookkeeping the async readback
+	// workers used to perform off the resolution thread; running it inline is safe because the
+	// readback is the only code executing in this window. The scope is a thread-local, nestable
+	// override so that unrelated mid-resolution mutations still fail fast. Instances are cheap and
+	// need no PageManager reference.
+	class FaultReadbackScope final {
+	public:
+		FaultReadbackScope() noexcept;
+		~FaultReadbackScope();
+		KYTY_CLASS_NO_COPY(FaultReadbackScope);
+	};
+	[[nodiscard]] static bool InFaultReadback() noexcept;
+
 	PageManager(PageFaultHandler fault_handler, void* fault_context);
 	// The owner must stop all PageManager callers before destruction.
 	~PageManager();

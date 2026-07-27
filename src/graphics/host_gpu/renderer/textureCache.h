@@ -126,7 +126,7 @@ public:
 private:
 	struct CachedImage;
 	using ImageOwnerIndex = MultiRangePageOwnerIndex<CachedImage*>;
-	struct ReadbackWorker;
+	struct ImageReadback;
 	struct MetaDataInfo {
 		uint64_t size         = 0;
 		uint32_t layers       = 1;
@@ -172,7 +172,7 @@ private:
 	std::vector<std::shared_ptr<CachedImage>> m_images;
 	ImageOwnerIndex                           m_image_owner_index;
 	std::map<uint64_t, MetaDataInfo>          m_surface_metas;
-	std::unique_ptr<ReadbackWorker>           m_readback;
+	std::unique_ptr<ImageReadback>            m_readback;
 	std::vector<uint8_t>                      m_buffer_transition_guest;
 };
 

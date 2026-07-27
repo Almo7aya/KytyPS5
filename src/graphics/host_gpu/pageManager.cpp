@@ -31,7 +31,8 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 
-thread_local bool g_in_fault_resolution = false;
+thread_local bool     g_in_fault_resolution = false;
+thread_local uint32_t g_fault_readback_depth = 0;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
@@ -298,8 +299,14 @@ bool PageManager::IsTracked(uint64_t vaddr) const noexcept {
 }
 
 bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
+	// Mapping state is a pure read taken under each page's SpinGuard. HandleFault holds no page
+	// lock across its Invalidate/Complete/Release callbacks, so this is safe to answer truthfully
+	// during fault resolution. The inline image/buffer readback (which runs on the faulting thread
+	// itself) relies on that: its MemoryTracker::RequireMapped assertion must see real mapping
+	// state, not the conservative "unmapped" a resolution short-circuit would report. Mutating
+	// entry points (OnGpuMap, SetWatchers, Begin/EndBackingWrite, ...) still FailFast during
+	// resolution -- only reads are allowed here.
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
 		return false;
 	}
 	const auto end = PageStart(vaddr + size - 1) + PAGE_SIZE;
@@ -318,8 +325,8 @@ bool PageManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 }
 
 bool PageManager::HasAnyMapping(uint64_t vaddr, uint64_t size) const noexcept {
-	if (g_in_fault_resolution || vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE ||
-	    size > ADDRESS_SIZE - vaddr) {
+	// Pure read; safe during fault resolution for the same reason as IsMapped (see above).
+	if (vaddr == 0 || size == 0 || vaddr >= ADDRESS_SIZE || size > ADDRESS_SIZE - vaddr) {
 		return false;
 	}
 	const auto end = PageEnd(vaddr, size);
@@ -396,9 +403,27 @@ uint64_t PageManager::GpuAccessExtent(uint64_t vaddr, uint64_t max_size,
 	return available < max_size ? available : max_size;
 }
 
+PageManager::FaultReadbackScope::FaultReadbackScope() noexcept {
+	g_fault_readback_depth++;
+}
+
+PageManager::FaultReadbackScope::~FaultReadbackScope() {
+	if (g_fault_readback_depth == 0) {
+		FailFast("unbalanced fault-readback scope");
+	}
+	g_fault_readback_depth--;
+}
+
+bool PageManager::InFaultReadback() noexcept {
+	return g_fault_readback_depth != 0;
+}
+
 void PageManager::UpdatePageWatchers(bool track, uint64_t vaddr, uint64_t size,
                                      PageWatchMode mode) {
-	if (g_in_fault_resolution) {
+	// The inline fault readback legitimately removes GPU watches on the pages it downloads while
+	// resolving the fault on this very thread (see FaultReadbackScope). Only that scoped case is
+	// allowed to mutate watchers during resolution; anything else is a genuine race.
+	if (g_in_fault_resolution && g_fault_readback_depth == 0) {
 		FailFast("page watchers changed during fault resolution");
 	}
 	if (mode != PageWatchMode::Write && mode != PageWatchMode::ReadWrite) {

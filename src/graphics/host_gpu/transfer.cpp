@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
 #include "graphics/host_gpu/gpuTiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/imageView.h"

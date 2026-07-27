@@ -518,6 +518,7 @@ private:
 		}
 
 		std::lock_guard lock(m_mutex);
+		Kyty::WaitWatch::Scope w("dmem_lock", vaddr, size); // KYTY_DIAG
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
 		while (current < end) {
