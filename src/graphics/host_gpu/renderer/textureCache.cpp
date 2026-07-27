@@ -421,6 +421,7 @@ struct TextureCache::ReadbackWorker {
 		vaddr                 = fault_vaddr;
 		size                  = fault_size;
 		submissions_prepaused = submissions_prepaused_now;
+		command_request       = command_thread;
 		state.store(State::Requested, std::memory_order_release);
 		state.notify_all();
 		while (true) {
@@ -831,8 +832,16 @@ struct TextureCache::ReadbackWorker {
 				     static_cast<uint32_t>(current));
 			}
 
-			std::optional<GraphicsRunSubmissionLock> submissions;
-			if (!submissions_prepaused) {
+			// The request came from the command-processor (GPU worker) thread while it is blocked in a
+			// page fault: it holds no submission lock and can never park, but it is also not submitting
+			// GPU work. Adopt an already-paused state so nested submission locks (e.g. inside
+			// BufferCache::UnmapMemory via WriteBacking->TryTransferBacking) become no-ops instead of
+			// trying to (re-)pause the stuck worker -- that self-wait was the readback deadlock.
+			std::optional<GraphicsRunSubmissionLock>        submissions;
+			std::optional<GraphicsRunAdoptedSubmissionPause> adopted;
+			if (command_request) {
+				adopted.emplace();
+			} else if (!submissions_prepaused) {
 				submissions.emplace();
 			}
 			Kyty::WaitWatch::Scope rb_scope("rb_download", vaddr, size); // KYTY_DIAG
@@ -909,6 +918,7 @@ struct TextureCache::ReadbackWorker {
 			}
 			selected->gpu_modified = false;
 			submissions_prepaused  = false;
+			command_request        = false;
 			state.store(State::Idle, std::memory_order_release);
 			state.notify_all();
 		}
@@ -920,6 +930,7 @@ struct TextureCache::ReadbackWorker {
 	uint64_t             vaddr                 = 0;
 	uint64_t             size                  = 0;
 	bool                 submissions_prepaused = false;
+	bool                 command_request       = false;
 	std::vector<uint8_t> download;
 	std::vector<uint8_t> guest;
 	std::thread          thread;

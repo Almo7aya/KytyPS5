@@ -86,6 +86,7 @@ void WaitForQueueIdle() {
 	auto& graphics = GetRenderContext().GetGraphics();
 	EXIT_IF(graphics.queue == nullptr);
 	Common::LockGuard lock(graphics.queue_mutex);
+	Kyty::WaitWatch::Scope w("xfer_qidle", 0, 0); // KYTY_DIAG
 	const auto        result = graphics.queue.waitIdle();
 
 	if (result != vk::Result::eSuccess) {

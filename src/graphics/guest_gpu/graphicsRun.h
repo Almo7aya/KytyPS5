@@ -15,6 +15,21 @@ public:
 	KYTY_CLASS_NO_COPY(GraphicsRunSubmissionLock);
 };
 
+// Marks the current thread as operating inside an already-effectively-established submission pause,
+// WITHOUT actually pausing the GPU worker. Nested GraphicsRunSubmissionLock acquisitions then become
+// no-ops (they see a non-zero pause depth) instead of trying to (re-)pause. The async readback worker
+// uses this when it services a fault requested by the command-processor (GPU worker) thread: that
+// worker is blocked in the fault and can never park, but it is also not submitting any GPU work, so
+// the pause its nested cache operations (e.g. BufferCache::UnmapMemory) want is already in force.
+// Using a real GraphicsRunSubmissionLock there instead deadlocks (RequestPauseAndWait waits forever
+// for the stuck worker to park).
+class GraphicsRunAdoptedSubmissionPause final {
+public:
+	GraphicsRunAdoptedSubmissionPause();
+	~GraphicsRunAdoptedSubmissionPause();
+	KYTY_CLASS_NO_COPY(GraphicsRunAdoptedSubmissionPause);
+};
+
 void GraphicsRunInit();
 
 void GraphicsRunSubmit(uint32_t* cmd_draw_buffer, uint32_t num_draw_dw, uint32_t* cmd_const_buffer,

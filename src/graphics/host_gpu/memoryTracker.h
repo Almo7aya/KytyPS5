@@ -46,6 +46,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
 		CheckNotInUploadCallback(this, vaddr);
+		Kyty::WaitWatch::Scope w("mt_dl", vaddr, size); // KYTY_DIAG
 		std::lock_guard access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		std::vector<RegionManager*> managers;
@@ -98,6 +99,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback(this, vaddr);
+		Kyty::WaitWatch::Scope w("mt_ul", vaddr, size); // KYTY_DIAG
 		std::unique_lock access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});

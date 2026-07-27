@@ -1236,6 +1236,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::PublishImageBacking(uint64_t vaddr, uint64_t size,
                                       bool preserve_cpu_dirty) {
+	Kyty::WaitWatch::Scope w("bc_publish", vaddr, size); // KYTY_DIAG
 	FaultSafeCacheLock lock(this, m_mutex);
 	bool               cached_overlap = false;
 	for (auto it = m_buffers.begin(); it != m_buffers.end(); ++it) {

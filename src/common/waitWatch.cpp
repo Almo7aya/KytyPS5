@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <set>
+#include <tuple>
 #include <utility>
 
 namespace Kyty::WaitWatch {
@@ -58,8 +59,12 @@ void DumpThreadStackIfStuck(const ThreadWait* t, uint64_t held_ms) {
 	CONTEXT ctx {};
 	ctx.ContextFlags = CONTEXT_FULL;
 	if (GetThreadContext(thread, &ctx) != 0) {
-		static std::set<std::pair<uint64_t, uint64_t>> captured;
-		const auto                                     key = std::make_pair(host_tid, ctx.Rip);
+		// Coarse hold-time bucket in the key so a genuine multi-second deadlock re-emits even
+		// when the same (tid, rip) was already dumped during an earlier transient stall that
+		// recovered. Without it the permanent dedup hid the deadlocked GPU-worker/readback
+		// threads (they share ntdll's WaitOnAddress rip with prior transient stalls).
+		static std::set<std::tuple<uint64_t, uint64_t, uint64_t>> captured;
+		const auto key = std::make_tuple(host_tid, ctx.Rip, held_ms / 4000);
 		if (captured.insert(key).second) {
 			::printf("  --- host stack tid=%llu rip=0x%llx rsp=0x%llx ---\n",
 			         static_cast<unsigned long long>(host_tid),

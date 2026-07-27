@@ -1817,6 +1817,23 @@ GraphicsRunSubmissionLock::~GraphicsRunSubmissionLock() {
 	}
 }
 
+GraphicsRunAdoptedSubmissionPause::GraphicsRunAdoptedSubmissionPause() {
+	if (g_gpu == nullptr || g_submission_pause_depth == UINT32_MAX) {
+		EXIT("cannot adopt a GPU submission pause in the current state\n");
+	}
+	// Raise the pause depth without calling PauseSubmissionsShared: nested GraphicsRunSubmissionLock
+	// acquisitions on this thread become no-ops, but no attempt is made to park the GPU worker.
+	g_submission_pause_depth++;
+}
+
+GraphicsRunAdoptedSubmissionPause::~GraphicsRunAdoptedSubmissionPause() {
+	if (g_gpu == nullptr || g_submission_pause_depth == 0) {
+		EXIT("adopted GPU submission pause released without ownership\n");
+	}
+	// Symmetric with the constructor: never calls ResumeSubmissionsShared (it never paused).
+	g_submission_pause_depth--;
+}
+
 void GraphicsRunDone() {
 	EXIT_IF(g_gpu == nullptr);
 

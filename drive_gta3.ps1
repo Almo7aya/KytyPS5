@@ -1,8 +1,8 @@
 param(
-    [int]$IntroSeconds = 60,      # how long to keep pressing Cross to skip intros
-    [int]$PostStartSeconds = 40,  # how long to watch after pressing Start
-    [string]$LogTag = "run",
-    [string]$Printf = "Silent"    # printf-direction: Silent or Console
+    [int]$IntroSeconds = 60,       # how long to keep pressing Cross to skip intros
+    [int]$PostStartSeconds = 180,  # how long to watch (and keep the emulator alive) after Start
+    [string]$LogTag = (Get-Date -Format 'MMdd_HHmmss'),  # unique per run so logs never clobber
+    [string]$Printf = "Silent"     # printf-direction: Silent or Console
 )
 
 $ErrorActionPreference = "Stop"

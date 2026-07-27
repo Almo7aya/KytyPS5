@@ -642,9 +642,22 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 				// falls through to the guest exception path.
 				return allowed;
 			}
-			if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
-			    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
+			if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
 				FailFast("fault access is incompatible with active page watchers");
+			}
+			if (access == PageFaultAccess::Read && page.access_watchers == 0) {
+				// Read fault on a write-watched (PAGE_READONLY) page. Only writes need to
+				// invalidate the GPU's clean copy; reads of the guest backing are always
+				// legitimate. As with the no-watcher branch above, more than one CPU can
+				// fault during the NOACCESS->READONLY publish: the first consumes
+				// late_read_pending on the fast path, later ones land here and must also
+				// resume once the mapped page already permits the read.
+				const bool allowed     = Impl::AllowsAccess(fault_vaddr, access);
+				page.late_read_pending = false;
+				if (waited && !allowed) {
+					FailFast("page remained inaccessible after waiting for its resolver");
+				}
+				return allowed;
 			}
 			page.resolving            = true;
 			page.resolving_read_write = page.access_watchers != 0;

@@ -5,6 +5,7 @@
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
