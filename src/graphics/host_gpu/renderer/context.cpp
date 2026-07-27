@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -347,7 +348,23 @@ void CommandBuffer::WaitForFenceOnly() {
 		return;
 	}
 	auto device = GetRenderContext().GetGraphics().device;
-	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
+	auto result = device.waitForFences(1, &m_slot->fence, VK_TRUE, 4'000'000'000ull); // KYTY_DIAG 4s
+	if (result == vk::Result::eTimeout) {
+		// KYTY_DIAG: a fence that will not signal within 4s means either the GPU hung (device lost /
+		// TDR -> a bad command buffer earlier in the queue) or the submission is merely queued behind
+		// stuck work. getFenceStatus distinguishes them. Then resume the infinite wait unchanged.
+		const auto status = device.getFenceStatus(m_slot->fence);
+		std::printf("KYTY_DIAG fence-stall slot=%u submit_seq=%llu global_seq=%llu status=%s "
+		            "op=%u submit=%llu args=%u,%u,%u,%u,0x%016llx\n",
+		            m_slot->id, static_cast<unsigned long long>(m_submit_seq),
+		            static_cast<unsigned long long>(
+		                g_command_buffer_submit_seq.load(std::memory_order_relaxed)),
+		            VulkanToString(status).c_str(), m_debug_op,
+		            static_cast<unsigned long long>(m_debug_submit_id), m_debug_arg0, m_debug_arg1,
+		            m_debug_arg2, m_debug_arg3, static_cast<unsigned long long>(m_debug_arg4));
+		std::fflush(stdout);
+		result = device.waitForFences(1, &m_slot->fence, VK_TRUE, UINT64_MAX);
+	}
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkWaitForFences failed: %s (%d), slot=%u submit_seq=%" PRIu64
 		     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
