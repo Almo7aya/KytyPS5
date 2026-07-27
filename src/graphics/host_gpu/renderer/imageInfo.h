@@ -933,48 +933,81 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			return image_gpu_modified ? BufferImageWrite::SynchronizeVideoOut
 			                          : BufferImageWrite::InvalidateVideoOut;
 		case BufferImageBinding::RenderTarget:
-			if (!contained || !buffer_page_aligned || !image_page_aligned) {
+			if (buffer_formatted) {
+				if (!contained || !buffer_page_aligned || !image_page_aligned) {
+					return BufferImageWrite::Unsupported;
+				}
+				if (image_gpu_modified) {
+					// Preserve the complete native image in guest backing before a formatted
+					// buffer overwrites any contained page range. The synchronization path
+					// downloads the whole target, so bytes outside a partial write remain
+					// current.
+					return !image_buffer_modified ? BufferImageWrite::SynchronizeRenderTarget
+					                              : BufferImageWrite::Unsupported;
+				}
+				// A page-aligned write inside a CPU-current render target can move just that
+				// byte range into native-buffer ownership. ObtainBufferForImage later downloads
+				// the dirty subrange into the full guest backing before refreshing the target.
+				return BufferImageWrite::InvalidateRenderTarget;
+			}
+			// Raw (unformatted) bulk writes land here when the streaming pool reuses the guest
+			// allocation (a live target is never bulk-overwritten through the buffer path). A
+			// contained write over a GPU-owned target first flushes the whole image to guest
+			// memory so nothing is lost, then the write integrates coherently on top.
+			if (!(contained || image_contained) || !buffer_page_aligned || !image_page_aligned) {
 				return BufferImageWrite::Unsupported;
 			}
-			if (image_gpu_modified) {
-				// Preserve the complete native image in guest backing before a formatted buffer
-				// overwrites any contained page range. The synchronization path downloads the
-				// whole target, so bytes outside a partial write remain current.
-				return buffer_formatted && !image_buffer_modified
-				           ? BufferImageWrite::SynchronizeRenderTarget
-				           : BufferImageWrite::Unsupported;
+			if (contained && image_gpu_modified && !image_buffer_modified) {
+				return BufferImageWrite::SynchronizeRenderTarget;
 			}
-			// A raw page-aligned write inside a CPU-current render target can move just that byte
-			// range into native-buffer ownership. ObtainBufferForImage later downloads the dirty
-			// subrange into the full guest backing before refreshing the target.
 			return BufferImageWrite::InvalidateRenderTarget;
 		case BufferImageBinding::StorageTexture:
-			if (!image_page_aligned || !buffer_formatted) {
+			if (!image_page_aligned) {
 				return BufferImageWrite::Unsupported;
 			}
-			// A formatted write fully inside a GPU-owned storage image reconciles by flushing the
-			// image's GPU contents to guest memory, after which the buffer write lands coherently on
-			// top. The flush reconstructs the whole backing, so the write itself need not be page
-			// aligned.
+			// A write fully inside a GPU-owned storage image reconciles by flushing the image's
+			// GPU contents to guest memory, after which the write lands coherently on top. The
+			// flush reconstructs the whole backing, so the write itself need not be page aligned.
 			if (contained && image_gpu_modified && !image_buffer_modified) {
 				return BufferImageWrite::SynchronizeStorageTexture;
 			}
 			if (!buffer_page_aligned) {
 				return BufferImageWrite::Unsupported;
 			}
+			if (!buffer_formatted) {
+				// Raw bulk writes into a CPU-current storage image move the affected byte range
+				// into native-buffer ownership, the same as for sampled targets.
+				return (contained || image_contained) && !image_gpu_modified
+				           ? BufferImageWrite::InvalidateStorageTexture
+				           : BufferImageWrite::Unsupported;
+			}
 			return image_contained && !image_gpu_modified && image_buffer_modified
 			           ? BufferImageWrite::InvalidateStorageTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::DepthTarget:
-			if (!exact || !buffer_page_aligned || !buffer_formatted) {
+			if (buffer_formatted) {
+				if (!exact || !buffer_page_aligned) {
+					return BufferImageWrite::Unsupported;
+				}
+				if (image_gpu_modified && !image_buffer_modified) {
+					return BufferImageWrite::SynchronizeDepthTarget;
+				}
+				return !image_gpu_modified && image_buffer_modified
+				           ? BufferImageWrite::InvalidateDepthTarget
+				           : BufferImageWrite::Unsupported;
+			}
+			// Raw (unformatted) bulk writes land here when the streaming pool reuses the guest
+			// allocation (a live depth target is never bulk-overwritten through the buffer path).
+			// A contained write over a GPU-owned target first flushes the whole image to guest
+			// memory so no depth content is lost, then the write integrates coherently on top.
+			// Everything else moves the range into native-buffer ownership.
+			if (!(contained || image_contained) || !buffer_page_aligned || !image_page_aligned) {
 				return BufferImageWrite::Unsupported;
 			}
-			if (image_gpu_modified && !image_buffer_modified) {
+			if (contained && image_gpu_modified && !image_buffer_modified) {
 				return BufferImageWrite::SynchronizeDepthTarget;
 			}
-			return !image_gpu_modified && image_buffer_modified
-			           ? BufferImageWrite::InvalidateDepthTarget
-			           : BufferImageWrite::Unsupported;
+			return BufferImageWrite::InvalidateDepthTarget;
 		case BufferImageBinding::Unsupported: return BufferImageWrite::Unsupported;
 	}
 	return BufferImageWrite::Unsupported;

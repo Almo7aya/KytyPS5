@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/waitWatch.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -580,22 +581,40 @@ struct TextureCache::ReadbackWorker {
 		const bool meta_overlap =
 		    cache.HasMetaOverlapLocked(info.address, info.size) ||
 		    (has_stencil && cache.HasMetaOverlapLocked(info.stencil_address, info.stencil_size));
-		const bool buffer_overlap = cache.m_buffer_cache.HasPageOverlap(info.address, info.size) ||
-		                            (has_stencil && cache.m_buffer_cache.HasPageOverlap(
-		                                                info.stencil_address, info.stencil_size));
+		// Buffer-cache page overlap is reconciled by publishing the reconstructed backing into
+		// buffer ownership after the download (mirroring the color-image readback); only a
+		// genuinely modified cached buffer makes the readback incoherent.
+		const bool buffer_overlap_depth =
+		    cache.m_buffer_cache.HasPageOverlap(info.address, info.size);
+		const bool buffer_overlap_stencil =
+		    has_stencil &&
+		    cache.m_buffer_cache.HasPageOverlap(info.stencil_address, info.stencil_size);
+		const bool buffer_cpu_modified =
+		    (buffer_overlap_depth &&
+		     cache.m_buffer_cache.IsRegionCpuModified(info.address, info.size)) ||
+		    (buffer_overlap_stencil &&
+		     cache.m_buffer_cache.IsRegionCpuModified(info.stencil_address, info.stencil_size));
+		const bool buffer_gpu_modified =
+		    (buffer_overlap_depth &&
+		     cache.m_buffer_cache.IsRegionGpuModified(info.address, info.size)) ||
+		    (buffer_overlap_stencil &&
+		     cache.m_buffer_cache.IsRegionGpuModified(info.stencil_address, info.stencil_size));
 		const auto transfer_size  = info.size + info.stencil_size;
 		if (depth_linear_size > depth_slice_size ||
 		    (has_stencil && stencil_linear_elements > stencil_slice_size) ||
 		    transfer_size > UINT32_MAX || cached.image->format != info.format ||
 		    cached.image->extent.width != info.width ||
-		    cached.image->extent.height != info.height || meta_overlap || buffer_overlap) {
+		    cached.image->extent.height != info.height || meta_overlap || buffer_cpu_modified ||
+		    buffer_gpu_modified) {
 			EXIT("TextureCache: depth-image readback storage is unsupported, "
 			     "depth=0x%016" PRIx64 "+0x%016" PRIx64 " linear=0x%016" PRIx64
-			     " format=%d/%d extent=%ux%u/%ux%u meta=%d buffer=%d\n",
+			     " format=%d/%d extent=%ux%u/%ux%u meta=%d buffer=%d buffer_cpu=%d "
+			     "buffer_gpu=%d\n",
 			     info.address, info.size, depth_linear_size, static_cast<int>(cached.image->format),
 			     static_cast<int>(info.format), cached.image->extent.width,
 			     cached.image->extent.height, info.width, info.height, meta_overlap,
-			     buffer_overlap);
+			     buffer_overlap_depth || buffer_overlap_stencil, buffer_cpu_modified,
+			     buffer_gpu_modified);
 		}
 		auto regions = Transfer::MakeLayeredImageBufferCopies(info.layers, depth_slice_size,
 		                                                      info.pitch, info.width, info.height,
@@ -654,11 +673,17 @@ struct TextureCache::ReadbackWorker {
 		Transfer::DownloadTiledImage(guest.data(), transfer_size, transfer_size, gpu_infos, regions,
 		                             *cached.image, cached.image->layout);
 		Libs::LibKernel::Memory::WriteBacking(info.address, guest.data(), info.size);
+		if (buffer_overlap_depth) {
+			cache.m_buffer_cache.PublishImageBacking(info.address, info.size);
+		}
 		ReadbackTransfer transfer;
 		transfer.Add(info.address, info.size);
 		if (has_stencil) {
 			Libs::LibKernel::Memory::WriteBacking(info.stencil_address, guest.data() + info.size,
 			                                      info.stencil_size);
+			if (buffer_overlap_stencil) {
+				cache.m_buffer_cache.PublishImageBacking(info.stencil_address, info.stencil_size);
+			}
 			transfer.Add(info.stencil_address, info.stencil_size);
 		}
 		return transfer;
@@ -788,6 +813,8 @@ struct TextureCache::ReadbackWorker {
 	}
 
 	void Run() noexcept {
+		Kyty::WaitWatch::SetThreadName("TextureReadback", -4,
+		                               Kyty::WaitWatch::CurrentHostTid()); // KYTY_DIAG
 		while (true) {
 			auto current = state.load(std::memory_order_acquire);
 			while (current == State::Idle) {
@@ -808,6 +835,7 @@ struct TextureCache::ReadbackWorker {
 			if (!submissions_prepaused) {
 				submissions.emplace();
 			}
+			Kyty::WaitWatch::Scope rb_scope("rb_download", vaddr, size); // KYTY_DIAG
 			FaultSafeTextureLock lock(&cache, cache.m_lock);
 			CachedImage*         selected = cache.FindGpuReadbackPageCandidateLocked(vaddr, size);
 			const bool           render_target =
@@ -3316,10 +3344,13 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 			// GPU-owned image kinds and metadata aliases remain unsupported.
 			const bool host_refreshable =
 			    IsHostWriteRefreshable(cached->BufferBinding(), cached->buffer_modified);
+			const bool gpu_synchronizable =
+			    cached->kind == CachedImage::Kind::RenderTarget ||
+			    cached->kind == CachedImage::Kind::DepthTarget;
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,
 			                                 cached->gpu_modified, metadata_overlap,
-			                                 cached->kind == CachedImage::Kind::RenderTarget)) {
+			                                 gpu_synchronizable)) {
 				case HostWriteOverlap::None: break;
 				case HostWriteOverlap::InvalidateImage: found = true; break;
 				case HostWriteOverlap::SynchronizeImage:
@@ -3348,7 +3379,13 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	if (synchronize != nullptr) {
-		SynchronizeColorImageBackingLocked(*synchronize, vaddr, size, false);
+		// Publish the complete GPU-owned backing into guest memory before the partial host
+		// write lands on top of it (color and depth targets share the flush-first rule).
+		if (synchronize->kind == CachedImage::Kind::DepthTarget) {
+			SynchronizeDepthImageToBufferLocked(*synchronize, vaddr, size);
+		} else {
+			SynchronizeColorImageBackingLocked(*synchronize, vaddr, size, false);
+		}
 	}
 	// Explicitly invalidate on a write fault. The resource transaction is already held here, so
 	// writing first would recursively enter the cache.
@@ -3600,14 +3637,27 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 	    (d16 || d32) && TileGetDepthSize(info.width, info.height, 0,
 	                                     Prospero::GpuEnumValue(d16 ? Prospero::DepthFormat::kZ16
 	                                                                : Prospero::DepthFormat::kZ32F),
-	                                     Prospero::GpuEnumValue(Prospero::StencilFormat::kInvalid),
-	                                     false, expected_stencil, expected_htile, expected_depth);
+	                                     Prospero::GpuEnumValue(has_stencil
+	                                                                ? Prospero::StencilFormat::k8UInt
+	                                                                : Prospero::StencilFormat::kInvalid),
+	                                     has_htile, expected_stencil, expected_htile, expected_depth);
+	const bool write_inside =
+	    write_address >= info.address && write_size != 0 &&
+	    write_address - info.address <= info.size &&
+	    write_size <= info.size - (write_address - info.address);
+	// The write only needs to be contained in the depth backing: the whole depth (and stencil)
+	// plane is flushed to guest memory below, so bytes outside a partial write stay current.
+	// htile metadata is derived and rebuilt by the guest on the next bind, so it needs no flush.
 	if (cached.kind != CachedImage::Kind::DepthTarget || !cached.gpu_modified ||
-	    cached.buffer_modified || write_address != info.address || write_size != info.size ||
-	    has_stencil || has_htile || info.layers != 1 || !layout || expected_depth.align != 65536 ||
-	    expected_depth.size != info.size || cached.image->format != info.format ||
-	    cached.image->extent.width != info.width || cached.image->extent.height != info.height ||
-	    HasMetaOverlapLocked(info.address, info.size)) {
+	    cached.buffer_modified || !write_inside || info.layers != 1 || !layout ||
+	    expected_depth.align != 65536 || expected_depth.size != info.size ||
+	    (has_stencil &&
+	     (expected_stencil.align != 65536 || expected_stencil.size != info.stencil_size)) ||
+	    (has_htile && (expected_htile.align != 32768 || expected_htile.size != info.htile_size)) ||
+	    cached.image->format != info.format || cached.image->extent.width != info.width ||
+	    cached.image->extent.height != info.height ||
+	    HasMetaOverlapLocked(info.address, info.size) ||
+	    (has_stencil && HasMetaOverlapLocked(info.stencil_address, info.stencil_size))) {
 		EXIT("TextureCache: unsupported depth-image buffer synchronization, "
 		     "write=0x%016" PRIx64 "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
 		     " extent=%ux%u layers=%u format=%d guest=%u bpe=%u"
@@ -3617,8 +3667,20 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 		     has_stencil, has_htile, cached.gpu_modified, cached.buffer_modified);
 	}
 	Transfer::WaitForQueueIdle();
-	const auto regions = Transfer::MakeLayeredImageBufferCopies(
+	auto regions = Transfer::MakeLayeredImageBufferCopies(
 	    1, info.size, info.pitch, info.width, info.height, vk::ImageAspectFlagBits::eDepth);
+	if (has_stencil) {
+		const auto stencil_pitch =
+		    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt), info.width,
+		                        1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
+		auto stencil_regions = Transfer::MakeLayeredImageBufferCopies(
+		    1, info.stencil_size, stencil_pitch, info.width, info.height,
+		    vk::ImageAspectFlagBits::eStencil);
+		for (auto& region: stencil_regions) {
+			region.offset += static_cast<uint32_t>(info.size);
+		}
+		regions.insert(regions.end(), stencil_regions.begin(), stencil_regions.end());
+	}
 	TileBlockLayout block {};
 	EXIT_NOT_IMPLEMENTED(
 	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_element, block));
@@ -3633,14 +3695,42 @@ void TextureCache::SynchronizeDepthImageToBufferLocked(CachedImage& cached, uint
 	                             info.height,
 	                             1,
 	                             info.pitch};
-	m_buffer_transition_guest.resize(info.size);
-	Transfer::DownloadTiledImage(m_buffer_transition_guest.data(), info.size, info.size,
-	                             std::span<const GpuTileInfo>(&tile_info, 1), regions,
-	                             *cached.image, cached.image->layout);
+	TileBlockLayout stencil_block {};
+	std::vector<GpuTileInfo> tile_infos;
+	tile_infos.push_back(tile_info);
+	if (has_stencil) {
+		const auto stencil_pitch =
+		    TileGetTexturePitch(Prospero::GpuEnumValue(Prospero::BufferFormat::k8UInt), info.width,
+		                        1, Prospero::GpuEnumValue(Prospero::TileMode::kDepth));
+		EXIT_NOT_IMPLEMENTED(!TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block));
+		const GpuTileInfo stencil_info {stencil_block.family,
+		                                stencil_block.bytes_per_element,
+		                                info.size,
+		                                info.stencil_size,
+		                                info.size,
+		                                info.stencil_size,
+		                                0,
+		                                info.width,
+		                                info.height,
+		                                1,
+		                                stencil_pitch};
+		tile_infos.push_back(stencil_info);
+	}
+	const auto transfer_size = info.size + (has_stencil ? info.stencil_size : 0);
+	m_buffer_transition_guest.resize(transfer_size);
+	Transfer::DownloadTiledImage(m_buffer_transition_guest.data(), transfer_size, transfer_size,
+	                             tile_infos, regions, *cached.image, cached.image->layout);
 	Libs::LibKernel::Memory::WriteBacking(info.address, m_buffer_transition_guest.data(),
 	                                      info.size);
 	m_memory_tracker.ForEachDownloadRange<true>(info.address, info.size,
 	                                            [](uint64_t, uint64_t) noexcept {});
+	if (has_stencil) {
+		Libs::LibKernel::Memory::WriteBacking(info.stencil_address,
+		                                      m_buffer_transition_guest.data() + info.size,
+		                                      info.stencil_size);
+		m_memory_tracker.ForEachDownloadRange<true>(info.stencil_address, info.stencil_size,
+		                                            [](uint64_t, uint64_t) noexcept {});
+	}
 	m_buffer_cache.PublishImageBacking(write_address, write_size);
 	cached.gpu_modified    = false;
 	cached.buffer_modified = true;

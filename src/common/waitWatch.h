@@ -18,6 +18,12 @@
 
 namespace Kyty::WaitWatch {
 
+// Implemented in waitWatch.cpp (Windows): captures a host stack for a thread stuck past the
+// dump threshold (rbp-chain walk, addresses only; symbolize offline against the PDB).
+struct ThreadWait;
+void DumpThreadStackIfStuck(const ThreadWait* t, uint64_t held_ms);
+uint64_t CurrentHostTid();
+
 // Lock-free unique-vs-total guest-fault measurement (Phase 1 diagnosis). Tells whether the fault
 // storm is re-faults of the same pages (eager re-protection => coalescing helps) or unique pages
 // (genuine streaming volume). One atomic bit test-set + two counters per fault.
@@ -188,6 +194,7 @@ inline void Dump(const char* reason) {
 		         static_cast<unsigned long long>(t->arg1.load(std::memory_order_relaxed)),
 		         static_cast<unsigned long long>(held),
 		         static_cast<unsigned long long>(t->activity.load(std::memory_order_relaxed)));
+		DumpThreadStackIfStuck(t, held);
 	}
 	::fflush(stdout);
 }

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
@@ -1365,6 +1366,41 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 	}
 }
 
+// KYTY_DIAG: pre-compile GCN dump for offline hang/crash reproduction. Enabled only when the
+// KYTY_DUMP_PRECMP environment variable is set; writes _Shaders/precmp/<id>_<stage>_<hash>_addr<addr>.bin
+// for every shader BEFORE it is compiled, so the last file written is the shader being compiled when
+// the worker hangs. Strip or keep disabled for release.
+static bool ShaderPrecmpDumpEnabled() {
+	static const bool enabled = std::getenv("KYTY_DUMP_PRECMP") != nullptr;
+	return enabled;
+}
+
+static void DumpShaderRecompilerPrecmp(const char* type, uint64_t shader_hash, uint64_t shader_addr,
+                                       std::span<const uint32_t> code) {
+	if (!ShaderPrecmpDumpEnabled() || code.empty()) {
+		return;
+	}
+
+	static std::atomic_int id = 0;
+
+	const auto base_name = Config::GetShaderLogFolder() / "precmp" /
+	                       fmt::format("{:04d}_{}_{:016x}_addr{:016x}", id++, type, shader_hash,
+	                                   shader_addr);
+	Common::File::CreateDirectories(base_name.parent_path());
+
+	Common::File bin_file;
+	auto         bin_name = base_name;
+	bin_name += ".bin";
+	bin_file.Create(bin_name);
+	if (bin_file.IsInvalid()) {
+		auto bin_name_text = Common::PathToString(bin_name);
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", bin_name_text.c_str());
+	} else {
+		bin_file.Write(code.data(), code.size_bytes());
+		bin_file.Close();
+	}
+}
+
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                           std::vector<uint32_t>& spirv) {
@@ -1392,6 +1428,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	DumpShaderRecompilerPrecmp("vs", options.shader_hash, shader_addr, code);
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash, error.c_str());
 	}
@@ -1445,6 +1482,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	DumpShaderRecompilerPrecmp("ps", options.shader_hash, shader_addr, code);
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash, error.c_str());
 	}
@@ -1495,6 +1533,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	DumpShaderRecompilerPrecmp("cs", options.shader_hash, shader_addr, code);
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
 	}

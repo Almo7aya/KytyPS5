@@ -229,6 +229,11 @@ public:
 			}
 		}
 		Queue(0);
+		// Safety net against fixpoint non-convergence. The merge is monotonic (a phi slot,
+		// once created, always returns the phi), so the worklist must drain; a generous cap
+		// turns any future oscillation bug into a compile error instead of a frozen worker.
+		constexpr uint64_t kMaxFixpointIterations = 16u * 1024u * 1024u;
+		uint64_t           iterations             = 0;
 		while (!m_work.empty()) {
 			const auto block_index = m_work.front();
 			m_work.pop_front();
@@ -247,6 +252,12 @@ public:
 			m_exit_ready[block_index] = true;
 			for (const auto successor: m_program.blocks[block_index].successors) {
 				Queue(successor);
+			}
+			if (++iterations > kMaxFixpointIterations) {
+				return Fail(error,
+				            fmt::format("scalar provenance fixpoint did not converge within {} "
+				                        "block visits (values={})",
+				                        kMaxFixpointIterations, m_graph.values.size()));
 			}
 		}
 
@@ -778,12 +789,21 @@ private:
 			if (incoming.empty()) {
 				return ScalarProvenance::Undefined;
 			}
+			if (*phi != ScalarProvenance::Undefined) {
+				// Once a phi exists for this slot, keep returning it even when the incoming
+				// set temporarily collapses to a single value. Falling back to the plain
+				// value makes the merge non-monotonic: the entry then flips between the
+				// propagated phi and this slot's phi one loop-trip apart (a limit cycle),
+				// and the worklist fixpoint never converges. Observed on a GTA III
+				// Definitive Edition pixel shader: reg31/reg42 entries oscillated between
+				// three phi ids with a period of ~393216 block visits forever.
+				m_graph.values[*phi].phi_args = std::move(incoming);
+				return *phi;
+			}
 			if (incoming.size() == 1) {
 				return incoming[0];
 			}
-			if (*phi == ScalarProvenance::Undefined) {
-				*phi = AddValue({ScalarValueOp::Phi, block.start_pc});
-			}
+			*phi = AddValue({ScalarValueOp::Phi, block.start_pc});
 			m_graph.values[*phi].phi_args = std::move(incoming);
 			return *phi;
 		};

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -106,6 +107,8 @@ public:
 
 void LabelManager::ThreadRun(void* data) {
 	auto* manager = static_cast<LabelManager*>(data);
+
+	Kyty::WaitWatch::SetThreadName("GpuLabelThread", -3, Kyty::WaitWatch::CurrentHostTid()); // KYTY_DIAG
 
 	for (;;) {
 		manager->m_mutex.Lock();

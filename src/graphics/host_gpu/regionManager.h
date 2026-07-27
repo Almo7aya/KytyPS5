@@ -44,6 +44,13 @@ public:
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
+	// True when the calling thread already holds the lock. A nested page-fault handler on the
+	// uploading thread uses this to avoid re-entering a region whose state is mid-transition:
+	// the lock owner is the thread itself, so the region cannot change under it, and the outer
+	// operation rewrites the region state when it completes.
+	[[nodiscard]] bool OwnedByCurrentThread() const noexcept {
+		return m_owner.load(std::memory_order_relaxed) == CurrentThread();
+	}
 
 private:
 	static uint32_t CurrentThread() noexcept {

@@ -101,6 +101,8 @@ public:
 	void Done();
 	void PauseSubmissions();
 	void ResumeSubmissions();
+	void PauseSubmissionsShared();
+	void ResumeSubmissionsShared();
 	int  GetFrameNum();
 
 private:
@@ -130,10 +132,20 @@ private:
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
+	// Coalesced fault-drain window (see PauseSubmissionsShared). The first participant drains
+	// once; joiners attach to the open window without serializing on m_submission_mutex.
+	struct SharedPause {
+		Common::Mutex   mutex;
+		Common::CondVar cv;
+		uint32_t        participants = 0;
+		bool            draining     = false;
+	};
+
 	Common::Mutex                                  m_submission_mutex;
 	Common::Mutex                                  m_queue_mutex;
 	Common::CondVar                                m_work_available;
 	Common::CondVar                                m_idle;
+	SharedPause                                    m_shared_pause;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	uint32_t                                       m_next_queue       = 0;
 	uint32_t                                       m_submission_count = 0;
@@ -573,7 +585,7 @@ void Gpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<Gpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
-	Kyty::WaitWatch::SetThreadName("GpuWorker", -2, 0); // KYTY_DIAG
+	Kyty::WaitWatch::SetThreadName("GpuWorker", -2, Kyty::WaitWatch::CurrentHostTid()); // KYTY_DIAG
 
 	for (;;) {
 		Submission submission;
@@ -767,6 +779,65 @@ void Gpu::ResumeSubmissions() {
 	}
 	ReleasePause();
 	m_submission_mutex.Unlock();
+	g_gpu_mutex_owned = false;
+}
+
+// Coalesced variant of PauseSubmissions for the per-fault drain. During level streaming the
+// drain was measured serializing ~16 engine threads 7-16x over wall-clock: every fault took
+// m_submission_mutex and parked the worker individually. The exclusivity a fault actually
+// needs is (a) the worker parked and (b) a fence+label flush covering everything submitted
+// so far. Because the worker stays parked for the whole window, one drain covers every
+// concurrent participant: the first participant parks, fences (BufferWait) and flushes
+// (LabelDrain) once under m_submission_mutex (kept only against Done()); joiners attach to
+// the open window without touching that mutex; the last leaver un-parks the worker.
+void Gpu::PauseSubmissionsShared() {
+	if (g_gpu_mutex_owned) {
+		EXIT("GPU submissions are already paused by this thread\n");
+	}
+	Kyty::WaitWatch::Scope watch("gpu_pause_lock", 0, 0);
+	Kyty::WaitWatch::DrainStats::pause_count.fetch_add(1, std::memory_order_relaxed);
+	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::pause_ns);
+	g_gpu_mutex_owned = true;
+	m_shared_pause.mutex.Lock();
+	if (m_shared_pause.participants == 0 && !m_shared_pause.draining) {
+		// Sole leader: drain once. Election is atomic so a thread arriving mid-drain cannot
+		// become a second leader; it joins below after the drain completes.
+		m_shared_pause.draining = true;
+		m_shared_pause.mutex.Unlock();
+		m_submission_mutex.Lock();
+		{
+			Kyty::WaitWatch::DrainStats::ScopedNs wt(Kyty::WaitWatch::DrainStats::waitidle_ns);
+			RequestPauseAndWait();
+		}
+		m_gfx_cp->BufferWait();
+		{
+			Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
+			Kyty::WaitWatch::DrainStats::ScopedNs lt(Kyty::WaitWatch::DrainStats::labeldrain_ns);
+			LabelDrain();
+		}
+		m_submission_mutex.Unlock();
+		m_shared_pause.mutex.Lock();
+		m_shared_pause.draining     = false;
+		m_shared_pause.participants = 1;
+		m_shared_pause.cv.SignalAll();
+		m_shared_pause.mutex.Unlock();
+		return;
+	}
+	while (m_shared_pause.draining) {
+		m_shared_pause.cv.Wait(&m_shared_pause.mutex);
+	}
+	m_shared_pause.participants++;
+	m_shared_pause.mutex.Unlock();
+}
+
+void Gpu::ResumeSubmissionsShared() {
+	Common::LockGuard lock(m_shared_pause.mutex);
+	if (m_shared_pause.participants == 0) {
+		EXIT("GPU shared pause released without participants\n");
+	}
+	if (--m_shared_pause.participants == 0) {
+		ReleasePause();
+	}
 	g_gpu_mutex_owned = false;
 }
 
@@ -1733,7 +1804,7 @@ GraphicsRunSubmissionLock::GraphicsRunSubmissionLock() {
 		EXIT("cannot acquire GPU submission lock in the current state\n");
 	}
 	if (g_submission_pause_depth++ == 0) {
-		g_gpu->PauseSubmissions();
+		g_gpu->PauseSubmissionsShared();
 	}
 }
 
@@ -1742,7 +1813,7 @@ GraphicsRunSubmissionLock::~GraphicsRunSubmissionLock() {
 		EXIT("GPU submission lock released without ownership\n");
 	}
 	if (--g_submission_pause_depth == 0) {
-		g_gpu->ResumeSubmissions();
+		g_gpu->ResumeSubmissionsShared();
 	}
 }
 

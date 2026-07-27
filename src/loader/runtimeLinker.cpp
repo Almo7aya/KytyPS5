@@ -681,13 +681,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		const auto dump_size = 32u;
 #endif
 
-		LOGF("%s code: addr=%016" PRIx64 ", off=%016" PRIx64 ", module=%s:", name, addr,
-		     addr - p->base_vaddr,
-		     Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name)).c_str());
+		// KYTY_DIAG: exception context must stay visible with --printf-direction Silent.
+		std::printf("KYTY_DIAG %s code: addr=%016llx, off=%016llx, module=%s:", name,
+		            static_cast<unsigned long long>(addr),
+		            static_cast<unsigned long long>(addr - p->base_vaddr),
+		            Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name))
+		                .c_str());
 		for (uint32_t i = 0; i < dump_size; i++) {
-			LOGF(" %02" PRIx32, static_cast<uint32_t>(dump_ptr[i]));
+			std::printf(" %02x", static_cast<uint32_t>(dump_ptr[i]));
 		}
-		LOGF("\n");
+		std::printf("\n");
+		std::fflush(stdout);
 	};
 
 	dump_guest_code("guest rip", info->exception_address);

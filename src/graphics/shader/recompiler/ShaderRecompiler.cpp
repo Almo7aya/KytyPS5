@@ -756,6 +756,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::BuildScalarProvenance(ir, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR BuildScalarProvenance elapsed_ms=%" PRIu64
+	     "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	std::string srt_error;
 	if (!IR::BuildSrtPlan(ir, &srt_error)) {
 		LOGF("%s SRT planning failed: %s\n", GetDumpLabel(options), srt_error.c_str());
@@ -764,6 +767,8 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR BuildSrtPlan elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	ir.dispatcher_fallback = dispatcher_fallback;
 	if (!dispatcher_reason.empty()) {
 		ir.fallback_reason = dispatcher_reason;
@@ -772,6 +777,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::PatchSrtReads(ir, error) || !IR::TrackResources(ir, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64
+	     " IR PatchSrtReads+TrackResources elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
@@ -813,9 +821,15 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			return false;
 		}
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR MaterializeResources elapsed_ms=%" PRIu64
+	     "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	if (!IR::SpecializeResources(ir, resources, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR SpecializeResources elapsed_ms=%" PRIu64
+	     "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 
 	ShaderVertexInputInfo  default_vertex {};
 	ShaderPixelInputInfo   default_pixel {};
@@ -830,12 +844,18 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR CollectShaderInfo elapsed_ms=%" PRIu64
+	     "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	IR::BindingLayoutOptions layout_options;
 	layout_options.descriptor_set       = options.descriptor_set;
 	layout_options.push_constant_offset = options.push_constant_offset;
 	if (!IR::AllocateBindings(ir, layout_options, error)) {
 		return false;
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR AllocateBindings elapsed_ms=%" PRIu64
+	     "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, phase_ms());
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(cfg, ir);

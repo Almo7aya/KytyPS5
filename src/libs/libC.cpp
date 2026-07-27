@@ -5,6 +5,7 @@
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/guestPrintf.h"
@@ -19,6 +20,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -99,7 +101,7 @@ static void PrintAbortStringCandidate(const char* name, uint64_t addr) {
 	}
 
 	if (len >= 4) {
-		LOGF("\t %s string = \"%s\"\n", name, buf);
+		std::printf("KYTY_DIAG abort-diag:\t %s string = \"%s\"\n", name, buf);
 	}
 }
 
@@ -127,7 +129,7 @@ static void PrintAbortWideStringCandidate(const char* name, uint64_t addr) {
 	}
 
 	if (len >= 4) {
-		LOGF("\t %s u16 = \"%s\"\n", name, buf);
+		std::printf("KYTY_DIAG abort-diag:\t %s u16 = \"%s\"\n", name, buf);
 	}
 }
 
@@ -147,11 +149,17 @@ static void PrintAbortBytesCandidate(const char* name, uint64_t addr) {
 		return;
 	}
 
-	LOGF("\t %s bytes =", name);
+	std::string hex;
+	bool        all_zero = true;
 	for (size_t i = 0; i < len; i++) {
-		LOGF(" %02" PRIx8, bytes[i]);
+		hex += fmt::format(" {:02x}", bytes[i]);
+		all_zero = all_zero && bytes[i] == 0;
 	}
-	LOGF("\n");
+	std::printf("KYTY_DIAG abort-diag:\t %s bytes =%s\n", name, hex.c_str());
+	if (all_zero) {
+		std::printf("KYTY_DIAG abort-diag:\t %s all-zero, commit-on-fault-filled=%s\n", name,
+		            Libs::LibKernel::Memory::KernelWasCommittedOnFault(addr, len) ? "YES" : "no");
+	}
 }
 
 static void PrintAbortPointerCandidate(const char* name, uint64_t addr) {
@@ -180,7 +188,8 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 			continue;
 		}
 
-		LOGF("\t %s[%d] = 0x%016" PRIx64 "\n", name, i, value);
+		std::printf("KYTY_DIAG abort-diag:\t %s[%d] = 0x%016llx\n", name, i,
+		            static_cast<unsigned long long>(value));
 		const auto child_name = fmt::format("{}[{}]", name, i);
 		PrintAbortPointerCandidate(child_name.c_str(), value);
 	}
@@ -199,17 +208,21 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	const auto ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
 
-	LOGF("Guest abort diagnostics:\n"
-	     "\t return = 0x%016" PRIx64 "\n"
-	     "\t rbp    = 0x%016" PRIx64 "\n"
-	     "\t rsp    = 0x%016" PRIx64 "\n"
-	     "\t arg0   = 0x%016" PRIx64 "\n"
-	     "\t arg1   = 0x%016" PRIx64 "\n"
-	     "\t arg2   = 0x%016" PRIx64 "\n"
-	     "\t arg3   = 0x%016" PRIx64 "\n"
-	     "\t arg4   = 0x%016" PRIx64 "\n"
-	     "\t arg5   = 0x%016" PRIx64 "\n",
-	     ret, rbp, rsp, arg0, arg1, arg2, arg3, arg4, arg5);
+	std::printf("KYTY_DIAG abort-diag: Guest abort diagnostics:\n"
+	            "\t return = 0x%016llx\n"
+	            "\t rbp    = 0x%016llx\n"
+	            "\t rsp    = 0x%016llx\n"
+	            "\t arg0   = 0x%016llx\n"
+	            "\t arg1   = 0x%016llx\n"
+	            "\t arg2   = 0x%016llx\n"
+	            "\t arg3   = 0x%016llx\n"
+	            "\t arg4   = 0x%016llx\n"
+	            "\t arg5   = 0x%016llx\n",
+	            static_cast<unsigned long long>(ret), static_cast<unsigned long long>(rbp),
+	            static_cast<unsigned long long>(rsp), static_cast<unsigned long long>(arg0),
+	            static_cast<unsigned long long>(arg1), static_cast<unsigned long long>(arg2),
+	            static_cast<unsigned long long>(arg3), static_cast<unsigned long long>(arg4),
+	            static_cast<unsigned long long>(arg5));
 
 	PrintAbortPointerCandidate("arg0", arg0);
 	PrintAbortPointerCandidate("arg1", arg1);
@@ -229,7 +242,7 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 	}
 
 	if (rsp != 0) {
-		LOGF("Guest abort stack words:\n");
+		std::printf("KYTY_DIAG abort-diag: Guest abort stack words:\n");
 		auto* linker = Common::Singleton<Loader::RuntimeLinker>::Instance();
 		for (int i = 0; i < 16; i++) {
 			const auto addr = rsp + static_cast<uint64_t>(i) * sizeof(uint64_t);
@@ -240,14 +253,62 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 			auto*      program = linker->FindProgramByAddr(value);
 			if (program != nullptr) {
 				auto module_name = Common::PathToString(program->file_name.filename());
-				LOGF("\t [%02d] 0x%016" PRIx64 " %s+0x%016" PRIx64 "\n", i, value,
-				     module_name.c_str(), value - program->base_vaddr);
+				std::printf("KYTY_DIAG abort-diag:\t [%02d] 0x%016llx %s+0x%016llx\n", i,
+				            static_cast<unsigned long long>(value), module_name.c_str(),
+				            static_cast<unsigned long long>(value - program->base_vaddr));
 			} else {
-				LOGF("\t [%02d] 0x%016" PRIx64 "\n", i, value);
+				std::printf("KYTY_DIAG abort-diag:\t [%02d] 0x%016llx\n", i,
+				            static_cast<unsigned long long>(value));
 			}
 			PrintAbortPointerCandidate(fmt::format("stack[{:02d}]", i).c_str(), value);
 			PrintAbortPointerArrayCandidate(fmt::format("stack[{:02d}]", i).c_str(), value);
 		}
+		std::fflush(stdout);
+	}
+
+	// KYTY_DIAG: dump the decrypted guest image containing the abort return address so the
+	// failing code can be disassembled offline (offsets printed above are image-relative).
+	if (auto* linker = Common::Singleton<Loader::RuntimeLinker>::Instance(); linker != nullptr) {
+		auto*      program   = linker->FindProgramByAddr(ret);
+		const bool readable  = program != nullptr && Graphics::HostMemoryIsReadable(program->base_vaddr);
+		std::printf("KYTY_DIAG abort-diag: image dump: program=%p base=0x%016llx size=0x%llx "
+		            "readable=%d\n",
+		            static_cast<const void*>(program),
+		            static_cast<unsigned long long>(program != nullptr ? program->base_vaddr : 0),
+		            static_cast<unsigned long long>(program != nullptr ? program->base_size : 0),
+		            readable ? 1 : 0);
+		if (program != nullptr && program->import_symbols != nullptr) {
+			program->import_symbols->DbgDump("_work", "eboot_imports.txt");
+			std::printf("KYTY_DIAG abort-diag: dumped import symbols to _work\\eboot_imports.txt\n");
+		}
+		if (program != nullptr && program->base_size != 0 && readable) {
+			const auto file_base = program->file_name.filename().string();
+			const auto dump_name =
+			    fmt::format("_work\\{}_{:x}.dump.bin", file_base.c_str(), program->base_vaddr);
+			if (FILE* f = std::fopen(dump_name.c_str(), "wb"); f != nullptr) {
+				constexpr uint64_t CHUNK = 0x1000;
+				uint8_t              zeros[CHUNK] {};
+				for (uint64_t off = 0; off < program->base_size; off += CHUNK) {
+					const auto addr = program->base_vaddr + off;
+					const auto bytes =
+					    (off + CHUNK <= program->base_size ? CHUNK : program->base_size - off);
+					if (Graphics::HostMemoryIsReadable(addr)) {
+						std::fwrite(reinterpret_cast<const void*>(static_cast<uintptr_t>(addr)), 1,
+						            bytes, f);
+					} else {
+						std::fwrite(zeros, 1, bytes, f);
+					}
+				}
+				std::fclose(f);
+				std::printf("KYTY_DIAG abort-diag: dumped guest image to %s (%llu bytes)\n",
+				            dump_name.c_str(),
+				            static_cast<unsigned long long>(program->base_size));
+			} else {
+				std::printf("KYTY_DIAG abort-diag: image dump fopen failed for %s\n",
+				            dump_name.c_str());
+			}
+		}
+		std::fflush(stdout);
 	}
 
 	EXIT("Guest abort()\n");

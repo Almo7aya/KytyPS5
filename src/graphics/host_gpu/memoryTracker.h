@@ -2,11 +2,13 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/waitWatch.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -43,7 +45,7 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
-		CheckNotInUploadCallback();
+		CheckNotInUploadCallback(this, vaddr);
 		std::lock_guard access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		std::vector<RegionManager*> managers;
@@ -95,7 +97,7 @@ public:
 	                        UploadFunc&& upload_func) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
-		CheckNotInUploadCallback();
+		CheckNotInUploadCallback(this, vaddr);
 		std::unique_lock access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
@@ -125,9 +127,25 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	// Nested page-fault passthrough (see BeginCpuFault): the region+page a fault was allowed
+	// through without touching region state, so the matching CompleteCpuFault can succeed.
+	inline static thread_local const RegionManager* s_nested_fault_manager = nullptr;
+	inline static thread_local uint64_t           s_nested_fault_vaddr   = 0;
+	inline static thread_local uint64_t           s_nested_fault_size    = 0;
 
-	static void CheckNotInUploadCallback() noexcept {
+	static void CheckNotInUploadCallback(const MemoryTracker* self, uint64_t vaddr = 0) noexcept {
 		if (s_upload_owner != nullptr) {
+			// KYTY_DIAG: characterize the re-entry before dying (same-instance re-entry can
+			// deadlock on a held region spinlock, cross-instance is a false positive).
+			const auto& w = Kyty::WaitWatch::Self();
+			std::printf("KYTY_DIAG tracker re-entry: self=%p owner=%p same=%d vaddr=0x%llx "
+			            "thread=%s state=%s arg0=0x%llx\n",
+			            static_cast<const void*>(self), static_cast<const void*>(s_upload_owner),
+			            s_upload_owner == self ? 1 : 0, static_cast<unsigned long long>(vaddr),
+			            w.name.load(std::memory_order_relaxed),
+			            w.kind.load(std::memory_order_relaxed),
+			            static_cast<unsigned long long>(w.arg0.load(std::memory_order_relaxed)));
+			std::fflush(stdout);
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}

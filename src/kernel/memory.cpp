@@ -3423,9 +3423,30 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 // an explicit map. Mirror the map path's commit-over-reserved sequence (ConsumeReserved + placeholder
 // commit) for the 64KB allocation-granularity block containing the fault, so the write succeeds and
 // the block becomes real, tracked, committed memory.
+static std::mutex                                g_commit_on_fault_mutex;
+static std::vector<std::pair<uint64_t, uint64_t>> g_commit_on_fault_blocks;
+
+// KYTY_DIAG: records each on-demand committed block so the guest-abort diagnostics can test whether
+// a suspicious (zeroed) pointer target was produced by this zero-filling path.
+static void CommitOnFaultRecord(uint64_t block, uint64_t size) {
+	std::lock_guard lock(g_commit_on_fault_mutex);
+	g_commit_on_fault_blocks.emplace_back(block, size);
+}
+
+bool KernelWasCommittedOnFault(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(g_commit_on_fault_mutex);
+	for (const auto& [block, block_size]: g_commit_on_fault_blocks) {
+		if (vaddr >= block && size <= block_size && vaddr - block <= block_size - size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void CommitOnFaultLog(uint64_t block, uint64_t size, const char* tag) {
 	static std::atomic<uint64_t> commit_on_fault_count {0};
 	const uint64_t               n = commit_on_fault_count.fetch_add(1) + 1;
+	CommitOnFaultRecord(block, size);
 	if ((n & (n - 1)) == 0) { // log at powers of two to avoid spam
 		std::printf("KYTY_DIAG commit-on-fault #%llu block=0x%016llx size=0x%llx %s\n",
 		            static_cast<unsigned long long>(n), static_cast<unsigned long long>(block),

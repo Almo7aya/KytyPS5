@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 
+#include "common/waitWatch.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <array>
@@ -598,58 +599,65 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 	}
 	auto& page   = m_impl->GetPage(*region, fault_vaddr);
 	bool  waited = false;
-	while (true) {
-		SpinGuard lock(page.lock);
-		if (access == PageFaultAccess::Read && page.late_read_pending &&
-		    Impl::AllowsAccess(fault_vaddr, access)) {
-			page.late_read_pending = false;
-			return true;
-		}
-		if (access == PageFaultAccess::Write && page.late_write_pending &&
-		    Impl::AllowsAccess(fault_vaddr, access)) {
-			page.late_write_pending = false;
-			return true;
-		}
-		if (page.resolving) {
-			if (page.backing_writer == CurrentThread()) {
-				FailFast("backing writer faulted on its own reserved page");
+	{
+		Kyty::WaitWatch::Scope w("pm_spin", fault_vaddr, static_cast<uint64_t>(access)); // KYTY_DIAG
+		while (true) {
+			SpinGuard lock(page.lock);
+			if (access == PageFaultAccess::Read && page.late_read_pending &&
+			    Impl::AllowsAccess(fault_vaddr, access)) {
+				page.late_read_pending = false;
+				return true;
 			}
-			if ((!page.resolving_read_write && access != PageFaultAccess::Write) ||
-			    (page.resolving_read_write && access != PageFaultAccess::Read &&
-			     access != PageFaultAccess::Write)) {
-				FailFast("fault access is incompatible with the active resolver");
+			if (access == PageFaultAccess::Write && page.late_write_pending &&
+			    Impl::AllowsAccess(fault_vaddr, access)) {
+				page.late_write_pending = false;
+				return true;
 			}
-			waited = true;
-			continue;
-		}
-		if (page.write_watchers == 0 && page.access_watchers == 0) {
-			if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
-				return false;
+			if (page.resolving) {
+				if (page.backing_writer == CurrentThread()) {
+					FailFast("backing writer faulted on its own reserved page");
+				}
+				if ((!page.resolving_read_write && access != PageFaultAccess::Write) ||
+				    (page.resolving_read_write && access != PageFaultAccess::Read &&
+				     access != PageFaultAccess::Write)) {
+					FailFast("fault access is incompatible with the active resolver");
+				}
+				waited = true;
+				continue;
 			}
-			bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
-			                                                      : page.late_write_pending);
-			const bool allowed = Impl::AllowsAccess(fault_vaddr, access);
-			pending            = false;
-			if (waited && !allowed) {
-				FailFast("page remained inaccessible after waiting for its resolver");
+			if (page.write_watchers == 0 && page.access_watchers == 0) {
+				if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
+					return false;
+				}
+				bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
+				                                                      : page.late_write_pending);
+				const bool allowed = Impl::AllowsAccess(fault_vaddr, access);
+				pending            = false;
+				if (waited && !allowed) {
+					FailFast("page remained inaccessible after waiting for its resolver");
+				}
+				// More than one CPU can fault before a protection transition becomes visible. The first
+				// delayed fault consumes the hint bit; later faults must also resume once the mapped
+				// page already permits the requested access. A genuinely read-only/no-access page still
+				// falls through to the guest exception path.
+				return allowed;
 			}
-			// More than one CPU can fault before a protection transition becomes visible. The first
-			// delayed fault consumes the hint bit; later faults must also resume once the mapped
-			// page already permits the requested access. A genuinely read-only/no-access page still
-			// falls through to the guest exception path.
-			return allowed;
+			if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
+			    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
+				FailFast("fault access is incompatible with active page watchers");
+			}
+			page.resolving            = true;
+			page.resolving_read_write = page.access_watchers != 0;
+			break;
 		}
-		if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
-		    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
-			FailFast("fault access is incompatible with active page watchers");
-		}
-		page.resolving            = true;
-		page.resolving_read_write = page.access_watchers != 0;
-		break;
 	}
 	g_in_fault_resolution = true;
-	const bool handled    = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
-	                                              PageFaultPhase::Invalidate);
+	bool handled = false;
+	{
+		Kyty::WaitWatch::Scope w("pm_handler_inv", fault_vaddr, 0); // KYTY_DIAG
+		handled = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
+		                                PageFaultPhase::Invalidate);
+	}
 	g_in_fault_resolution = false;
 	{
 		SpinGuard lock(page.lock);
@@ -658,8 +666,12 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 		}
 	}
 	g_in_fault_resolution = true;
-	const bool completed  = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
-	                                              PageFaultPhase::Complete);
+	bool completed = false;
+	{
+		Kyty::WaitWatch::Scope w("pm_handler_comp", fault_vaddr, 0); // KYTY_DIAG
+		completed = m_impl->fault_handler(m_impl->fault_context, access, fault_vaddr, 1,
+		                                  PageFaultPhase::Complete);
+	}
 	g_in_fault_resolution = false;
 	{
 		SpinGuard lock(page.lock);

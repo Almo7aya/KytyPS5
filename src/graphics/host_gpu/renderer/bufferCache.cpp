@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/waitWatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/objects/label.h"
@@ -542,9 +543,14 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 	}
 	switch (phase) {
 		case PageFaultPhase::Invalidate: break;
-		case PageFaultPhase::Complete:
-			return m_readback->Complete(access, vaddr, size) ||
-			       m_memory_tracker.CompleteCpuFault(vaddr, size, access, false);
+		case PageFaultPhase::Complete: {
+			bool rb_complete = false;
+			{
+				Kyty::WaitWatch::Scope w("gpu_rbcomp", vaddr, 0); // KYTY_DIAG
+				rb_complete = m_readback->Complete(access, vaddr, size);
+			}
+			return rb_complete || m_memory_tracker.CompleteCpuFault(vaddr, size, access, false);
+		}
 		case PageFaultPhase::Release: m_readback->Release(access, vaddr, size); return true;
 		default:
 			EXIT("BufferCache: unsupported page-fault phase %u\n", static_cast<uint32_t>(phase));
@@ -556,7 +562,10 @@ bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint6
 	if (GraphicsRunIsCommandProcessorThread()) {
 		GraphicsRunFinishScheduler();
 	}
-	m_readback->Request(access, vaddr, size);
+	{
+		Kyty::WaitWatch::Scope w("gpu_rbreq", vaddr, 0); // KYTY_DIAG
+		m_readback->Request(access, vaddr, size);
+	}
 	return true;
 }
 

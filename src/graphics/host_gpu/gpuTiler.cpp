@@ -479,7 +479,10 @@ void TileCompute::Execute(bool to_tiled, const void* input, void* output, uint64
 	}
 	command.End();
 	command.Execute();
-	command.WaitForFence();
+	{
+		Kyty::WaitWatch::Scope w("gpu_tile_fence", 0, 0); // KYTY_DIAG
+		command.WaitForFence();
+	}
 	if (output != nullptr) {
 		std::memcpy(output, resources.mapped,
 		            static_cast<size_t>(to_tiled ? tiled_capacity : linear_capacity));
@@ -510,6 +513,7 @@ void TileCompute::Release() {
 
 void GpuDetile(const void* tiled, void* linear, uint64_t tiled_capacity, uint64_t linear_capacity,
                std::span<const GpuTileInfo> infos, const GpuTileRecord& after) {
+	Kyty::WaitWatch::Scope w("gpu_detile_lock", 0, 0); // KYTY_DIAG
 	Common::LockGuard lock(g_tiler_mutex);
 	if (!g_tiler) {
 		g_tiler = std::make_unique<TileCompute>(GetRenderContext().GetGraphics());
@@ -519,6 +523,7 @@ void GpuDetile(const void* tiled, void* linear, uint64_t tiled_capacity, uint64_
 
 void GpuTile(const void* linear, void* tiled, uint64_t tiled_capacity, uint64_t linear_capacity,
              std::span<const GpuTileInfo> infos, const GpuTileRecord& before) {
+	Kyty::WaitWatch::Scope w("gpu_tile_lock", 0, 0); // KYTY_DIAG
 	Common::LockGuard lock(g_tiler_mutex);
 	if (!g_tiler) {
 		g_tiler = std::make_unique<TileCompute>(GetRenderContext().GetGraphics());
