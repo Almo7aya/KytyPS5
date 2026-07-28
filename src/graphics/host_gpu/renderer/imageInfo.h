@@ -1400,6 +1400,18 @@ ClassifyRenderTargetOverlap(const RenderTargetInfo& cached, bool cached_gpu_modi
 			return RenderTargetOverlap::MaterializeRetireTarget;
 		}
 	}
+	// Same-footprint, different-layout render-target reinterpretation (format/pitch/bpe/tiling all
+	// change while the base+size stay put) over a still-GPU-modified, page-isolated target with no
+	// pending buffer copy: this is allocation-pool reuse the guest is about to render over.
+	// MaterializeRetireTarget downloads the old color to guest memory (transient preservation) and
+	// creates the NEW target fresh -- it never uploads the old bytes back into the new shape, so the
+	// layout change never round-trips through one image and cannot scramble. The new render then
+	// overwrites the region. (GTA III level-load rebinds a target as a 2x2/quarter-bpe view.)
+	if (page_isolated && pool_storage_shape_changed && cached.address == requested.address &&
+	    cached.size == requested.size && cached_gpu_modified && tracker_gpu_modified &&
+	    !cached_buffer_modified) {
+		return RenderTargetOverlap::MaterializeRetireTarget;
+	}
 	return RenderTargetOverlap::Unsupported;
 }
 
