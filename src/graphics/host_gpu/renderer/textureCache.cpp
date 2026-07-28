@@ -1345,14 +1345,20 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 			case StorageImageOverlap::RetireSampled: retire.push_back(cached); continue;
 			case StorageImageOverlap::RetireImage:
 				if (cached->kind == CachedImage::Kind::RenderTarget ||
-				    cached->kind == CachedImage::Kind::StorageTexture) {
+				    cached->kind == CachedImage::Kind::StorageTexture ||
+				    cached->kind == CachedImage::Kind::DepthTarget) {
 					retire.push_back(cached);
 					continue;
 				}
 				break;
 			case StorageImageOverlap::MaterializeImage:
+				// A GPU-owned depth target overlapped by a storage image is read back to guest
+				// backing (DownloadDepthTarget below) and retired, the same as a render/storage
+				// target; the storage then reads the canonical guest bytes reinterpreted through its
+				// own format. (GTA III level-load binds a storage image over a live depth target.)
 				if ((cached->kind == CachedImage::Kind::RenderTarget ||
-				     cached->kind == CachedImage::Kind::StorageTexture) &&
+				     cached->kind == CachedImage::Kind::StorageTexture ||
+				     cached->kind == CachedImage::Kind::DepthTarget) &&
 				    !cpu_dirty) {
 					retire.push_back(cached);
 					materialize.push_back(cached);
@@ -1382,7 +1388,9 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " kind=%u\n",
 				     cached->Address(), cached->Size(), static_cast<uint32_t>(cached->kind));
 			}
-			const auto transfer = m_readback->DownloadColorImage(*cached);
+			const auto transfer = cached->kind == CachedImage::Kind::DepthTarget
+			                          ? m_readback->DownloadDepthTarget(*cached, false)
+			                          : m_readback->DownloadColorImage(*cached);
 			for (const auto& range: transfer.Ranges()) {
 				m_memory_tracker.ForEachDownloadRange<true>(range.address, range.size,
 				                                            [](uint64_t, uint64_t) noexcept {});
@@ -1394,6 +1402,9 @@ void TextureCache::ResolveStorageImageOverlaps(const ImageInfo& requested) {
 		// so the old Vulkan shape retires through the clean path.
 		cached->buffer_modified = false;
 	}
+	// A retired depth target may own htile metadata pages; release them (mirrors the sampled/depth
+	// alias retirement) before the images leave the cache.
+	RetireDepthMetadataLocked(retire);
 	RetireImages(retire);
 }
 
