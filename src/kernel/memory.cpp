@@ -3834,6 +3834,17 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 		}
 
 		if (result != OK) {
+			// KYTY_DIAG: GTA III level-load aborts with UE4 "sceKernelBatchMap failed 0x8002000c"
+			// (ENOMEM). Characterize the exact failing entry so the mapping path can be fixed.
+			std::printf("KYTY_DIAG batchmap-fail entry[%d/%d] op=%d start=%p offset=0x%016llx "
+			            "length=0x%016llx prot=0x%02x type=0x%02x flags=0x%x -> result=0x%08x\n",
+			            i, num_entries, entry->operation, static_cast<void*>(entry->start),
+			            static_cast<unsigned long long>(entry->offset),
+			            static_cast<unsigned long long>(entry->length),
+			            static_cast<uint32_t>(static_cast<unsigned char>(entry->protection)),
+			            static_cast<uint32_t>(static_cast<unsigned char>(entry->type)),
+			            static_cast<uint32_t>(flags), static_cast<uint32_t>(result));
+			std::fflush(stdout);
 			if (num_entries_out != nullptr) {
 				*num_entries_out = processed;
 			}

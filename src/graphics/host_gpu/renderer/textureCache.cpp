@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/textureCache.h"
 
+#include <intrin.h> // KYTY_DIAG: _ReturnAddress
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -930,8 +932,12 @@ void TextureCache::RetireImages(const std::vector<CachedImage*>& retire,
 		    (storage && ((*it)->buffer_modified || (*it)->info.IsCpuDirty())) ||
 		    (target && (*it)->buffer_modified)) {
 			EXIT("TextureCache: invalid image retirement, kind=%u gpu_modified=%d "
-			     "buffer_modified=%d\n",
-			     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified, (*it)->buffer_modified);
+			     "buffer_modified=%d cpu_dirty=%d addr=0x%016" PRIx64 "+0x%016" PRIx64
+			     " caller=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>((*it)->kind), (*it)->gpu_modified, (*it)->buffer_modified,
+			     (*it)->kind == CachedImage::Kind::StorageTexture && (*it)->info.IsCpuDirty(),
+			     (*it)->Address(), (*it)->Size(),
+			     static_cast<uint64_t>(reinterpret_cast<uintptr_t>(_ReturnAddress())));
 		}
 		for (uint32_t range = 0; range < (*it)->RangeCount(); range++) {
 			if (target && !native_image &&
@@ -1289,6 +1295,23 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 		Transfer::WaitForQueueIdle();
 	}
 	for (auto* cached: retire) {
+		// buffer_current_depth (see the supported classifier above): a plain depth target whose
+		// current bytes live in a native buffer. Publish that buffer into guest backing so the
+		// retirement leaves coherent guest memory (the sampled image reloads from backing), then
+		// clear buffer_modified so RetireImages' clean-target invariant holds.
+		if (cached->kind == CachedImage::Kind::DepthTarget && cached->buffer_modified &&
+		    !cached->gpu_modified) {
+			if (m_buffer_cache.HasPageOverlap(cached->depth.address, cached->depth.size)) {
+				m_buffer_cache.PublishImageBacking(cached->depth.address, cached->depth.size);
+			}
+			if (cached->depth.stencil_address != 0 &&
+			    m_buffer_cache.HasPageOverlap(cached->depth.stencil_address,
+			                                  cached->depth.stencil_size)) {
+				m_buffer_cache.PublishImageBacking(cached->depth.stencil_address,
+				                                   cached->depth.stencil_size);
+			}
+			cached->buffer_modified = false;
+		}
 		if (!cached->gpu_modified) {
 			continue;
 		}
