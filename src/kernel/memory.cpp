@@ -2921,6 +2921,14 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	     Common::EnumName(gpu_mode).c_str(), shared_backing ? "yes" : "no", shared_reason);
 
 	if (out_addr == 0) {
+		// KYTY_DIAG: GTA III level-load batch-maps direct memory with start==0 (kernel-chosen
+		// placement) and intermittently fails here. Report the backing failure reason + inputs.
+		std::printf("KYTY_DIAG mapdirect-outaddr0 in_addr=0x%016llx len=0x%016llx dmem=0x%016llx "
+		            "fixed=%d consumed_reserved=%d reason=%s\n",
+		            static_cast<unsigned long long>(in_addr), static_cast<unsigned long long>(len),
+		            static_cast<unsigned long long>(direct_memory_start), fixed ? 1 : 0,
+		            consumed_reserved ? 1 : 0, shared_reason);
+		std::fflush(stdout);
 		if (consumed_reserved) {
 			g_virtual_ranges->Add(in_addr, len, 0, 0, 0, VirtualRangeType::Reserved,
 			                      consumed_range.name, false, consumed_range.placeholder_backed);
