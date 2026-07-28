@@ -1737,7 +1737,9 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 	}
 
 	std::shared_ptr<CachedImage> match;
-	for (auto& cached: m_images) {
+	// EqualStorageBacking requires cached.address == info.address, so use the address index instead
+	// of scanning all m_images.
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, true)) {
 		if (cached->kind != CachedImage::Kind::StorageTexture ||
 		    !EqualStorageBacking(info, cached->info)) {
 			continue;
@@ -1747,7 +1749,7 @@ StorageTextureVulkanImage& TextureCache::FindStorageTexture(CommandBuffer&   com
 			     " size=0x%016" PRIx64 " duplicate=%d cpu_dirty=%d\n",
 			     info.address, info.size, match != nullptr, cached->info.IsCpuDirty());
 		}
-		match = cached;
+		match = cached->shared_from_this();
 	}
 	if (match != nullptr) {
 		const bool cpu_modified = m_memory_tracker.IsRegionCpuModified(info.address, info.size);
@@ -1916,13 +1918,16 @@ RenderTextureVulkanImage& TextureCache::FindRenderTarget(CommandBuffer&         
 	}
 	FaultSafeTextureLock         lock(this, m_lock);
 	std::shared_ptr<CachedImage> match;
-	for (auto& cached: m_images) {
+	// All match predicates (Equal / IsCompatibleRenderTargetView / ...Backing) require
+	// cached.address == info.address, so any match overlaps [info.address, info.size). Use the
+	// address index instead of scanning all m_images (draw_prepare hot path).
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, true)) {
 		if (cached->kind != CachedImage::Kind::RenderTarget ||
 		    (!Equal(info, cached->target) && !IsCompatibleRenderTargetView(cached->target, info) &&
 		     !IsCompatibleRenderTargetBacking(cached->target, info))) {
 			continue;
 		}
-		match = cached;
+		match = cached->shared_from_this();
 	}
 	if (match != nullptr) {
 		ResolveImageMetadataOverlapsLocked(info.address, info.size);
@@ -2281,12 +2286,14 @@ DepthStencilVulkanImage& TextureCache::FindDepthTarget(CommandBuffer&         co
 		ResolveImageMetadataOverlapsLocked(info.stencil_address, info.stencil_size);
 	}
 	std::shared_ptr<CachedImage> match;
-	for (auto& cached: m_images) {
+	// Equal / IsCompatibleDepthTargetBacking both require cached.address == info.address, so use the
+	// address index instead of scanning all m_images (draw_prepare hot path).
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, true)) {
 		if (cached->kind != CachedImage::Kind::DepthTarget ||
 		    (!Equal(info, cached->depth) && !IsCompatibleDepthTargetBacking(cached->depth, info))) {
 			continue;
 		}
-		match = cached;
+		match = cached->shared_from_this();
 	}
 	if (match != nullptr) {
 		if (match->stencil_detached) {
