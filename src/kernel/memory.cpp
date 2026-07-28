@@ -3841,11 +3841,18 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			break;
 		}
 
+		// A map entry with start==0 requests kernel-chosen placement (NULL address hint). The batch
+		// forces MAP_FIXED, which cannot honor address 0 and would fail with ENOMEM, so drop it for
+		// those entries; the mapping call writes the chosen address back into entry->start. Entries
+		// with an explicit address keep MAP_FIXED. (GTA III level-load batch-maps such entries.)
+		constexpr int MAP_FIXED_FLAG = 0x10;
+		const int     map_flags = entry->start == nullptr ? (flags & ~MAP_FIXED_FLAG) : flags;
+
 		int result = OK;
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
 				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
-				                                    flags, static_cast<int64_t>(entry->offset), 0,
+				                                    map_flags, static_cast<int64_t>(entry->offset), 0,
 				                                    "anon");
 				break;
 			case MAP_OP_UNMAP:
@@ -3856,7 +3863,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 				break;
 			case MAP_OP_MAP_FLEXIBLE:
 				result = KernelMapNamedFlexibleMemory(&entry->start, entry->length,
-				                                      entry->protection, flags, "anon");
+				                                      entry->protection, map_flags, "anon");
 				break;
 			case MAP_OP_TYPE_PROTECT:
 				result =

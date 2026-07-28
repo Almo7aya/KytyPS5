@@ -1616,6 +1616,16 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 	}
 	if (!storage_discard.empty()) {
 		for (auto* cached: storage_discard) {
+			// A buffer-owned storage image (ClassifyStorageSampledOverlap now discards these):
+			// publish its native buffer into guest backing so the discard leaves coherent guest
+			// memory, then release buffer ownership. The persistent native buffer still backs any
+			// remainder outside the sampled range on a later obtain. Matches the depth retire path.
+			if (cached->buffer_modified) {
+				if (m_buffer_cache.HasPageOverlap(cached->info.address, cached->info.size)) {
+					m_buffer_cache.PublishImageBacking(cached->info.address, cached->info.size);
+				}
+				cached->buffer_modified = false;
+			}
 			if (cached->gpu_modified || cached->buffer_modified ||
 			    m_memory_tracker.IsRegionGpuModified(cached->info.address, cached->info.size)) {
 				EXIT("TextureCache: stale sampled storage owner regained GPU ownership, "
