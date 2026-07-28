@@ -81,6 +81,14 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	// KYTY_DIAG: pack the page-state bits for the page containing vaddr (bit0 gpu_dirty,
+	// bit1 cpu_dirty, bit2 writable, bit3 fault_pending, bit4 tracked). Diagnostic only.
+	[[nodiscard]] uint32_t DiagPageBits(uint64_t vaddr) const {
+		const auto page = static_cast<size_t>((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
+		return (m_gpu_dirty.test(page) ? 1u : 0u) | (m_cpu_dirty.test(page) ? 2u : 0u) |
+		       (m_writable.test(page) ? 4u : 0u) | (m_fault_pending.test(page) ? 8u : 0u) |
+		       (m_tracked.test(page) ? 16u : 0u);
+	}
 	void                   Track(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		for (auto page = start; page < end; page++) {

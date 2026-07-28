@@ -45,6 +45,9 @@ public:
 	                                    PageFaultPhase phase) noexcept;
 	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
 	                                             uint64_t size, PageFaultPhase phase) noexcept;
+	// KYTY_DIAG: true when the current thread is inside a ForEachUploadRange callback (any tracker
+	// instance). A readback triggered here re-enters m_access_mutex and aborts; used to localize it.
+	[[nodiscard]] static bool InUploadCallback() noexcept { return s_upload_owner != nullptr; }
 
 	template <bool clear, typename Preflight, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
@@ -111,7 +114,10 @@ public:
 		std::unique_lock access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
-		s_upload_owner = this;
+		// Save/restore rather than clear so a nested upload on a DIFFERENT tracker instance (allowed
+		// by CheckNotInUploadCallback) restores the outer instance's marker instead of losing it.
+		const MemoryTracker* prev_upload_owner = s_upload_owner;
+		s_upload_owner                         = this;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->Track(manager->GetCpuAddr() + offset, bytes);
@@ -131,7 +137,7 @@ public:
 				    manager->lock.unlock();
 			    });
 		}
-		s_upload_owner = nullptr;
+		s_upload_owner = prev_upload_owner;
 	}
 
 private:
@@ -147,9 +153,12 @@ private:
 	inline static thread_local uint64_t           s_nested_fault_size    = 0;
 
 	static void CheckNotInUploadCallback(const MemoryTracker* self, uint64_t vaddr = 0) noexcept {
-		if (s_upload_owner != nullptr) {
-			// KYTY_DIAG: characterize the re-entry before dying (same-instance re-entry can
-			// deadlock on a held region spinlock, cross-instance is a false positive).
+		// Only a re-entry into the SAME tracker instance can deadlock: m_access_mutex and the region
+		// spinlocks are per-instance, so an operation on a different tracker while this thread is
+		// inside another tracker's upload callback is safe (a level-load fault on texture memory that
+		// happens while the buffer cache is mid-upload, and vice versa). Aborting those was a false
+		// positive; only the same-instance case is a real hazard.
+		if (s_upload_owner == self) {
 			const auto& w = Kyty::WaitWatch::Self();
 			std::printf("KYTY_DIAG tracker re-entry: self=%p owner=%p same=%d vaddr=0x%llx "
 			            "thread=%s state=%s arg0=0x%llx upload_ra=0x%llx upload=0x%llx+0x%llx\n",

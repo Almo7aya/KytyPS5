@@ -432,6 +432,21 @@ struct TextureCache::ImageReadback {
 			     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
 		}
 
+		if (MemoryTracker::InUploadCallback()) {
+			// KYTY_DIAG: this readback is running inside a tracker upload callback -> the follow-up
+			// IsRegionGpuModified/ForEachDownloadRange will re-enter and abort. Identify the image
+			// whose GPU page-watch faulted while ObtainBufferForImage read guest memory it thought
+			// was clean, so the flag/dirty-bit source can be fixed.
+			std::printf("KYTY_DIAG readback-in-upload fault=0x%016llx size=0x%llx kind=%u "
+			            "image_addr=0x%016llx image_size=0x%llx gpu=%d buffer=%d\n",
+			            static_cast<unsigned long long>(vaddr),
+			            static_cast<unsigned long long>(size),
+			            static_cast<uint32_t>(selected->kind),
+			            static_cast<unsigned long long>(selected->Address()),
+			            static_cast<unsigned long long>(selected->Size()), selected->gpu_modified,
+			            selected->buffer_modified);
+			std::fflush(stdout);
+		}
 		Kyty::WaitWatch::DrainStats::readback_count.fetch_add(1, std::memory_order_relaxed); // KYTY_DIAG
 		transfer = depth_target ? DownloadDepthTarget(*selected)
 		                        : DownloadColorImage(*selected, false);
@@ -4352,6 +4367,20 @@ bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint
 				MarkSampledAliasesCpuDirtyLocked(vaddr, size);
 			}
 			needs_readback = FindGpuReadbackPageCandidateLocked(vaddr, size) != nullptr;
+			// A READ fault that occurs while this thread is inside a memory-tracker upload callback
+			// is the tracker's own upload reading guest memory it has already made coherent (an
+			// upload only runs on a tracker-clean region -- ObtainBufferForImage verifies this before
+			// uploading). A live gpu_modified image can still hold a page read-watch over that region
+			// (its tracker dirty bit was cleared without dropping the watch), so the candidate lookup
+			// reports a readback; performing it here would re-enter the tracker (m_access_mutex, held
+			// by the outer upload) and abort. The guest backing is already current, so the read is
+			// legitimate: skip the readback and resolve through the clean-page path, mirroring the
+			// "reads of guest backing are always legitimate" rule in PageManager::HandleFault. A write
+			// fault is never coherent this way and still takes the readback path.
+			if (needs_readback && access == PageFaultAccess::Read &&
+			    MemoryTracker::InUploadCallback()) {
+				needs_readback = false;
+			}
 			if (!needs_readback) {
 				action = m_memory_tracker.BeginCpuFault(vaddr, size, access);
 			}
