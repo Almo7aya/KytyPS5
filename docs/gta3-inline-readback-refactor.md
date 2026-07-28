@@ -412,3 +412,18 @@ The DRAIN work (§10) was a dead end for fps because it targeted the wrong thing
 **New bottleneck / next fps front:** the worker is now often idle (guest-submission bound). Its remaining active time is `draw_prepare` (~30 %) — dominated by **`mt_ul` (buffer/texture uploads)** — and `gpu_pm4` (~25 %). Likely next levers: (a) avoid redundant re-uploads (dynamic buffers/textures re-uploaded per draw), (b) the readback worker-park still stalls the worker on the ~40 % of faults that download (see §10). But much of the remaining cost is now genuine guest CPU work under emulation.
 
 **Lesson for the next agent:** when the worker looks "busy", sample its live scope before optimizing — the DRAIN/pause numbers hid a pure-CPU O(N²) texture-lookup problem that had nothing to do with the readback/drain machinery.
+
+---
+
+## 12. Session 3 part 4 (2026-07-28): dual-ownership coherency fix — tracker re-entry ELIMINATED
+
+The consistent streaming crash (`memoryTracker.h:155`, "re-entered from upload callback") was the image∩buffer dual-ownership knot. Root cause pinned exactly: `BufferCache::ObtainBuffer`'s **merge path** (taken when no single cached buffer contains the request) re-uploads *every overlapping cached buffer's whole range* from guest memory, but only `[vaddr,size]` was materialized first. The merged span reaches past that into pages an access-watched GPU render/depth target still owns; the worker's read faults *inside* `ForEachUploadRange` (holding the tracker's `m_access_mutex`) → the inline texture readback's `IsRegionCpuModified` deadlock-guards → EXIT.
+
+**Fix (committed `bb4e059`):** before the cache lock, replicate the merge-range computation under a short probe lock, then `PrepareGpuBufferRead` / `InvalidateMemoryFromGPU` the **full merged span** so no GPU-dirty image remains in it before the upload reads guest memory. `m_buffers` is stable under `m_resource_mutex` and unmutated by materialization (`PublishImageBacking` only marks tracker state), so one pass converges. **Result: `memoryTracker.h:155` went from 3/3 → 0/5 runs.**
+
+**Current crash distribution (post-fix, streaming, frame ~300-350, still ~15fps intro / 3-4fps stream):**
+- **`textureCache.cpp:1253` "unsupported sampled/depth-target alias" (~3/5)** — the game samples a texture that *contains* a GPU-dirty depth target with a size mismatch (e.g. sampled `0x1950000` ⊃ depth `0x1800000`, same base). `native_transition` needs `contained && (exact_range || sampled_expansion)`; this is contained but neither exact nor a recognized expansion. Arguably a *correct* EXIT — the sampled bytes beyond the depth target are undefined, so relaxing it risks wrong output. Real fix = implement the containing-depth-sample transition (read back the depth into the larger sampled allocation). Risky feature work.
+- **`libC.cpp:314` guest `abort()` at `eboot+0x1837ad3` (~1/5)** — the pre-existing §8.2 abort (70 KB memcpy from a BSS struct of pointers to zeroed buffers). Not caused by any of this session's work (same guest address as prior sessions). Deep guest-behaviour investigation.
+- **`textureCache.cpp:2083` (~1/5)** — another texture-alias limitation.
+
+The remaining tail is emulator **feature-completeness** for GTA III's specific aliasing patterns (sampled↔depth/render-target aliases) plus the pre-existing guest abort — each an "unsupported X" guard that EXITs rather than render wrong, so relaxing any needs careful per-case correctness work, not a blanket change.
