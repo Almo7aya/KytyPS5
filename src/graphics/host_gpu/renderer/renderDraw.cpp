@@ -872,6 +872,7 @@ static void ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer& buffer,
                                 const DrawIndexBufferSource& index_source, bool log_pipeline_phase,
                                 bool set_bind_debug, bool set_auto_debug) {
 	EXIT_IF(draw.name == nullptr);
+	Kyty::WaitWatch::DrainStats::draw_count.fetch_add(1, std::memory_order_relaxed); // KYTY_DIAG
 	auto& ucfg = buffer.GetUserConfig();
 
 	for (;;) {

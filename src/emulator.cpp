@@ -28,7 +28,11 @@
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <string>
+#include <vector>
 #include <cstdlib>
 #include <filesystem>
 
@@ -173,9 +177,31 @@ static void WatchdogRun(void* /*unused*/) {
 	int      save_tick      = 0;
 	namespace DS            = Kyty::WaitWatch::DrainStats;
 	uint64_t p_pause = 0, p_pause_ns = 0, p_wait_ns = 0, p_bw = 0, p_bw_ns = 0, p_ld_ns = 0,
-	         p_incde = 0, p_fault = 0, p_cpf = 0, p_sub = 0, p_rb = 0, p_ftot = 0, p_funi = 0;
+	         p_incde = 0, p_fault = 0, p_cpf = 0, p_sub = 0, p_rb = 0, p_ftot = 0, p_funi = 0,
+	         p_draws = 0, p_disp = 0, p_ftx = 0;
 	for (;;) {
-		Common::Thread::Sleep(1000);
+		// KYTY_DIAG: sample the GPU worker's live scope at ~5ms granularity across the 1s window and
+		// tally it, so the DRAIN line shows WHERE the worker's wall-clock actually goes (park latency
+		// is dominated by whatever the worker is doing between pause requests).
+		std::map<const char*, int> worker_hist;
+		int                        worker_samples = 0;
+		for (int s = 0; s < 200; s++) {
+			Common::Thread::Sleep(5);
+			const char* k = Kyty::WaitWatch::ScopeKindByName("GpuWorker");
+			worker_hist[k != nullptr ? k : "?"]++;
+			worker_samples++;
+		}
+		std::string worker_top;
+		{
+			std::vector<std::pair<const char*, int>> v(worker_hist.begin(), worker_hist.end());
+			std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+			for (size_t i = 0; i < v.size() && i < 5; i++) {
+				char buf[64];
+				std::snprintf(buf, sizeof(buf), "%s=%d ", v[i].first != nullptr ? v[i].first : "?",
+				              v[i].second);
+				worker_top += buf;
+			}
+		}
 		{
 			const uint64_t pause    = DS::pause_count.load(std::memory_order_relaxed);
 			const uint64_t pause_ns = DS::pause_ns.load(std::memory_order_relaxed);
@@ -208,7 +234,18 @@ static void WatchdogRun(void* /*unused*/) {
 			            static_cast<double>(bw_ns - p_bw_ns) / 1e6,
 			            static_cast<double>(ld_ns - p_ld_ns) / 1e6,
 			            static_cast<unsigned long long>(incde - p_incde));
+			const uint64_t draws = DS::draw_count.load(std::memory_order_relaxed);
+			const uint64_t disp  = DS::dispatch_count.load(std::memory_order_relaxed);
+			const uint64_t ftx   = DS::find_texture_calls.load(std::memory_order_relaxed);
+			const uint64_t nimg  = DS::texture_image_count.load(std::memory_order_relaxed);
+			std::printf("=== WORKER/s samples=%d draws=%llu dispatches=%llu findTex=%llu images=%llu | "
+			            "%s===\n",
+			            worker_samples, static_cast<unsigned long long>(draws - p_draws),
+			            static_cast<unsigned long long>(disp - p_disp),
+			            static_cast<unsigned long long>(ftx - p_ftx),
+			            static_cast<unsigned long long>(nimg), worker_top.c_str());
 			std::fflush(stdout);
+			p_draws = draws, p_disp = disp, p_ftx = ftx;
 			p_pause = pause, p_pause_ns = pause_ns, p_wait_ns = wait_ns, p_bw = bw, p_bw_ns = bw_ns,
 			p_ld_ns = ld_ns, p_incde = incde, p_fault = fault, p_cpf = cpf, p_sub = sub, p_rb = rb,
 			p_ftot = ftot, p_funi = funi;

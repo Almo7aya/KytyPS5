@@ -86,6 +86,10 @@ inline std::atomic<uint64_t> fault_count {0};   // non-CP guest faults taking th
 inline std::atomic<uint64_t> readback_count {0}; // faults that actually downloaded GPU data
 inline std::atomic<uint64_t> cp_fault_count {0}; // CP-path faults (inside the worker's Process)
 inline std::atomic<uint64_t> submits_done {0};   // GPU worker submissions completed (throughput)
+inline std::atomic<uint64_t> draw_count {0};     // draws executed (worker draw throughput)
+inline std::atomic<uint64_t> dispatch_count {0}; // compute dispatches executed
+inline std::atomic<uint64_t> find_texture_calls {0}; // TextureCache::FindTexture invocations
+inline std::atomic<uint64_t> texture_image_count {0}; // latest m_images.size() gauge
 
 struct ScopedNs {
 	std::atomic<uint64_t>& sink;
@@ -132,6 +136,31 @@ inline void SetThreadName(const char* n, int32_t tid, uint64_t host_tid) {
 	s.name.store(n, std::memory_order_relaxed);
 	s.tid.store(tid, std::memory_order_relaxed);
 	s.host_tid.store(host_tid, std::memory_order_relaxed);
+}
+
+// KYTY_DIAG: read a named thread's current scope (kind string pointer). Returns nullptr if the
+// thread is not registered. Used by the watchdog to sample what the GPU worker is doing.
+inline const char* ScopeKindByName(const char* target) {
+	if (target == nullptr) {
+		return nullptr;
+	}
+	std::scoped_lock lk(RegMutex());
+	for (auto* t: Registry()) {
+		const char* n = t->name.load(std::memory_order_relaxed);
+		if (n == nullptr) {
+			continue;
+		}
+		const char* a = n;
+		const char* b = target;
+		while (*a != '\0' && *a == *b) {
+			a++;
+			b++;
+		}
+		if (*a == *b) {
+			return t->kind.load(std::memory_order_relaxed);
+		}
+	}
+	return nullptr;
 }
 
 inline void Begin(const char* kind, uint64_t a0, uint64_t a1) {

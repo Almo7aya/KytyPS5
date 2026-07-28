@@ -189,7 +189,7 @@ bool IsExactRenderTargetMipStorage(const ImageInfo& sampled, const ImageInfo& st
 	return false;
 }
 
-struct TextureCache::CachedImage {
+struct TextureCache::CachedImage : std::enable_shared_from_this<TextureCache::CachedImage> {
 	explicit CachedImage(GraphicContext& graphics): graphics(graphics) {}
 
 	enum class Kind {
@@ -1442,6 +1442,8 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 		     static_cast<const void*>(&command), info.address, info.size, info.width, info.height,
 		     info.depth, info.levels);
 	}
+	Kyty::WaitWatch::DrainStats::find_texture_calls.fetch_add(1, std::memory_order_relaxed); // KYTY_DIAG
+	Kyty::WaitWatch::DrainStats::texture_image_count.store(m_images.size(), std::memory_order_relaxed);
 	std::lock_guard transaction(m_resource_mutex);
 	{
 		FaultSafeTextureLock lock(this, m_lock);
@@ -1469,7 +1471,9 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 	std::vector<CachedImage*>    storage_retire;
 	std::vector<CachedImage*>    storage_discard;
 	const auto                   requested_view_format = TextureGetFormat(info.format);
-	for (auto& cached: m_images) {
+	// Only storage textures overlapping the requested region can classify non-None; the address
+	// index yields exactly those instead of scanning all m_images (the level-load hot path).
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, true)) {
 		if (cached->kind != CachedImage::Kind::StorageTexture) {
 			continue;
 		}
@@ -1490,13 +1494,13 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 					     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 					     info.address, info.size);
 				}
-				storage_match = cached;
+				storage_match = cached->shared_from_this();
 				break;
 			case StorageSampledOverlap::RetireStorage:
-				storage_retire.push_back(cached.get());
+				storage_retire.push_back(cached);
 				break;
 			case StorageSampledOverlap::DiscardStorage:
-				storage_discard.push_back(cached.get());
+				storage_discard.push_back(cached);
 				break;
 			case StorageSampledOverlap::Unsupported:
 				EXIT("TextureCache: unsupported sampled/storage image alias, "
@@ -1585,8 +1589,11 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 	if (m_memory_tracker.IsRegionCpuModified(info.address, info.size)) {
 		MarkSampledAliasesCpuDirtyLocked(info.address, info.size);
 	}
+	// Exact-match lookup via the address index (Equal requires the same address+size, so any match
+	// overlaps [info.address, info.size)). This replaces a full O(m_images) scan -- the level-load
+	// hot path, with ~2000 cached images resolved ~1000x/s.
 	std::shared_ptr<CachedImage> match;
-	for (auto& cached: m_images) {
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, false)) {
 		if (cached->kind != CachedImage::Kind::Texture || !Equal(info, cached->info)) {
 			continue;
 		}
@@ -1595,7 +1602,7 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 			     " size=0x%016" PRIx64 " duplicate=%d gpu_modified=%d\n",
 			     info.address, info.size, match != nullptr, cached->gpu_modified);
 		}
-		match = cached;
+		match = cached->shared_from_this();
 	}
 	if (match != nullptr) {
 		if (match->info.IsMaybeCpuDirty() && !match->info.IsDefinitelyCpuDirty()) {
@@ -1634,7 +1641,9 @@ VulkanImage& TextureCache::FindTexture(CommandBuffer& command, const ImageInfo& 
 		command.RetainResourceUntilFence(match);
 		return *match->image;
 	}
-	for (const auto& cached: m_images) {
+	// Only images overlapping the requested region can conflict; the address index yields exactly
+	// those (page-granular, matching OverlapsRange(..., true)) instead of scanning all m_images.
+	for (auto* cached: FindImagesInRegionLocked(info.address, info.size, true)) {
 		if (cached->kind != CachedImage::Kind::Texture) {
 			if (!cached->OverlapsRange(info.address, info.size, true)) {
 				continue;
