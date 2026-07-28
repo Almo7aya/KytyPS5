@@ -612,6 +612,62 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 			(void)m_texture_cache->InvalidateMemoryFromGPU(vaddr, size, is_formatted);
 		}
 	}
+	// The merge path below (taken when no cached buffer already contains the request) re-uploads
+	// every overlapping cached buffer's whole range from guest memory. That merged span can reach
+	// past [vaddr, size] into pages a texture still owns GPU-dirty; reading them during the upload --
+	// which runs inside the tracker's upload callback holding m_access_mutex -- faults into a
+	// re-entrant readback (the memoryTracker re-entry crash). Resolve image ownership across the full
+	// merged span up front, before the cache lock. m_buffers is stable under m_resource_mutex and is
+	// not mutated by materialisation (PublishImageBacking only marks tracker state), so one pass
+	// suffices; the bounded loop is belt-and-suspenders against any residual GPU ownership.
+	for (int settle = 0; settle < 64; settle++) {
+		BufferCacheRange span {};
+		bool             merge_path = false;
+		{
+			FaultSafeCacheLock probe(this, m_mutex);
+			auto               it = m_buffers.upper_bound(vaddr);
+			if (it != m_buffers.begin()) {
+				auto       previous = std::prev(it);
+				const auto offset   = vaddr - previous->second->vaddr;
+				if (offset <= previous->second->size && size <= previous->second->size - offset) {
+					it = previous;
+				}
+			}
+			if (it == m_buffers.end() || it->second->vaddr > vaddr ||
+			    size > it->second->size - (vaddr - it->second->vaddr)) {
+				merge_path   = true;
+				span         = {.address = begin, .size = end - begin};
+				auto first   = m_buffers.lower_bound(begin);
+				if (first != m_buffers.begin()) {
+					auto previous = std::prev(first);
+					if (MergeOverlappingBufferCacheRange(
+					        span, {previous->second->vaddr, previous->second->size})) {
+						first = previous;
+					}
+				}
+				for (auto candidate = first; candidate != m_buffers.end(); ++candidate) {
+					if (candidate->first >= span.address + span.size) {
+						break;
+					}
+					MergeOverlappingBufferCacheRange(
+					    span, {candidate->second->vaddr, candidate->second->size});
+				}
+			}
+		}
+		// A containing buffer exists (no merge); the [vaddr, size] path above already materialised.
+		if (!merge_path || (span.address == begin && span.size == end - begin)) {
+			break;
+		}
+		const auto region = m_texture_cache->QueryRegion(span.address, span.size);
+		if (!region.gpu_image_bytes) {
+			break;
+		}
+		if (is_read && !is_written) {
+			m_texture_cache->PrepareGpuBufferRead(span.address, span.size);
+		} else {
+			(void)m_texture_cache->InvalidateMemoryFromGPU(span.address, span.size, is_formatted);
+		}
+	}
 	FaultSafeCacheLock lock(this, m_mutex);
 
 	auto it = m_buffers.upper_bound(vaddr);
