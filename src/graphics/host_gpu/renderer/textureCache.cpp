@@ -426,6 +426,7 @@ struct TextureCache::ImageReadback {
 			     selected != nullptr ? static_cast<const void*>(selected->image) : nullptr);
 		}
 
+		Kyty::WaitWatch::DrainStats::readback_count.fetch_add(1, std::memory_order_relaxed); // KYTY_DIAG
 		transfer = depth_target ? DownloadDepthTarget(*selected)
 		                        : DownloadColorImage(*selected, false);
 
@@ -4224,6 +4225,18 @@ bool TextureCache::TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear) {
 		it->second.clear_mask &= ~(1u << slice);
 	}
 	return true;
+}
+
+bool TextureCache::FaultWouldReadback(uint64_t vaddr) noexcept {
+	// Mirrors the Invalidate-phase readback tests: a GPU-modified virtual-metadata page (handled by
+	// m_metadata_tracker.InvalidateVirtualGpuWrite) or a GPU-modified image page candidate. Both
+	// resolve against GPU-owned data and need the submission drain. Read-only; the resource mutex
+	// (held by the caller) keeps the state stable, and m_lock guards the image lookup.
+	if (m_metadata_tracker.HasGpuModifiedUnchecked(vaddr, 1)) {
+		return true;
+	}
+	FaultSafeTextureLock lock(this, m_lock);
+	return FindGpuReadbackPageCandidateLocked(vaddr, 1) != nullptr;
 }
 
 bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,

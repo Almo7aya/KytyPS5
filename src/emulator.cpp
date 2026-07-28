@@ -173,7 +173,7 @@ static void WatchdogRun(void* /*unused*/) {
 	int      save_tick      = 0;
 	namespace DS            = Kyty::WaitWatch::DrainStats;
 	uint64_t p_pause = 0, p_pause_ns = 0, p_wait_ns = 0, p_bw = 0, p_bw_ns = 0, p_ld_ns = 0,
-	         p_incde = 0, p_fault = 0, p_cpf = 0, p_sub = 0;
+	         p_incde = 0, p_fault = 0, p_cpf = 0, p_sub = 0, p_rb = 0, p_ftot = 0, p_funi = 0;
 	for (;;) {
 		Common::Thread::Sleep(1000);
 		{
@@ -187,13 +187,20 @@ static void WatchdogRun(void* /*unused*/) {
 			const uint64_t fault    = DS::fault_count.load(std::memory_order_relaxed);
 			const uint64_t cpf      = DS::cp_fault_count.load(std::memory_order_relaxed);
 			const uint64_t sub      = DS::submits_done.load(std::memory_order_relaxed);
-			std::printf("=== DRAIN/s frame=%d faults=%llu cpFaults=%llu submits=%llu "
+			const uint64_t rb       = DS::readback_count.load(std::memory_order_relaxed);
+			const uint64_t ftot     = Kyty::WaitWatch::FaultStats::total.load(std::memory_order_relaxed);
+			const uint64_t funi     = Kyty::WaitWatch::FaultStats::unique.load(std::memory_order_relaxed);
+			std::printf("=== DRAIN/s frame=%d faults=%llu cpFaults=%llu readbacks=%llu submits=%llu "
+			            "fTot=%llu fNew=%llu "
 			            "pause=%llu(%.1fms) waitidle=%.1fms bufwait=%llu(%.1fms) labeldrain=%.1fms "
 			            "incDe=%llu ===\n",
 			            Libs::Graphics::WindowGetPresentedFrame(),
 			            static_cast<unsigned long long>(fault - p_fault),
 			            static_cast<unsigned long long>(cpf - p_cpf),
+			            static_cast<unsigned long long>(rb - p_rb),
 			            static_cast<unsigned long long>(sub - p_sub),
+			            static_cast<unsigned long long>(ftot - p_ftot),
+			            static_cast<unsigned long long>(funi - p_funi),
 			            static_cast<unsigned long long>(pause - p_pause),
 			            static_cast<double>(pause_ns - p_pause_ns) / 1e6,
 			            static_cast<double>(wait_ns - p_wait_ns) / 1e6,
@@ -203,7 +210,8 @@ static void WatchdogRun(void* /*unused*/) {
 			            static_cast<unsigned long long>(incde - p_incde));
 			std::fflush(stdout);
 			p_pause = pause, p_pause_ns = pause_ns, p_wait_ns = wait_ns, p_bw = bw, p_bw_ns = bw_ns,
-			p_ld_ns = ld_ns, p_incde = incde, p_fault = fault, p_cpf = cpf, p_sub = sub;
+			p_ld_ns = ld_ns, p_incde = incde, p_fault = fault, p_cpf = cpf, p_sub = sub, p_rb = rb,
+			p_ftot = ftot, p_funi = funi;
 		}
 		// Persist the driver pipeline cache periodically so it survives even a hard kill.
 		if (++save_tick >= 15) {

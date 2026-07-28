@@ -118,6 +118,10 @@ public:
 	[[nodiscard]] bool       TouchMeta(uint64_t vaddr, uint32_t slice, bool is_clear);
 	[[nodiscard]] bool       InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                          PageFaultPhase phase) noexcept;
+	// True iff a fault at vaddr would trigger an image readback in InvalidateMemory's Invalidate
+	// phase (i.e. there is a GPU-modified image page candidate). Used to decide whether a fault
+	// needs the expensive submission drain. Must be called under the resource mutex; takes m_lock.
+	[[nodiscard]] bool       FaultWouldReadback(uint64_t vaddr) noexcept;
 	void                     UnmapMemory(uint64_t vaddr, uint64_t size);
 
 	VulkanImage& GetDummySampledTexture(bool uint_format, bool image_3d);

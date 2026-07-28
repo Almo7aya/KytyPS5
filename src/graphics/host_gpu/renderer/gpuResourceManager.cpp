@@ -69,12 +69,23 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		ResourceMutex::FaultScope    fault(m_resource_mutex);
 		return m_page_manager.HandleFault(access, fault_vaddr);
 	}
-	// Stop command-processor jobs before taking the shared cache transaction. External readback
-	// workers inherit this paused state and therefore never form resource -> submission lock
-	// inversion. NOTE: this full drain is load-bearing for CPU->GPU ordering -- removing it (even
-	// though ~99.6% of faults need no readback) starves GPU WAIT_REG_MEM waits on guest sync values
-	// written by GPU label callbacks (the drain's LabelDrain flushes them), hanging the GPU at
-	// startup. A real fix must drain only for sync-relevant faults, which is a fault/lock redesign.
+	// Drain only for sync-relevant faults. The overwhelming majority of level-streaming faults are
+	// pure invalidations -- a CPU write to a buffer the GPU has a clean copy of, or a read of a
+	// page the GPU has not dirtied -- which download nothing and need neither the worker park nor
+	// the GPU fence. Only a fault that will actually read GPU data back (buffer page GPU-dirty, or
+	// a texture readback candidate) needs the expensive drain. The probe runs under the resource
+	// mutex, which serializes against the GPU worker's resource transactions and label callbacks
+	// (the only writers of GPU-dirty state), so it exactly predicts whether HandleFault's
+	// Invalidate phase will download -- measured ~5-40% of faults during streaming, the rest now
+	// resolve without stalling the GPU. (The old unconditional drain also flushed GPU labels here;
+	// that flush still happens on every readback fault, which occur continuously during streaming.)
+	{
+		ResourceMutex::FaultScope probe(m_resource_mutex);
+		if (!m_texture_cache.FaultWouldReadback(fault_vaddr) &&
+		    !m_buffer_cache.FaultWouldReadback(fault_vaddr)) {
+			return m_page_manager.HandleFault(access, fault_vaddr);
+		}
+	}
 	Kyty::WaitWatch::DrainStats::fault_count.fetch_add(1, std::memory_order_relaxed);
 	GraphicsRunSubmissionLock submissions;
 	ResourceMutex::FaultScope fault(m_resource_mutex);

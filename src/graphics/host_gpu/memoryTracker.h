@@ -26,6 +26,10 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Read-only GPU-modified test that does NOT assert the range is mapped (unlike
+	// IsRegionGpuModified's RequireMapped) and takes no page-manager locks. Safe for virtual
+	// metadata pages and for use as a pre-fault drain probe. Never downloads or mutates.
+	[[nodiscard]] bool HasGpuModifiedUnchecked(uint64_t vaddr, uint64_t size) noexcept;
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

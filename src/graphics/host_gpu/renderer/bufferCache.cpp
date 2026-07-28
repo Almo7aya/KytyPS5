@@ -325,6 +325,7 @@ struct BufferCache::Readback {
 			}
 			// The copy and its fence are driven by this thread alone; the cache lock is
 			// never held across a wait on another thread's progress.
+			Kyty::WaitWatch::DrainStats::readback_count.fetch_add(1, std::memory_order_relaxed); // KYTY_DIAG
 			auto vk_buffer = command->Handle();
 			command->Begin();
 			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
@@ -1120,6 +1121,14 @@ bool BufferCache::HasPageOverlap(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::FaultWouldReadback(uint64_t vaddr) noexcept {
+	// A buffer readback happens iff the fault page is GPU-dirty (RegionManager::BeginCpuFault
+	// returns Download only for a gpu_dirty page). HasGpuModifiedUnchecked reports exactly that
+	// without asserting the range is mapped (a probe must never EXIT). The resource mutex (held by
+	// the caller) keeps the dirty bits stable against the GPU worker.
+	return m_memory_tracker.HasGpuModifiedUnchecked(vaddr, 1);
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

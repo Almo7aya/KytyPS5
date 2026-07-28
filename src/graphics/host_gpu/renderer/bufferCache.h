@@ -56,6 +56,10 @@ public:
 
 	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
+	// True iff a fault at vaddr would download buffer data in InvalidateMemory's Invalidate phase
+	// (i.e. the page is GPU-dirty, so BeginCpuFault returns Download). Used to decide whether a
+	// fault needs the expensive submission drain. Must be called under the resource mutex.
+	[[nodiscard]] bool FaultWouldReadback(uint64_t vaddr) noexcept;
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,

@@ -366,3 +366,28 @@ With the above fixed, streaming dies ~20–40 s in at a *rotating* set of sites 
 - **Perf** unchanged and severe: ~0.1–0.9 fps during streaming, `DRAIN/s pause≈5272 ms/s` (multi-thread synchronous drains). Still the §8.4 async-redesign problem; correctness first.
 
 **Files touched this session (all uncommitted before the checkpoint commit):** `pageManager.{h,cpp}` (truthful reads, `FaultReadbackScope`), `bufferCache.cpp` (reentrant `FaultSafeCacheLock`, readback scopes, context guard), `textureCache.cpp` (readback scopes). No diagnostics left in the tree.
+
+---
+
+## 10. Session 3 part 2 (2026-07-28): the perf wall is the per-readback worker park
+
+The user asked to prioritise frame rate (faster iteration → catch crashes sooner). Measured it properly first by adding `readbacks=`, `fTot=` (total faults) and `fNew=` (newly-seen pages) to the `DRAIN/s` line.
+
+**What the numbers actually say (streaming, per ~1 s report):**
+- The old "≈99.6 % of faults need no readback" claim is **false for GTA III streaming**. Readbacks are **~5–40 %** of faults depending on phase (e.g. one phase `readbacks=50/faults=87`, another `readbacks=4/faults=89`).
+- Massive **fault thrash**: reports with `fNew=0` (zero new pages) yet `faults=41–89` — the same pages fault over and over. These are pure invalidations (CPU writing a buffer the GPU has a clean copy of), downloading nothing.
+- Cost is dominated by `waitidle` (the worker **park**, `RequestPauseAndWait`): ~1.1–2.4 s per report. `labeldrain`≈0.1 ms and `bufwait`≈10 ms are negligible.
+
+**Fix shipped — drain only for sync-relevant faults** (`gpuResourceManager.cpp` external-thread path): probe under the resource mutex whether the fault will actually download GPU data, and skip the whole submission drain (worker park + fence + label flush) when it won't. The probe is *exact*, not heuristic:
+- buffer readback ⟺ page GPU-dirty (`RegionManager::BeginCpuFault` returns `Download` only then) → `MemoryTracker::HasGpuModifiedUnchecked` (new; no `RequireMapped`, so a probe never EXITs);
+- texture readback ⟺ `FindGpuReadbackPageCandidateLocked != null`;
+- metadata write ⟺ `m_metadata_tracker.HasGpuModifiedUnchecked` (mirrors `InvalidateVirtualGpuWrite`).
+GPU-dirty state only changes under the resource mutex (worker transactions + label callbacks all hold it), so the probe exactly predicts `HandleFault`'s Invalidate phase. `TextureCache::FaultWouldReadback` / `BufferCache::FaultWouldReadback` implement the per-cache predicates. Verified stable across ~6 runs (no new crash class, no starvation hang — labels still flush on every readback fault, which never stop during streaming).
+
+**Result: faults taking the drain dropped from ~90–270 to ~2–5 per report — but fps did NOT improve (~0.1–0.9 either way).** Why: the skipped faults were already cheap *joiners* on the shared-pause window; the wall is the readback **leaders** parking the worker. `waitidle` is essentially proportional to `readbacks`, not `faults`. With fewer drains the worker runs longer between them, so each park now waits longer — net wall-clock unchanged.
+
+**So the real fps wall (next front): the per-readback worker park.** Each GPU→CPU readback calls `RequestPauseAndWait` (park the whole GPU worker until its current submission finishes) so the render target's in-progress command buffer is flushed before the download copy. The download copy already runs on the **same `graphics.queue`** as rendering (`Transfer::ExecuteImmediateCommands` → `command.Execute`), so GPU ordering is automatic — the park exists only to flush the worker's *partially-built* buffer, and it waits for **unrelated** draws too. The fix is finer-grained: make a readback wait only for the specific render target's work to be flushed/fenced, not a global worker park. That is a real GPU-sync change (per-resource fence tracking) and is the highest-value perf item, but it must not read partial/stale targets (that would corrupt output and *hinder* crash-hunting), so it needs care, not haste.
+
+**Bottom line for the goal:** even a perfect perf fix won't make the level *load* — streaming still dies on the §9.3 dual-ownership crashes every run (`bufferCache:249/1057`, `memoryTracker:151`, `textureCache:1252`, and the `libC:314` guest abort). Those remain the actual blocker; perf is about iteration speed on top.
+
+**Instrumentation added (strip before any final fps number):** `readbacks=/fTot=/fNew=` on the `DRAIN/s` line (`emulator.cpp`), `readback_count` increments in both readback `Begin`s.
