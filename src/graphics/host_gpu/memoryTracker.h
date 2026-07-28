@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <intrin.h> // KYTY_DIAG: _ReturnAddress
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -103,6 +104,9 @@ public:
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		CheckNotInUploadCallback(this, vaddr);
+		s_upload_ra    = _ReturnAddress();       // KYTY_DIAG: caller (upload site) for re-entry diag
+		s_upload_vaddr = vaddr;                  // KYTY_DIAG
+		s_upload_size  = size;                   // KYTY_DIAG
 		Kyty::WaitWatch::Scope w("mt_ul", vaddr, size); // KYTY_DIAG
 		std::unique_lock access(m_access_mutex);
 		RequireMapped(vaddr, size);
@@ -133,6 +137,9 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
+	inline static thread_local void*                s_upload_ra    = nullptr; // KYTY_DIAG
+	inline static thread_local uint64_t             s_upload_vaddr = 0;        // KYTY_DIAG
+	inline static thread_local uint64_t             s_upload_size  = 0;        // KYTY_DIAG
 	// Nested page-fault passthrough (see BeginCpuFault): the region+page a fault was allowed
 	// through without touching region state, so the matching CompleteCpuFault can succeed.
 	inline static thread_local const RegionManager* s_nested_fault_manager = nullptr;
@@ -145,12 +152,15 @@ private:
 			// deadlock on a held region spinlock, cross-instance is a false positive).
 			const auto& w = Kyty::WaitWatch::Self();
 			std::printf("KYTY_DIAG tracker re-entry: self=%p owner=%p same=%d vaddr=0x%llx "
-			            "thread=%s state=%s arg0=0x%llx\n",
+			            "thread=%s state=%s arg0=0x%llx upload_ra=0x%llx upload=0x%llx+0x%llx\n",
 			            static_cast<const void*>(self), static_cast<const void*>(s_upload_owner),
 			            s_upload_owner == self ? 1 : 0, static_cast<unsigned long long>(vaddr),
 			            w.name.load(std::memory_order_relaxed),
 			            w.kind.load(std::memory_order_relaxed),
-			            static_cast<unsigned long long>(w.arg0.load(std::memory_order_relaxed)));
+			            static_cast<unsigned long long>(w.arg0.load(std::memory_order_relaxed)),
+			            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_upload_ra)),
+			            static_cast<unsigned long long>(s_upload_vaddr),
+			            static_cast<unsigned long long>(s_upload_size));
 			std::fflush(stdout);
 			EXIT("memory tracker re-entered from upload callback\n");
 		}

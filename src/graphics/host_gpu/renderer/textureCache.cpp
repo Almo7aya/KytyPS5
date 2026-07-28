@@ -3303,7 +3303,8 @@ void TextureCache::PrepareHostWrite(uint64_t vaddr, uint64_t size) {
 			    IsHostWriteRefreshable(cached->BufferBinding(), cached->buffer_modified);
 			const bool gpu_synchronizable =
 			    cached->kind == CachedImage::Kind::RenderTarget ||
-			    cached->kind == CachedImage::Kind::DepthTarget;
+			    cached->kind == CachedImage::Kind::DepthTarget ||
+			    cached->kind == CachedImage::Kind::StorageTexture;
 			switch (ClassifyHostWriteOverlap(vaddr, size, cached->Address(range),
 			                                 cached->Size(range), host_refreshable,
 			                                 cached->gpu_modified, metadata_overlap,
