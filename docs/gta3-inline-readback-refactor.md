@@ -391,3 +391,24 @@ GPU-dirty state only changes under the resource mutex (worker transactions + lab
 **Bottom line for the goal:** even a perfect perf fix won't make the level *load* — streaming still dies on the §9.3 dual-ownership crashes every run (`bufferCache:249/1057`, `memoryTracker:151`, `textureCache:1252`, and the `libC:314` guest abort). Those remain the actual blocker; perf is about iteration speed on top.
 
 **Instrumentation added (strip before any final fps number):** `readbacks=/fTot=/fNew=` on the `DRAIN/s` line (`emulator.cpp`), `readback_count` increments in both readback `Begin`s.
+
+---
+
+## 11. Session 3 part 3 (2026-07-28): the real fps win — texture-cache O(N) scans
+
+The DRAIN work (§10) was a dead end for fps because it targeted the wrong thing. Profiled properly instead: added a **worker-scope sampler** (the watchdog samples `GpuWorker`'s live WaitWatch scope every ~5 ms and prints a histogram as `WORKER/s`), plus `draws=/dispatches=/findTex=/images=` counters. That immediately showed the truth:
+
+1. The GPU worker was **~80 % in `gpu_pm4`** (not parked, not readback-bound) — i.e. CPU-bound recording draws.
+2. Only **~200 draws/s** (≈5 ms/draw — absurd). Scoping the draw path: **~70 % of the worker was in `BindDescriptors` → `NativeTexture` → `TextureCache::FindTexture`**.
+3. `FindTexture` ran **three full O(N) linear scans over `m_images`** (exact-match, storage-overlap, sampled-overlap), and `images=~2000` during streaming with `findTex=~1000-5000/s`. Quadratic. That was the entire fps wall.
+
+**Fix (committed `aac35e9`, `28d0843`):** every hot exact/overlap lookup was already funnelled through `FindImagesInRegionLocked` → `m_image_owner_index` (an address index) *except* the raw `for (auto& c : m_images)` scans in `FindTexture` / `FindRenderTarget` / `FindDepthTarget` / `FindStorageTexture`. All their match predicates (`Equal`, `IsCompatible*Backing`, `IsCompatibleRenderTargetView`, `EqualStorageBacking`) require `cached.address == info.address`, so the address-index query returns exactly the same candidates — O(overlap) not O(2000). `CachedImage` gained `enable_shared_from_this` so the exact-match paths still return a `shared_ptr` from an index raw pointer.
+
+**Measured impact:**
+- FindTexture: **~75 % → ~5 %** of worker wall-clock.
+- Draws: **~200/s → ~600-1650/s**; worker now **20-56 % idle**.
+- **Streaming fps ~0.1-0.9 → ~2-4 fps; intro ~10 → ~15-17 fps.** Level reaches frame ~316-342 in a fraction of the wall time.
+
+**New bottleneck / next fps front:** the worker is now often idle (guest-submission bound). Its remaining active time is `draw_prepare` (~30 %) — dominated by **`mt_ul` (buffer/texture uploads)** — and `gpu_pm4` (~25 %). Likely next levers: (a) avoid redundant re-uploads (dynamic buffers/textures re-uploaded per draw), (b) the readback worker-park still stalls the worker on the ~40 % of faults that download (see §10). But much of the remaining cost is now genuine guest CPU work under emulation.
+
+**Lesson for the next agent:** when the worker looks "busy", sample its live scope before optimizing — the DRAIN/pause numbers hid a pure-CPU O(N²) texture-lookup problem that had nothing to do with the readback/drain machinery.
