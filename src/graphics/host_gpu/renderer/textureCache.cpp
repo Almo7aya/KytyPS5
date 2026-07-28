@@ -1233,7 +1233,17 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 		    !cached->buffer_modified && cached->depth.stencil_address == 0 &&
 		    cached->depth.stencil_size == 0 && cached->depth.layers == 1 && contained &&
 		    (exact_range || sampled_expansion);
-		const bool supported = clean_pool_alias || native_transition;
+		// A sampled texture that fully contains a plain (no stencil, no htile, single-layer) depth
+		// target aliases its guest bytes. The retirement below reads the GPU-dirty depth back into
+		// coherent guest backing, and the sampled image is then uploaded from that backing -- the
+		// same canonical-guest-bytes path native_transition uses -- so accept the general contained
+		// case, not only the exact/array-expansion shapes. Extra sampled bytes beyond the depth come
+		// from guest backing as usual. (GTA III level-load samples such a depth alias.)
+		const bool contained_depth_sample =
+		    !cached->buffer_modified && cached->depth.stencil_address == 0 &&
+		    cached->depth.stencil_size == 0 && cached->depth.htile_address == 0 &&
+		    cached->depth.htile_size == 0 && cached->depth.layers == 1 && contained;
+		const bool supported = clean_pool_alias || native_transition || contained_depth_sample;
 		if (!supported) {
 			EXIT("TextureCache: unsupported sampled/depth-target alias, sampled=0x%016" PRIx64
 			     "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
