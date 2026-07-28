@@ -1110,9 +1110,13 @@ void BufferCache::CopyBuffer(CommandBuffer* command, uint64_t dst_vaddr, uint64_
 		}
 		dst_image_transition        = m_texture_cache->InvalidateMemoryFromGPU(dst_vaddr, size);
 		const auto transitioned_dst = m_texture_cache->QueryRegion(dst_vaddr, size);
-		// A clean target destination is handled above like a protected host write. Target
-		// aliases that require an actual GPU buffer copy remain unsupported.
-		if (transitioned_dst.non_sampled_pages) {
+		// A clean target destination is handled above like a protected host write. If
+		// InvalidateMemoryFromGPU transitioned the overlapping target(s) to buffer ownership
+		// (dst_image_transition), the remaining non-sampled pages are those now-buffer_modified
+		// images: the GPU copy below writes the destination buffer that ObtainBuffer resolves over
+		// that memory, and each transitioned target refreshes from that buffer on its next use, so
+		// the copy is coherent. Only reject when nothing could take buffer ownership.
+		if (transitioned_dst.non_sampled_pages && !dst_image_transition) {
 			EXIT("BufferCache: GPU copy aliases target pages, src=0x%016" PRIx64
 			     " dst=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 			     src_vaddr, dst_vaddr, size);
