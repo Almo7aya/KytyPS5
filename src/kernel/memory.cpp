@@ -2738,6 +2738,38 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 	}
 	if (direct_memory_start < 0 || len == 0 ||
 	    !g_physical_memory->CanMapDirect(static_cast<uint64_t>(direct_memory_start), len)) {
+		// KYTY_DIAG: GTA III level-load MAP_DIRECT ENOMEM. Describe the physical block covering
+		// direct_memory_start so we know whether it is a pool_expansion block, unallocated, or a
+		// boundary/type crossing.
+		{
+			const auto  dm   = static_cast<uint64_t>(direct_memory_start);
+			const auto& phys = g_physical_memory->GetPhysicalBlocks();
+			auto        next = phys.upper_bound(dm);
+			const char* why  = "no-block-below";
+			uint64_t    bs = 0, bsz = 0;
+			int         btype = -1, bpool = -1;
+			if (next != phys.begin()) {
+				const auto& b = std::prev(next)->second;
+				bs = b.start_addr;
+				bsz = b.size;
+				btype = b.memory_type;
+				bpool = b.pool_expansion ? 1 : 0;
+				if (dm >= b.start_addr + b.size) {
+					why = "in-gap-after-block";
+				} else if (b.pool_expansion) {
+					why = "pool_expansion-block";
+				} else {
+					why = "boundary-or-type-crossing";
+				}
+			}
+			std::printf("KYTY_DIAG mapdirect-enomem dm=0x%016llx len=0x%016llx why=%s "
+			            "block=0x%016llx+0x%016llx type=%d pool=%d\n",
+			            static_cast<unsigned long long>(dm),
+			            static_cast<unsigned long long>(len), why,
+			            static_cast<unsigned long long>(bs),
+			            static_cast<unsigned long long>(bsz), btype, bpool);
+			std::fflush(stdout);
+		}
 		return KERNEL_ERROR_ENOMEM;
 	}
 

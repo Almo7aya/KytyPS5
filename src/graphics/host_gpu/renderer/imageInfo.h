@@ -856,10 +856,13 @@ enum class DepthTargetPlane : uint8_t { None, Depth, Stencil };
 		return StorageSampledOverlap::None;
 	}
 	// CPU writes can make a cached storage view stale before the same bytes are rebound through a
-	// sampled descriptor with a different format, tile mode, or image type. With no native image,
-	// buffer, or tracker GPU ownership left, guest backing is authoritative and the stale storage
-	// allocation can be discarded without a readback.
-	if (!cached_gpu_modified && !cached_buffer_modified && !tracker_gpu_modified) {
+	// sampled descriptor with a different format, tile mode, or image type. With no native-image or
+	// tracker GPU ownership left, guest backing is authoritative and the stale storage allocation
+	// can be discarded without a readback. A buffer_modified storage is also discardable here: the
+	// sampled path publishes the owning native buffer into guest backing (ObtainBufferForImage)
+	// before this classification, so backing already holds the current bytes for the sampled range,
+	// and the storage's remainder stays recoverable from the persistent native buffer.
+	if (!cached_gpu_modified && !tracker_gpu_modified) {
 		return StorageSampledOverlap::DiscardStorage;
 	}
 	const bool same_backing = HasSampleCompatibleStorageImageBacking(requested, cached);
@@ -992,13 +995,20 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::DepthTarget:
 			if (buffer_formatted) {
-				if (!exact || !buffer_page_aligned) {
+				if (!buffer_page_aligned) {
 					return BufferImageWrite::Unsupported;
 				}
+				// Synchronize downloads the whole target, so require an exact overwrite to avoid
+				// leaving a partial write straddling native/guest ownership.
 				if (image_gpu_modified && !image_buffer_modified) {
-					return BufferImageWrite::SynchronizeDepthTarget;
+					return exact ? BufferImageWrite::SynchronizeDepthTarget
+					             : BufferImageWrite::Unsupported;
 				}
-				return !image_gpu_modified && image_buffer_modified
+				// A formatted write that exactly overwrites, or lands inside (contained) a depth
+				// target already owned by a native buffer, moves the written range into buffer
+				// ownership; the depth refreshes from the native buffer on next use, so the
+				// untouched remainder is preserved. Mirrors the render/storage formatted paths.
+				return (!image_gpu_modified && image_buffer_modified && (exact || contained))
 				           ? BufferImageWrite::InvalidateDepthTarget
 				           : BufferImageWrite::Unsupported;
 			}
