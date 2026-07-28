@@ -981,7 +981,13 @@ ClassifyBufferImageWrite(uint64_t buffer_address, uint64_t buffer_size, uint64_t
 				           ? BufferImageWrite::InvalidateStorageTexture
 				           : BufferImageWrite::Unsupported;
 			}
-			return image_contained && !image_gpu_modified && image_buffer_modified
+			// A formatted write that either encloses the storage image (image_contained) or lands
+			// inside a storage image already owned by a native buffer (contained && buffer_modified)
+			// moves the written range into buffer ownership; the image refreshes from the native
+			// buffer / guest backing on next use, so the untouched remainder is preserved. This
+			// mirrors the render-target formatted path above, which invalidates any contained write.
+			return ((image_contained || (contained && image_buffer_modified)) &&
+			        !image_gpu_modified)
 			           ? BufferImageWrite::InvalidateStorageTexture
 			           : BufferImageWrite::Unsupported;
 		case BufferImageBinding::DepthTarget:

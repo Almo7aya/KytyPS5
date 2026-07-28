@@ -1247,7 +1247,19 @@ void TextureCache::RetireSampledTargetAliases(const ImageInfo& requested) {
 		    !cached->buffer_modified && cached->depth.stencil_address == 0 &&
 		    cached->depth.stencil_size == 0 && cached->depth.htile_address == 0 &&
 		    cached->depth.htile_size == 0 && cached->depth.layers == 1 && contained;
-		const bool supported = clean_pool_alias || native_transition || contained_depth_sample;
+		// A plain (no stencil, no htile, single-layer) depth target whose current bytes already live
+		// in a native buffer (buffer_modified, not GPU-dirty) can be retired with NO readback: the
+		// retire loop below skips !gpu_modified images, and the sampled image materialized afterwards
+		// pulls the same bytes from guest backing (its ObtainBufferForImage publishes the native
+		// buffer into backing on upload). Handles a sampled subrange of a buffer-owned depth target,
+		// the buffer_modified counterpart of contained_depth_sample. (GTA III level-load hits this.)
+		const bool buffer_current_depth =
+		    cached->buffer_modified && !cached->gpu_modified && cached->depth.stencil_address == 0 &&
+		    cached->depth.stencil_size == 0 && cached->depth.htile_address == 0 &&
+		    cached->depth.htile_size == 0 && cached->depth.layers == 1 && overlaps_depth &&
+		    !overlaps_stencil;
+		const bool supported =
+		    clean_pool_alias || native_transition || contained_depth_sample || buffer_current_depth;
 		if (!supported) {
 			EXIT("TextureCache: unsupported sampled/depth-target alias, sampled=0x%016" PRIx64
 			     "+0x%016" PRIx64 " depth=0x%016" PRIx64 "+0x%016" PRIx64
