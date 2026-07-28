@@ -469,3 +469,16 @@ Deterministic `same=1` tracker re-entry, `thread=GpuWorker state=rb_download`, `
 
 ### 14.4 Diagnostics added this session (strip before final fps run)
 `KYTY_DIAG batchmap-fail` (memory.cpp KernelBatchMap2), `KYTY_DIAG mapdirect-enomem` (KernelMapDirectMemory), RetireImages `_ReturnAddress` caller capture (textureCache.cpp), all under the existing `KYTY_DIAG` convention.
+
+---
+
+## §15 Session 4 cont. — re-entry FIXED (option b), batchmap root cause corrected
+
+### 15.1 Dual-ownership tracker re-entry: FIXED (commit 9efe049), ~4/5 → 0/6
+Two causes of "memory tracker re-entered from upload callback":
+1. **Read fault during upload, same tracker.** `ObtainBufferForImage`'s cpu-upload (bufferCache.cpp:936, is_written=false) reads guest memory a live `gpu_modified` image still holds a page read-watch over (its tracker dirty bit was cleared without dropping the watch — confirmed: bufferCache.cpp:873 assert doesn't fire, so IsRegionGpuModified=false while the page faults). The upload only runs on a tracker-clean region, so the guest backing is coherent and the read is legitimate. `TextureCache::InvalidateMemory` (textureCache.cpp:4369) now sets `needs_readback=false` for a READ fault while `MemoryTracker::InUploadCallback()`, resolving via the clean-page BeginCpuFault path. Write faults still readback.
+2. **Cross-instance false positive.** `CheckNotInUploadCallback` (memoryTracker.h) aborted on ANY `s_upload_owner != nullptr`, but m_access_mutex + region spinlocks are per-instance, so a texture-cache op during a buffer-cache upload (and vice versa) can't deadlock. Changed to abort only when `s_upload_owner == self`; `ForEachUploadRange` save/restores `s_upload_owner` for cross-instance nesting.
+Diagnostic that nailed it: `MemoryTracker::InUploadCallback()` gate + `readback-in-upload` printf at the readback candidate → culprit is a `gpu_modified` StorageTexture aliasing a depth bind.
+
+### 15.2 batchmap ENOMEM = FIXED direct-memory remap placeholder failure (NOT start==0)
+CORRECTED: the `batchmap-fail` diag reads `entry->start` AFTER the failed `KernelMapDirectMemory` zeroes it, so "start=0" was an artifact. `mapdirect-outaddr0` shows the real entry: a FIXED direct-memory REMAP at an explicit address (dmem=0xc00d0000 at 0x207f100000, len 0x150000) failing `reason=placeholder-reserve-failed` in `map_shared_fixed` (memory.cpp ~2842-2874). This is the real libC:314 / `LowLevelFatalError [Line:1270]`. The start==0 MAP_FIXED-drop (235bb47) is effectively a no-op. **Next:** fix the Windows placeholder remap — the fixed path Query→Unmap→map_shared_fixed leaves the VA non-reservable (the Unmap likely doesn't restore a consumable placeholder, or MapFixed/ReserveAligned can't split it). This is the dominant remaining level-load crash (~3/6), now that the re-entry no longer crashes earlier. Level-load reaches ~frame 394.
