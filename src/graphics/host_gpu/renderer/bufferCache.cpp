@@ -234,14 +234,20 @@ struct BufferCache::Readback {
 	}
 
 	void Begin(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
-		const bool command_thread            = GraphicsRunIsCommandProcessorThread();
-		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld() || command_thread;
+		const bool command_thread = GraphicsRunIsCommandProcessorThread();
+		// A GPU label callback fires on an end-of-pipe event, so all GPU work up to it has already
+		// retired: the readback's source is complete and, like the label-callback fault path
+		// (GpuResourceManager::HandleFault), it must NOT pause submissions -- pausing from the label
+		// thread deadlocks against a worker waiting to consume that very label. Treat it as already
+		// prepaused (skip the submission lock) rather than rejecting it.
+		const bool submissions_prepaused_now =
+		    GraphicsRunSubmissionLockHeld() || command_thread || LabelInCallback();
 		const bool unsafe_gpu_lock = GraphicsRunGpuLockHeld() && !submissions_prepaused_now;
 		// g_cache_lock_owner may be set: the faulting thread can already hold m_mutex from an outer
 		// cache operation it will resume after the fault (see FaultSafeCacheLock reentrancy). That
 		// is the legitimate inline-readback case, not the old readback-worker deadlock, so it is no
 		// longer rejected here.
-		if (unsafe_gpu_lock || LabelInCallback()) {
+		if (unsafe_gpu_lock) {
 			EXIT("BufferCache: unsafe readback context, command_thread=%d "
 			     "submission_lock=%d "
 			     "gpu_lock=%d label_callback=%d cache_lock=%p\n",

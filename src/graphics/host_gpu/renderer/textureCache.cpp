@@ -379,11 +379,15 @@ struct TextureCache::ImageReadback {
 	// only on its own GPU fence, which retires independently of other threads.
 
 	void Begin(PageFaultAccess fault_access, uint64_t fault_vaddr, uint64_t fault_size) noexcept {
-		const bool command_thread            = GraphicsRunIsCommandProcessorThread();
-		const bool submissions_prepaused_now = GraphicsRunSubmissionLockHeld() || command_thread;
+		const bool command_thread = GraphicsRunIsCommandProcessorThread();
+		// A GPU label callback fires end-of-pipe, so prior GPU work has retired: the image source is
+		// complete and, like the label-callback fault path, the readback must not pause submissions
+		// (that would deadlock the label thread against the worker). Treat it as already prepaused.
+		const bool submissions_prepaused_now =
+		    GraphicsRunSubmissionLockHeld() || command_thread || LabelInCallback();
 		const bool unsafe_gpu_lock = GraphicsRunGpuLockHeld() && !submissions_prepaused_now;
 		if ((fault_access != PageFaultAccess::Read && fault_access != PageFaultAccess::Write) ||
-		    unsafe_gpu_lock || LabelInCallback() || g_texture_cache_lock_owner != nullptr ||
+		    unsafe_gpu_lock || g_texture_cache_lock_owner != nullptr ||
 		    g_texture_fault_owner != &cache) {
 			EXIT("TextureCache: unsafe image readback request, access=%u command_thread=%d "
 			     "submission_lock=%d gpu_lock=%d label_callback=%d cache_lock=%p fault_owner=%p\n",
