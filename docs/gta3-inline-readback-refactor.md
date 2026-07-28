@@ -438,3 +438,34 @@ With the deadlock/perf/coherency work done, the level-load tail is a sequence of
 - **`textureCache.cpp:2093` render-target reinterpretation (committed `8774246`).** Rebinding the exact footprint as a differently-shaped RT (e.g. 1680x946x8bpe → 3360x1892x2bpe, same bytes). Routed through `MaterializeRetireTarget`, which downloads the old color to guest memory (transient) and makes the **new target fresh** — no preserve-into-new-shape round-trip, so no scramble; the guest renders over it. Correct iff it really is pool reuse (game overwrites); needs validation.
 
 **Current tail (frame ~300-411):** `bufferCache.cpp:1118` GPU-copy (`CopyBuffer` CP-DMA) whose destination aliases a render target `InvalidateMemoryFromGPU` can't retire (deeper classifier work); a residual `memoryTracker.h:155` (~1/3, timing — the merge-span fix cut it from 3/3 but a path remains); and the pre-existing `libC.cpp:314` guest abort. Each is per-case feature work; the risk is silent wrong rendering, so validate the two committed alias fixes on screen before extending further.
+
+---
+
+## §14 Session 4 (2026-07-28) — batchmap ENOMEM fixed + alias tail peeling (frame ~294 → 386)
+
+Branch `fix/gta3-level-load`. Continued peeling the level-load crash gauntlet. All commits `--no-gpg-sign`.
+
+### 14.1 THE BIG WIN: `sceKernelBatchMap` ENOMEM (the old "libC:314" / `LowLevelFatalError [Line: 1270]`)
+The dominant multi-session guest abort was NOT a mysterious guest bug. The abort-diag string decodes to:
+`LowLevelFatalError [File:Unknown] [Line: 1270]  sceKernelBatchMap failed with error code: 0x8002000c`
+i.e. **our `sceKernelBatchMap` returned SCE_KERNEL_ERROR_ENOMEM**. UE4 fatal-errors on that.
+- Traced (KYTY_DIAG in `KernelBatchMap2`): the failing entry is `op=0 (MAP_DIRECT) start=0x0 offset=~3GB length=~few×64KB flags=0x10(MAP_FIXED)`.
+- Root cause: `KernelBatchMap` forces `MAP_FIXED` on every entry. An entry with `start==0` wants kernel-chosen placement, but `KernelMapDirectMemory`'s fixed path can't honor address 0 (in prod `EXIT_NOT_IMPLEMENTED(in_addr==0)` is a no-op, so it falls through to `ReleaseReservedRange(0,..)` → ENOMEM at memory.cpp:2876). The `CanMapDirect` gate (2739) is NOT the culprit — offset is valid.
+- **Fix (commit 235bb47):** in `KernelBatchMap2`, drop `MAP_FIXED` for entries whose `start==0`; the mapping writes the chosen address back into `entry->start`. Entries with explicit addresses keep `MAP_FIXED`. **Result: batchmap ENOMEM eliminated (0/6 runs, was ~40%).**
+
+### 14.2 Texture/depth alias tail peeled (each lets streaming go further)
+All in `imageInfo.h`/`textureCache.cpp`, all "buffer-owned image" cases where the classifier was too strict. Pattern: a plain buffer_modified (native-buffer-owned, `!gpu_modified`) image can be retired/discarded cleanly because its bytes are recoverable from the persistent native buffer / guest backing; publish the buffer to backing (`PublishImageBacking`) and clear `buffer_modified` so the clean-retire invariants (`RetireImages`) hold.
+- `e40c940`: ClassifyBufferImageWrite StorageTexture — accept a *contained* formatted write into a buffer-owned storage (not only enclosing). RetireSampledTargetAliases — sampled subrange of a buffer-owned plain depth (`buffer_current_depth`).
+- `72a6ce5`: publish buffer-owned depth backing before retiring it for a sampled alias (fixes "invalid image retirement kind=3 buffer_modified=1", was 2/4).
+- `25f0918`: ClassifyBufferImageWrite DepthTarget — accept a *contained* formatted write into a buffer-owned depth (not only exact). ClassifyStorageSampledOverlap — discard a buffer_modified storage overlapped by a sampled (backing published by FindTexture's ObtainBufferForImage first).
+- `235bb47`: storage_discard path publishes+clears buffer_modified before discard (fixes "stale sampled storage owner regained GPU ownership").
+
+### 14.3 CURRENT BLOCKER (frame ~350-386): dual-ownership tracker re-entry (NOT batchmap anymore)
+Deterministic `same=1` tracker re-entry, `thread=GpuWorker state=rb_download`, `upload_ra=FindDepthTarget` (~3/6 runs). Mechanism:
+- `FindDepthTarget` calls `m_buffer_cache.ObtainBufferForImage(depth region)` at textureCache.cpp:2338 — **before** it resolves overlapping GPU-owned images (which happens after the FaultSafeTextureLock at 2350+).
+- A `gpu_modified` color/storage image aliasing the depth's guest memory still holds GPU page protection. ObtainBufferForImage's cpu-dirty upload (bufferCache.cpp:936, `ForEachUploadRange` is_written=false) reads that guest memory → CPU-read fault → TextureCache inline readback (`rb_download`) → `ForEachDownloadRange` → `CheckNotInUploadCallback` re-entry EXIT (memoryTracker.h:165).
+- Why it's a hard EXIT not a passthrough: `ForEachUploadRange(is_written=false)` releases region spinlocks before upload_func, but keeps `m_access_mutex` (non-recursive std::mutex) held; a nested `ForEachDownloadRange` would deadlock on it, so the guard is correct. **The fix must PREVENT the fault: materialize/retire the overlapping gpu_modified image(s) BEFORE ObtainBufferForImage reads guest memory in FindDepthTarget.** (Same latent gap exists in FindTexture/FindRenderTarget; depth hits it because the level binds a depth over a region a color/storage pass just wrote.)
+- Other tail crashes still seen (1/6 each): "unsupported render-target alias" (RT reclaims a gpu depth, existing_kind=3), "unsupported storage-image byte alias" (storage over gpu depth, gpu=1/1), "color-image readback storage is unsupported" (kind=1 buffer=1 buffer_cpu=1).
+
+### 14.4 Diagnostics added this session (strip before final fps run)
+`KYTY_DIAG batchmap-fail` (memory.cpp KernelBatchMap2), `KYTY_DIAG mapdirect-enomem` (KernelMapDirectMemory), RetireImages `_ReturnAddress` caller capture (textureCache.cpp), all under the existing `KYTY_DIAG` convention.
