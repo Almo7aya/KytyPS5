@@ -427,3 +427,14 @@ The consistent streaming crash (`memoryTracker.h:155`, "re-entered from upload c
 - **`textureCache.cpp:2083` (~1/5)** — another texture-alias limitation.
 
 The remaining tail is emulator **feature-completeness** for GTA III's specific aliasing patterns (sampled↔depth/render-target aliases) plus the pre-existing guest abort — each an "unsupported X" guard that EXITs rather than render wrong, so relaxing any needs careful per-case correctness work, not a blanket change.
+
+---
+
+## 13. Session 3 part 5 (2026-07-28): peeling the alias tail (needs visual validation)
+
+With the deadlock/perf/coherency work done, the level-load tail is a sequence of "unsupported alias" EXITs, each a real GTA III GPU-memory reuse pattern. Fixed two so far; each lets the load reach further (frame ~350 → ~411). **Both relax deliberate guards and need on-screen validation — headless testing only proves no-crash, not correct pixels.**
+
+- **`textureCache.cpp:1253` sampled-contains-depth (committed `6f71137`).** A sampled texture fully containing a plain (no stencil/htile, 1 layer) GPU-dirty depth target. The retire path already reads the depth back to *canonical guest backing* and the sampled image uploads from that, so the general `contained` case is handled like the exact/expansion shapes. Low risk (guest backing is the shared canonical form).
+- **`textureCache.cpp:2093` render-target reinterpretation (committed `8774246`).** Rebinding the exact footprint as a differently-shaped RT (e.g. 1680x946x8bpe → 3360x1892x2bpe, same bytes). Routed through `MaterializeRetireTarget`, which downloads the old color to guest memory (transient) and makes the **new target fresh** — no preserve-into-new-shape round-trip, so no scramble; the guest renders over it. Correct iff it really is pool reuse (game overwrites); needs validation.
+
+**Current tail (frame ~300-411):** `bufferCache.cpp:1118` GPU-copy (`CopyBuffer` CP-DMA) whose destination aliases a render target `InvalidateMemoryFromGPU` can't retire (deeper classifier work); a residual `memoryTracker.h:155` (~1/3, timing — the merge-span fix cut it from 3/3 but a path remains); and the pre-existing `libC.cpp:314` guest abort. Each is per-case feature work; the risk is silent wrong rendering, so validate the two committed alias fixes on screen before extending further.
