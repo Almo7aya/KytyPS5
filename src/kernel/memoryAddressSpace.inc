@@ -54,9 +54,21 @@ public:
 			m_handle = nullptr;
 		}
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#if defined(__APPLE__)
+		{
+			char shm_name[64];
+			snprintf(shm_name, sizeof(shm_name), "/kyty-dm-%d-%llx", static_cast<int>(getpid()),
+			         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(this)));
+			m_fd = shm_open(shm_name, O_RDWR | O_CREAT | O_EXCL, 0600);
+			if (m_fd >= 0) {
+				shm_unlink(shm_name);
+			}
+		}
+#else
 		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+#endif
 		if (m_fd < 0) {
-			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: memfd_create failed: %d\n",
+			LOGF_COLOR(Log::Color::Red, "\t direct-memory backing: shared fd creation failed: %d\n",
 			           errno);
 			return;
 		}
@@ -179,9 +191,15 @@ public:
 			SetFailure(failure_reason, FailureReason::ReserveAlignedFailed);
 			return 0;
 		}
+#if !defined(__APPLE__)
+		// On macOS the PROT_NONE reservation is left in place: MapView's MAP_FIXED
+		// replaces it atomically, so the range never becomes a hole that dyld,
+		// Rosetta, or Metal background threads could claim (which the subsequent
+		// MAP_FIXED would then silently destroy).
 		if (!ReleaseReservedProbe(reserved, failure_reason)) {
 			return 0;
 		}
+#endif
 		if (MapFixed(reserved, size, backing_offset, mode, failure_reason)) {
 			return reserved;
 		}
@@ -367,9 +385,12 @@ public:
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			if (preserve_placeholder && placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
+#endif
+			// Only Windows preserves placeholders.
 			return true;
 		}
 
@@ -1050,9 +1071,22 @@ private:
 		return ptr;
 	}
 
-	static bool UnmapView(void* vaddr, uint64_t size) { return munmap(vaddr, size) == 0; }
+	static bool UnmapView(void* vaddr, uint64_t size) {
+#if defined(__APPLE__)
+		// Re-reserve instead of freeing: the guest may MAP_FIXED-remap this range
+		// later, and that must never destroy a host mapping (dyld, Rosetta, Metal)
+		// that moved into the hole in the meantime.
+		return mmap(vaddr, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANON | MAP_NORESERVE,
+		            -1, 0) != MAP_FAILED;
+#else
+		return munmap(vaddr, size) == 0;
+#endif
+	}
 
-	static bool UnmapViewPreservePlaceholder(void* /*vaddr*/, uint64_t /*size*/) { return false; }
+	// POSIX has no placeholder equivalent.
+	static bool UnmapViewPreservePlaceholder(void* vaddr, uint64_t size) {
+		return munmap(vaddr, size) == 0;
+	}
 
 	int m_fd = -1;
 #endif
@@ -1383,8 +1417,8 @@ private:
 		}
 	}
 
-	uint64_t                     m_granularity = 0x10000;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, uint64_t> m_free;
 #endif
+	uint64_t m_granularity = 0x10000;
 };

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/waitWatch.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -43,11 +45,53 @@ public:
 	                                    bool downloaded) noexcept;
 	[[nodiscard]] bool InvalidateRegion(uint64_t vaddr, uint64_t size,
 	                                    PageFaultPhase phase) noexcept;
+	template <typename Flush>
+	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
+		static_assert(std::is_invocable_v<Flush&>);
+		CheckNotInUploadCallback();
+		ValidateRange(vaddr, size);
+
+		const auto update_cpu_state = [this, vaddr, size] {
+			std::lock_guard             access(m_access_mutex);
+			std::vector<RegionManager*> managers;
+			Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
+				managers.push_back(manager);
+			});
+			std::vector<std::unique_lock<TrackingSpinLock>> locks;
+			locks.reserve(managers.size());
+			for (auto* manager: managers) {
+				locks.emplace_back(manager->lock);
+			}
+			const bool gpu_modified = Iterate<false>(
+			    vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				    return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+			    });
+			if (gpu_modified) {
+				return true;
+			}
+			Iterate<false>(vaddr, size,
+			               [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+				               const auto changed = manager->ChangeState<DirtySource::Cpu, true>(
+				                   manager->GetCpuAddr() + offset, bytes);
+				               manager->ApplyProtection(changed, false);
+			               });
+			return false;
+		};
+
+		if (!update_cpu_state()) {
+			return;
+		}
+		std::forward<Flush>(on_flush)();
+		if (update_cpu_state()) {
+			EXIT("memory invalidation retained GPU-owned pages\n");
+		}
+	}
 	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
 	                                             uint64_t size, PageFaultPhase phase) noexcept;
-	// KYTY_DIAG: true when the current thread is inside a ForEachUploadRange callback (any tracker
-	// instance). A readback triggered here re-enters m_access_mutex and aborts; used to localize it.
-	[[nodiscard]] static bool InUploadCallback() noexcept { return s_upload_owner != nullptr; }
+	void               ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+	                                         const char* operation) const noexcept;
+	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+	                               const char* operation);
 
 	template <bool clear, typename Preflight, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
@@ -114,10 +158,7 @@ public:
 		std::unique_lock access(m_access_mutex);
 		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
-		// Save/restore rather than clear so a nested upload on a DIFFERENT tracker instance (allowed
-		// by CheckNotInUploadCallback) restores the outer instance's marker instead of losing it.
-		const MemoryTracker* prev_upload_owner = s_upload_owner;
-		s_upload_owner                         = this;
+		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->Track(manager->GetCpuAddr() + offset, bytes);
@@ -137,7 +178,7 @@ public:
 				    manager->lock.unlock();
 			    });
 		}
-		s_upload_owner = prev_upload_owner;
+		s_upload_owner = previous_upload_owner;
 	}
 
 private:
@@ -152,25 +193,8 @@ private:
 	inline static thread_local uint64_t           s_nested_fault_vaddr   = 0;
 	inline static thread_local uint64_t           s_nested_fault_size    = 0;
 
-	static void CheckNotInUploadCallback(const MemoryTracker* self, uint64_t vaddr = 0) noexcept {
-		// Only a re-entry into the SAME tracker instance can deadlock: m_access_mutex and the region
-		// spinlocks are per-instance, so an operation on a different tracker while this thread is
-		// inside another tracker's upload callback is safe (a level-load fault on texture memory that
-		// happens while the buffer cache is mid-upload, and vice versa). Aborting those was a false
-		// positive; only the same-instance case is a real hazard.
-		if (s_upload_owner == self) {
-			const auto& w = Kyty::WaitWatch::Self();
-			std::printf("KYTY_DIAG tracker re-entry: self=%p owner=%p same=%d vaddr=0x%llx "
-			            "thread=%s state=%s arg0=0x%llx upload_ra=0x%llx upload=0x%llx+0x%llx\n",
-			            static_cast<const void*>(self), static_cast<const void*>(s_upload_owner),
-			            s_upload_owner == self ? 1 : 0, static_cast<unsigned long long>(vaddr),
-			            w.name.load(std::memory_order_relaxed),
-			            w.kind.load(std::memory_order_relaxed),
-			            static_cast<unsigned long long>(w.arg0.load(std::memory_order_relaxed)),
-			            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(s_upload_ra)),
-			            static_cast<unsigned long long>(s_upload_vaddr),
-			            static_cast<unsigned long long>(s_upload_size));
-			std::fflush(stdout);
+	void CheckNotInUploadCallback() const noexcept {
+		if (s_upload_owner == this) {
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
@@ -210,7 +234,9 @@ private:
 	void        RequireMapped(uint64_t vaddr, uint64_t size) const {
 		ValidateRange(vaddr, size);
 		if (!m_page_manager.IsMapped(vaddr, size)) {
-			EXIT("memory tracker range is not mapped\n");
+			EXIT("memory tracker range [0x%llx, 0x%llx) is not mapped\n",
+			     static_cast<unsigned long long>(vaddr),
+			     static_cast<unsigned long long>(vaddr + size));
 		}
 	}
 	RegionManager* GetOrCreateRegion(uint64_t index);

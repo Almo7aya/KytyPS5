@@ -6,19 +6,11 @@
 
 namespace Libs::Graphics {
 
-class CommandBuffer;
-struct VideoOutVulkanImage;
-struct PreparedFrame;
+class Presenter;
 
-void           WindowInit(uint32_t width, uint32_t height);
-void           WindowRun();
-int            WindowGetPresentedFrame();
-// Persist the Vulkan driver pipeline cache to disk (safe to call periodically / any time).
-void           SavePipelineCache();
-PreparedFrame& WindowPrepareFrame(CommandBuffer& buffer, VideoOutVulkanImage& image);
-PreparedFrame& WindowPrepareBlankFrame(CommandBuffer& buffer, uint32_t width, uint32_t height,
-                                       bool opaque);
-void           WindowPresentFrame(PreparedFrame& frame);
+[[nodiscard]] Presenter& WindowInit(uint32_t width, uint32_t height);
+void                     WindowRun();
+void                     WindowShutdown();
 
 } // namespace Libs::Graphics
 

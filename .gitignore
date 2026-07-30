@@ -3,12 +3,4 @@
 .idea/
 build/
 _Build/vscode-clang/
-_Build
-_SaveData
-_Shaders
-_RenderDoc
-_DownloadData
-_pipeline_cache.bin
-_*_logs
-_gta3_logs*
-_work
+_Build/

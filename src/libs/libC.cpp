@@ -201,7 +201,8 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 
 	uint64_t rbp = 0;
 	uint64_t rsp = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// This assembly is x86-64-specific, not Windows-specific.
+#if defined(__x86_64__) || defined(_M_X64)
 	asm volatile("movq %%rbp, %0" : "=r"(rbp));
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
 #endif
@@ -480,7 +481,15 @@ static KYTY_SYSV_ABI size_t libc_strftime(char* str, size_t count, const char* f
 		return 0;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// Guest-created tm values do not initialize glibc's tm_zone pointer.
+	std::tm sanitized = *timeptr;
+	sanitized.tm_zone = nullptr;
+
+	return std::strftime(str, count, format, &sanitized);
+#else
 	return std::strftime(str, count, format, timeptr);
+#endif
 }
 
 static KYTY_SYSV_ABI void catchReturnFromMain(int status) {
@@ -833,19 +842,19 @@ int KYTY_SYSV_ABI atoi(const char* str) {
 }
 
 float KYTY_SYSV_ABI sinf(float x) {
-	return std::sinf(x);
+	return std::sin(x);
 }
 
 float KYTY_SYSV_ABI cosf(float x) {
-	return std::cosf(x);
+	return std::cos(x);
 }
 
 void KYTY_SYSV_ABI sincosf(float x, float* sinp, float* cosp) {
 	if (sinp != nullptr) {
-		*sinp = std::sinf(x);
+		*sinp = std::sin(x);
 	}
 	if (cosp != nullptr) {
-		*cosp = std::cosf(x);
+		*cosp = std::cos(x);
 	}
 }
 

@@ -2,8 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "graphics/host_gpu/rangeSet.h"
 
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -53,7 +56,6 @@ public:
 	[[nodiscard]] uint64_t GetPageSize() const;
 	[[nodiscard]] bool     IsTracked(uint64_t vaddr) const noexcept;
 	[[nodiscard]] bool     IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	[[nodiscard]] bool     HasAnyMapping(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool HasGpuAccess(uint64_t vaddr, uint64_t size, GpuAccess access) const noexcept;
 	// Returns the number of contiguous bytes from vaddr (capped at max_size) that have the requested
 	// GPU access. Used to clamp effectively-unbounded buffer descriptors (num_records ~= 0xffffffff)
@@ -67,7 +69,8 @@ public:
 	void OnGpuUnmap(uint64_t vaddr, uint64_t size, GpuAccess access = GpuAccess::ReadWrite);
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
-	[[nodiscard]] bool HandleWriteRange(uint64_t vaddr, uint64_t size) noexcept;
+	[[nodiscard]] std::vector<std::unique_ptr<BackingWrite>>
+	ReserveBackingWrites(std::span<const RangeSet::Range> ranges);
 
 private:
 	void BeginBackingWrite(uint64_t vaddr, uint64_t size) noexcept;

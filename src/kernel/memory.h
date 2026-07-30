@@ -6,6 +6,11 @@
 #include "common/subsystems.h"
 #include "common/virtualMemory.h"
 
+namespace Libs::Graphics {
+class GpuResourceManager;
+enum class PageFaultAccess;
+} // namespace Libs::Graphics
+
 namespace Libs::LibKernel::Memory {
 
 KYTY_SUBSYSTEM_DEFINE(Memory);
@@ -94,12 +99,15 @@ struct KernelMemoryPoolBlockStats {
 static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
-void RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
-void SetFlexibleMemorySize(uint64_t size);
-bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
-void PrepareHostWrite(uint64_t vaddr, uint64_t size);
+void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void                   SetFlexibleMemorySize(uint64_t size);
+bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+[[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+void                   InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept;
+[[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
