@@ -95,19 +95,6 @@ void CommandBuffer::RecycleDescriptorAfterFence(VulkanDescriptorSet& set) {
 	m_descriptor_sets_after_fence.push_back(&set);
 }
 
-void CommandBuffer::DebugDumpFenceStatus() const {
-	if (IsInvalid()) {
-		LOGF("Vulkan fence: invalid command buffer\n");
-		return;
-	}
-	const auto result = GetRenderContext().GetGraphics().device.getFenceStatus(m_slot->fence);
-	LOGF("Vulkan fence: slot=%u execute=%d waited=%d status=%s (%d) submit_seq=%" PRIu64
-	     " debug_op=%u debug_submit=%" PRIu64 " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
-	     m_slot->id, m_execute, m_fence_waited, VulkanToString(result).c_str(),
-	     static_cast<int>(result), m_submit_seq, m_debug_op, m_debug_submit_id, m_debug_arg0,
-	     m_debug_arg1, m_debug_arg2, m_debug_arg3, m_debug_arg4);
-}
-
 void CommandBuffer::RecycleDescriptorsAfterFence() {
 	for (auto* set: m_descriptor_sets_after_fence) {
 		m_context.GetDescriptorCache().Recycle(*set);

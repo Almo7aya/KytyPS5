@@ -58,7 +58,6 @@ uint64_t ReadReferenceClock() {
 }
 
 enum class EndOfPipeCompletion { None, Interrupt, Flip, FlipAndInterrupt };
-enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 
 struct EndOfPipeSignal {
 	CommandBuffer*          buffer          = nullptr;
@@ -67,20 +66,16 @@ struct EndOfPipeSignal {
 	std::array<uint32_t, 4> debug_args      = {};
 	uint64_t                debug_data      = 0;
 	std::optional<uint64_t> destination;
-	std::optional<EndOfPipeWriteSize> write_size;
-	uint64_t                write_value     = 0;
 	EndOfPipeCompletion     completion      = EndOfPipeCompletion::None;
 	uint64_t                completion_data = 0;
 };
 
+enum class EndOfPipeWriteSize : uint32_t { Dword = 4, Qword = 8 };
 enum class EndOfPipeWriteAction { Write, WriteBack, Interrupt, InterruptWriteBack };
 
 static void ValidateEndOfPipeSignal(const EndOfPipeSignal& signal) {
 	if (signal.destination.has_value()) {
 		EXIT_IF(*signal.destination == 0);
-	}
-	if (signal.write_size.has_value() && !signal.destination.has_value()) {
-		EXIT("end-of-pipe memory write has no destination\n");
 	}
 	EXIT_IF(signal.buffer == nullptr);
 	(void)signal.buffer->Handle();
@@ -120,11 +115,6 @@ static void RecordEndOfPipeSignal(const EndOfPipeSignal& signal) {
 			return;
 		}
 	}
-	const uint64_t args[LABEL_ARGS_MAX] = {
-	    signal.destination.value_or(0), signal.write_value,
-	    signal.write_size.has_value() ? static_cast<uint32_t>(*signal.write_size) : 0u,
-	    static_cast<uint32_t>(signal.completion), signal.completion_data};
-	SubmitLabel(*signal.buffer, CompleteEndOfPipeSignal, nullptr, args);
 }
 
 static CommandBufferDebugOp DebugOperation(EndOfPipeWriteAction action) {
@@ -159,8 +149,6 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
 	                                 : std::array {width, value_low, value_high, 0u},
 	    .debug_data      = destination,
 	    .destination     = destination,
-	    .write_size      = size,
-	    .write_value     = value,
 	    .completion      = interrupt ? EndOfPipeCompletion::Interrupt : EndOfPipeCompletion::None,
 	    .completion_data = context_id != 0 ? context_id : value,
 	};
@@ -201,7 +189,7 @@ void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst
 
 void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,
                                   uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::Write);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -211,7 +199,7 @@ void WriteAtEndOfPipeClockCounter(uint64_t submit_id, CommandBuffer& buffer, uin
 
 void WriteAtEndOfPipeClockCounterWithWriteBack(uint64_t submit_id, CommandBuffer& buffer,
                                                uint64_t* dst_gpu_addr, uint64_t value) {
-	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), value,
+	RecordEndOfPipeWrite(submit_id, buffer, reinterpret_cast<uint64_t>(dst_gpu_addr), 0,
 	                     EndOfPipeWriteSize::Qword, EndOfPipeWriteAction::WriteBack);
 
 	LOGF_COLOR(Log::Color::BrightGreen,
@@ -292,8 +280,6 @@ void WriteAtEndOfPipeWithInterruptWriteBackFlip32(uint64_t submit_id, CommandBuf
 	                        static_cast<uint32_t>(flip_mode), value},
 	    .debug_data      = static_cast<uint64_t>(flip_arg),
 	    .destination     = destination,
-	    .write_size      = EndOfPipeWriteSize::Dword,
-	    .write_value     = value,
 	    .completion      = EndOfPipeCompletion::FlipAndInterrupt,
 	    .completion_data = request_id,
 	});
@@ -311,8 +297,6 @@ void WriteAtEndOfPipeWithFlip32(uint64_t submit_id, CommandBuffer& buffer, uint3
 	                        static_cast<uint32_t>(flip_mode), value},
 	    .debug_data      = static_cast<uint64_t>(flip_arg),
 	    .destination     = destination,
-	    .write_size      = EndOfPipeWriteSize::Dword,
-	    .write_value     = value,
 	    .completion      = EndOfPipeCompletion::Flip,
 	    .completion_data = request_id,
 	});

@@ -12,9 +12,6 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
-#include "common/waitWatch.h"
-#include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/host_gpu/objects/label.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -28,11 +25,6 @@
 #include "loader/systemContent.h"
 #include "loader/timer.h"
 
-#include <algorithm>
-#include <cstdio>
-#include <map>
-#include <string>
-#include <vector>
 #include <cstdlib>
 #include <filesystem>
 

@@ -63,6 +63,7 @@ static void PrintUsage() {
 	         "4-vertex path.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --avplayer-skip <true|false>         Skip AVPlayer playback and intro videos.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
 }
 
@@ -227,6 +228,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--readback-linear-images") {
 			if (!ParseBool(value, options.config.readback_linear_images)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--avplayer-skip") {
+			if (!ParseBool(value, options.config.avplayer_skip_enabled)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

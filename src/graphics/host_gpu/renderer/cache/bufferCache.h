@@ -78,6 +78,8 @@ public:
 	[[nodiscard]] bool SynchronizeBacking(uint64_t vaddr, uint64_t size);
 	void               PublishImageBuffer(uint64_t vaddr, uint64_t size);
 	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
+	[[nodiscard]] uint64_t GpuAccessExtent(uint64_t vaddr, uint64_t max_size, bool is_read,
+	                                       bool is_written) const noexcept;
 	void RunGarbageCollector();
 
 private:

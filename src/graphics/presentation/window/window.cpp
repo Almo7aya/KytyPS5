@@ -965,8 +965,4 @@ void WindowContext::UpdateTitle() {
 #endif
 }
 
-int WindowGetPresentedFrame() {
-	return g_window_game.m_frame_num;
-}
-
 } // namespace Libs::Graphics

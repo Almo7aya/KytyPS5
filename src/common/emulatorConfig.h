@@ -37,6 +37,7 @@ struct ConfigOptions {
 	bool                   renderdoc_enabled           = false;
 	bool                   ngg_rectlist_draw_enabled   = true;
 	bool                   readback_linear_images      = false;
+	bool                   avplayer_skip_enabled       = false;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -66,6 +67,7 @@ bool SpirvDebugPrintfEnabled();
 bool RenderDocEnabled();
 bool NggRectlistDrawEnabled();
 bool ReadbackLinearImagesEnabled();
+bool AvPlayerSkipEnabled();
 
 } // namespace Config
 

@@ -91,25 +91,38 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
+
+	// GNM buffer descriptors are commonly over-provisioned (often with num_records set near
+	// UINT32_MAX) so the shader can perform its own bounds checks. Bind only the contiguous
+	// GPU-visible portion instead of treating the descriptor's nominal multi-gigabyte footprint as
+	// a Vulkan buffer range. Robust buffer access supplies zero for reads beyond the bound range.
+	const auto bound_size = context.GetBufferCache().GpuAccessExtent(
+	    address, size, resource.read || resource.formatted, resource.written);
+	if (bound_size == 0) {
+		BindNullStorageBuffer(context, result);
+		return result;
+	}
+
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
+	    bound_size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
 	auto binding = context.GetBufferCache().ObtainBuffer(
-	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
+	    command_buffer, address, bound_size, resource.written, resource.read, resource.formatted);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
 	const auto adjustment     = binding.offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 ||
+	    bound_size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	result.owner  = std::move(binding.owner);
 	result.buffer = binding.buffer;
 	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	result.range  = static_cast<vk::DeviceSize>(bound_size + adjustment);
 	return result;
 }
 
@@ -344,7 +357,8 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
-	const bool supported_mip_view = descriptor.BaseLevel() == 0 || is_1d || is_2d;
+	const bool supported_mip_view =
+	    descriptor.BaseLevel() == 0 || is_1d || is_2d || is_2d_array;
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
 	       supported_mip_view && descriptor.BaseLevel() == descriptor.LastLevel() &&
 	       descriptor.LastLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&

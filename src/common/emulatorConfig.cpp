@@ -97,4 +97,8 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool AvPlayerSkipEnabled() {
+	return g_config->avplayer_skip_enabled;
+}
+
 } // namespace Config

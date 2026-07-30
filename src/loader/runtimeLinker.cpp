@@ -753,7 +753,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	LOGF("regs: r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
 	     info->r12, info->r13, info->r14, info->r15);
 
-	if (IsReadableRange(info->rsp, 16u * sizeof(uint64_t))) {
+	constexpr uint64_t guest_stack_dump_qwords = 48;
+
+	if (IsReadableRange(info->rsp, guest_stack_dump_qwords * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		LOGF("stack:");
 		for (uint64_t i = 0; i < guest_stack_dump_qwords; i++) {
@@ -807,7 +809,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	dump_guest_code("guest rbx[0]", info->rbx);
 	dump_guest_code("guest rcx[0]", info->rcx);
 	dump_guest_code("guest rsi[0]", info->rsi);
-	if (IsDumpableRange(info->rsp, 16u * sizeof(uint64_t))) {
+	if (IsDumpableRange(info->rsp, guest_stack_dump_qwords * sizeof(uint64_t))) {
 		auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		for (uint64_t i = 0; i < guest_stack_dump_qwords; i++) {
 			char name[32] {};

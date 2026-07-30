@@ -111,7 +111,6 @@ public:
 	void RetireBufferAfterFence(std::unique_ptr<VulkanBuffer> buffer);
 	void RetainResourceUntilFence(std::shared_ptr<void> resource);
 	void RecycleDescriptorAfterFence(VulkanDescriptorSet& set);
-	void DebugDumpFenceStatus() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }

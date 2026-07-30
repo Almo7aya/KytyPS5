@@ -131,8 +131,6 @@ private:
 	void              WaitLocked();
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
-	void              RequestPauseAndWait();
-	void              ReleasePause();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
@@ -143,7 +141,6 @@ private:
 	std::mutex                                     m_shutdown_mutex;
 	Common::CondVar                                m_work_available;
 	Common::CondVar                                m_idle;
-	SharedPause                                    m_shared_pause;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	uint32_t                                       m_next_queue        = 0;
@@ -494,9 +491,6 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		     m_submit_id, width, address, static_cast<uint64_t>(value),
 		     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func, wait_op, poll,
 		     m_wait_reg_retries);
-		if (m_wait_reg_retries == 128) {
-			GetScheduler().DebugDumpFenceStatus();
-		}
 	}
 	g_gpu_wait.address.store(address, std::memory_order_relaxed);
 	g_gpu_wait.value.store(static_cast<uint64_t>(value), std::memory_order_relaxed);
@@ -724,8 +718,7 @@ bool GpuState::Process(Submission& submission) {
 
 	switch (submission.type) {
 		case SubmissionType::Graphics: {
-			bool     progressed = false;
-			uint64_t spin       = 0; // KYTY_DIAG
+			bool progressed = false;
 			submission.constant_complete |= submission.constant_commands.Empty();
 			for (;;) {
 				bool round_progress = false;
@@ -787,11 +780,7 @@ bool GpuState::Process(Submission& submission) {
 				m_renderer.GetGpuResources().RunGarbageCollector();
 			}
 			if (complete && submission.trigger_agc_interrupt_on_done) {
-				cp.TriggerAgcUserInterruptAtEndOfPipe();
-				progressed = true;
-			}
-			if (progressed) {
-				cp.BufferFlush();
+				Sync::TriggerAgcUserInterrupt();
 			}
 			break;
 		}
@@ -827,67 +816,7 @@ void GpuState::ResumeSubmissions() {
 	if (!g_gpu_mutex_owned) {
 		EXIT("GPU submissions resumed without an active pause\n");
 	}
-	ReleasePause();
 	m_submission_mutex.Unlock();
-	g_gpu_mutex_owned = false;
-}
-
-// Coalesced variant of PauseSubmissions for the per-fault drain. During level streaming the
-// drain was measured serializing ~16 engine threads 7-16x over wall-clock: every fault took
-// m_submission_mutex and parked the worker individually. The exclusivity a fault actually
-// needs is (a) the worker parked and (b) a fence+label flush covering everything submitted
-// so far. Because the worker stays parked for the whole window, one drain covers every
-// concurrent participant: the first participant parks, fences (BufferWait) and flushes
-// (LabelDrain) once under m_submission_mutex (kept only against Done()); joiners attach to
-// the open window without touching that mutex; the last leaver un-parks the worker.
-void Gpu::PauseSubmissionsShared() {
-	if (g_gpu_mutex_owned) {
-		EXIT("GPU submissions are already paused by this thread\n");
-	}
-	Kyty::WaitWatch::Scope watch("gpu_pause_lock", 0, 0);
-	Kyty::WaitWatch::DrainStats::pause_count.fetch_add(1, std::memory_order_relaxed);
-	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::pause_ns);
-	g_gpu_mutex_owned = true;
-	m_shared_pause.mutex.Lock();
-	if (m_shared_pause.participants == 0 && !m_shared_pause.draining) {
-		// Sole leader: drain once. Election is atomic so a thread arriving mid-drain cannot
-		// become a second leader; it joins below after the drain completes.
-		m_shared_pause.draining = true;
-		m_shared_pause.mutex.Unlock();
-		m_submission_mutex.Lock();
-		{
-			Kyty::WaitWatch::DrainStats::ScopedNs wt(Kyty::WaitWatch::DrainStats::waitidle_ns);
-			RequestPauseAndWait();
-		}
-		m_gfx_cp->BufferWait();
-		{
-			Kyty::WaitWatch::Scope drain("gpu_pause_labeldrain", 0, 0);
-			Kyty::WaitWatch::DrainStats::ScopedNs lt(Kyty::WaitWatch::DrainStats::labeldrain_ns);
-			LabelDrain();
-		}
-		m_submission_mutex.Unlock();
-		m_shared_pause.mutex.Lock();
-		m_shared_pause.draining     = false;
-		m_shared_pause.participants = 1;
-		m_shared_pause.cv.SignalAll();
-		m_shared_pause.mutex.Unlock();
-		return;
-	}
-	while (m_shared_pause.draining) {
-		m_shared_pause.cv.Wait(&m_shared_pause.mutex);
-	}
-	m_shared_pause.participants++;
-	m_shared_pause.mutex.Unlock();
-}
-
-void Gpu::ResumeSubmissionsShared() {
-	Common::LockGuard lock(m_shared_pause.mutex);
-	if (m_shared_pause.participants == 0) {
-		EXIT("GPU shared pause released without participants\n");
-	}
-	if (--m_shared_pause.participants == 0) {
-		ReleasePause();
-	}
 	g_gpu_mutex_owned = false;
 }
 
@@ -1480,6 +1409,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1525,6 +1455,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1606,6 +1537,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		case 0x04:
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
+				std::memcpy(dst_gpu_addr, &clock, sizeof(clock));
 				switch (cache_action) {
 					case 0x00:
 						if (((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1764,6 +1696,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1789,6 +1722,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);

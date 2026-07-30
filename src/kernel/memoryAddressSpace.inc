@@ -332,6 +332,7 @@ public:
 
 		const auto end     = vaddr + size;
 		auto       current = vaddr;
+		bool       all_placeholders_preserved = preserve_placeholder;
 		while (current < end) {
 			MapEntry entry {};
 			{
@@ -343,15 +344,20 @@ public:
 
 			const auto entry_end = entry.vaddr + entry.size;
 			const auto part_size = std::min(end, entry_end) - current;
-			const bool preserve_part_placeholder =
-			    preserve_placeholder && current == vaddr && part_size == size;
-			if (!UnmapOne(current, part_size, preserve_part_placeholder, placeholder_preserved)) {
+			bool       part_placeholder_preserved = false;
+			if (!UnmapOne(current, part_size, preserve_placeholder,
+			              &part_placeholder_preserved)) {
 				return false;
 			}
+			all_placeholders_preserved =
+			    all_placeholders_preserved && part_placeholder_preserved;
 
 			current += part_size;
 		}
 
+		if (placeholder_preserved != nullptr) {
+			*placeholder_preserved = all_placeholders_preserved;
+		}
 		return true;
 	}
 

@@ -48,7 +48,7 @@ public:
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
 		static_assert(std::is_invocable_v<Flush&>);
-		CheckNotInUploadCallback();
+		CheckNotInUploadCallback(this, vaddr);
 		ValidateRange(vaddr, size);
 
 		const auto update_cpu_state = [this, vaddr, size] {
@@ -193,8 +193,9 @@ private:
 	inline static thread_local uint64_t           s_nested_fault_vaddr   = 0;
 	inline static thread_local uint64_t           s_nested_fault_size    = 0;
 
-	void CheckNotInUploadCallback() const noexcept {
-		if (s_upload_owner == this) {
+	static void CheckNotInUploadCallback(const MemoryTracker* self,
+	                                     [[maybe_unused]] uint64_t vaddr = 0) noexcept {
+		if (s_upload_owner == self) {
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}

@@ -98,7 +98,8 @@ static uint32_t MachQueryPageProt(uint64_t vaddr) {
 constexpr uint32_t UNKNOWN_PROTECTION = 0;
 #endif
 
-thread_local bool g_in_fault_resolution = false;
+thread_local bool     g_in_fault_resolution   = false;
+thread_local uint32_t g_fault_readback_depth = 0;
 
 [[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
 	std::fputs("PageManager fail-fast: ", stderr);
@@ -1080,24 +1081,18 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 	}
 	auto& page   = m_impl->GetPage(*region, fault_vaddr);
 	bool  waited = false;
-	while (true) {
-		SpinGuard lock(page.lock);
-		if (access == PageFaultAccess::Read && page.late_read_pending &&
-		    Impl::AllowsAccess(page, fault_vaddr, access)) {
-			page.late_read_pending = false;
-			return true;
-		}
-		if (access == PageFaultAccess::Write && page.late_write_pending &&
-		    Impl::AllowsAccess(page, fault_vaddr, access)) {
-			page.late_write_pending = false;
-			return true;
-		}
-		if (page.resolving) {
-			if (page.backing_writer == CurrentThread()) {
-				FailFast("backing writer faulted on its own reserved page");
+	{
+		Kyty::WaitWatch::Scope w("pm_spin", fault_vaddr,
+		                         static_cast<uint64_t>(access)); // KYTY_DIAG
+		while (true) {
+			SpinGuard lock(page.lock);
+			if (access == PageFaultAccess::Read && page.late_read_pending &&
+			    Impl::AllowsAccess(page, fault_vaddr, access)) {
+				page.late_read_pending = false;
+				return true;
 			}
 			if (access == PageFaultAccess::Write && page.late_write_pending &&
-			    Impl::AllowsAccess(fault_vaddr, access)) {
+			    Impl::AllowsAccess(page, fault_vaddr, access)) {
 				page.late_write_pending = false;
 				return true;
 			}
@@ -1119,7 +1114,7 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 				}
 				bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
 				                                                      : page.late_write_pending);
-				const bool allowed = Impl::AllowsAccess(fault_vaddr, access);
+				const bool allowed = Impl::AllowsAccess(page, fault_vaddr, access);
 				pending            = false;
 				if (waited && !allowed) {
 					FailFast("page remained inaccessible after waiting for its resolver");
@@ -1130,15 +1125,9 @@ bool PageManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noex
 				// falls through to the guest exception path.
 				return allowed;
 			}
-			if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
+			if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
+			    (access == PageFaultAccess::Read && page.access_watchers == 0)) {
 				FailFast("fault access is incompatible with active page watchers");
-			}
-			bool&      pending = (access == PageFaultAccess::Read ? page.late_read_pending
-			                                                      : page.late_write_pending);
-			const bool allowed = Impl::AllowsAccess(page, fault_vaddr, access);
-			pending            = false;
-			if (waited && !allowed) {
-				FailFast("page remained inaccessible after waiting for its resolver");
 			}
 			page.resolving            = true;
 			page.resolving_read_write = page.access_watchers != 0;
