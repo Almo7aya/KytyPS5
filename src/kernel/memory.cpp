@@ -3602,9 +3602,35 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 				                      range.placeholder_backed);
 				return false;
 			}
-			// Register as committed flexible memory so later VirtualQuery/map/unmap stay consistent.
-			g_virtual_ranges->Add(block, size, 0, 0x3 /*R|W*/, 0, VirtualRangeType::Flexible,
-			                      range.name, true, false);
+
+			// Keep the flexible-memory backend in step with the virtual-range table. Fixed direct
+			// remaps use that backend to tear down every committed chunk in the target span; a
+			// virtual-range-only entry leaves the host commit behind and blocks the replacement
+			// view with ERROR_INVALID_ADDRESS.
+			constexpr int CPU_RW_PROTECTION = 0x3;
+			const bool backend_mapped =
+			    g_flexible_memory->Map(block, size, CPU_RW_PROTECTION,
+			                           VirtualMemory::Mode::ReadWrite, GpuAccessMode::NoAccess,
+			                           range.name);
+			const bool range_added =
+			    backend_mapped &&
+			    g_virtual_ranges->Add(block, size, 0, CPU_RW_PROTECTION, 0,
+			                          VirtualRangeType::Flexible, range.name, true, false);
+			if (!range_added) {
+				if (backend_mapped) {
+					GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
+					if (!g_flexible_memory->Unmap(block, size, &rollback_gpu_mode)) {
+						EXIT("commit-on-fault backend rollback failed: addr=0x%016" PRIx64
+						     " size=0x%016" PRIx64 "\n",
+						     block, size);
+					}
+				}
+				const bool placeholder_restored =
+				    RestoreCommittedPlaceholderOrProtect(block, size);
+				g_virtual_ranges->Add(block, size, 0, 0, 0, range.type, range.name, false,
+				                      placeholder_restored);
+				return false;
+			}
 			CommitOnFaultLog(block, size, "tracked");
 			return true;
 		}
