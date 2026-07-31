@@ -116,10 +116,23 @@ void EmitExport(EmitterState& state, const IR::Instruction& inst) {
 
 	const auto value = ApplyMrtExportMapping(state, inst, EmitExportVec4F32(state, inst));
 	if (inst.export_info.kind == IR::ExportTargetKind::Position) {
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction({OpAccessChain, state.ptr_output_vec4_float, pointer, variable,
-		                            ConstantU32(state, 0)});
-		state.builder.AddFunction({OpStore, pointer, value});
+		// A shader may build POS0 with several partial EXP instructions. Disabled
+		// lanes retain their previous values; replacing the whole vec4 here would
+		// reset them to EmitExportVec4F32's defaults and collapse depth-only
+		// geometry to (x, 0, 0, 1).
+		for (uint32_t component = 0; component < 4u; component++) {
+			if (((inst.export_info.en >> component) & 1u) == 0) {
+				continue;
+			}
+			const auto component_value = state.builder.AllocateId();
+			const auto pointer         = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpCompositeExtract, state.float_type, component_value, value, component});
+			state.builder.AddFunction(
+			    {OpAccessChain, state.ptr_output_float, pointer, variable, ConstantU32(state, 0),
+			     ConstantU32(state, component)});
+			state.builder.AddFunction({OpStore, pointer, component_value});
+		}
 		return;
 	}
 
