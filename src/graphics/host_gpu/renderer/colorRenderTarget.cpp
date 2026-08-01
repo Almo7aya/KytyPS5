@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "common/waitWatch.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -96,12 +97,12 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	// compared against the surfaces the post chain samples.
 	if (rt.attrib2.width + 1u >= 1920) {
 		static std::atomic<uint32_t> rt_log = 0;
-		if (rt_log.fetch_add(1, std::memory_order_relaxed) < 200) {
-			std::printf("KYTY_DIAG rt-resolve base=0x%010llx %ux%u fmt=0x%x nfmt=0x%x tile=0x%x "
-			            "slot=%u\n",
+		if (rt_log.fetch_add(1, std::memory_order_relaxed) < 4000) {
+			std::printf("KYTY_DIAG rt f=%llu base=0x%010llx %ux%u fmt=0x%x nfmt=0x%x\n",
+			            static_cast<unsigned long long>(
+			                Kyty::WaitWatch::g_frames.load(std::memory_order_relaxed)),
 			            static_cast<unsigned long long>(rt.base.addr), rt.attrib2.width + 1u,
-			            rt.attrib2.height + 1u, rt.info.format, rt.info.channel_type,
-			            rt.attrib3.tile_mode, rt_slot);
+			            rt.attrib2.height + 1u, rt.info.format, rt.info.channel_type);
 			std::fflush(stdout);
 		}
 	}

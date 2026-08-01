@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "common/waitWatch.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -1201,6 +1202,23 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
+		// KYTY_DIAG: an empty guest range substitutes a 1x1 null image. If a real post-processing
+		// input lands here (e.g. the tonemap's exposure texture) the shader reads zeros and the whole
+		// frame goes black, so report what was asked for.
+		{
+			static std::atomic<uint32_t> null_log = 0;
+			if (null_log.fetch_add(1, std::memory_order_relaxed) < 200) {
+				std::printf("KYTY_DIAG null-image addr=0x%010llx size=0x%010llx guest_fmt=%u vk_fmt=%d "
+				            "%ux%u lv=%u tile=%u bind=%s\n",
+				            static_cast<unsigned long long>(desc.info.data.address),
+				            static_cast<unsigned long long>(desc.info.data.size),
+				            desc.info.guest_format, static_cast<int>(desc.info.pixel_format),
+				            desc.info.extent.width, desc.info.extent.height,
+				            desc.info.resources.levels, desc.info.tile_mode,
+				            desc.type == BindingType::Storage ? "STORAGE" : "sampled");
+				std::fflush(stdout);
+			}
+		}
 		CacheLock lock(*this, m_lock);
 		return GetNullImage(desc);
 	}
@@ -1327,21 +1345,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	// post-processing scene buffer can be compared -- if they share a guest address but derive
 	// different formats the bug is in the format mapping, if the addresses differ the writer is
 	// simply somewhere else.
-	if (desc.info.extent.width >= 1920) {
+	if (desc.info.extent.width >= 1920 && desc.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
 		static std::atomic<uint32_t> lookup_log = 0;
-		if (lookup_log.fetch_add(1, std::memory_order_relaxed) < 200) {
-			const auto& info = ResolveImage(result).info;
-			std::printf("KYTY_DIAG surface-lookup bind=%s addr=0x%016llx size=0x%010llx guest_fmt=%u "
-			            "vk_fmt=%d tile=%u %ux%u lv=%u %s -> img_addr=0x%016llx img_vk_fmt=%d "
-			            "img_%ux%u\n",
+		if (lookup_log.fetch_add(1, std::memory_order_relaxed) < 4000) {
+			std::printf("KYTY_DIAG surf f=%llu bind=%s addr=0x%010llx img=%u.%u %s\n",
+			            static_cast<unsigned long long>(
+			                Kyty::WaitWatch::g_frames.load(std::memory_order_relaxed)),
 			            desc.type == BindingType::Storage ? "STORAGE" : "sampled",
-			            static_cast<unsigned long long>(desc.info.data.address),
-			            static_cast<unsigned long long>(desc.info.data.size),
-			            desc.info.guest_format, static_cast<int>(desc.info.pixel_format),
-			            desc.info.tile_mode, desc.info.extent.width, desc.info.extent.height,
-			            desc.info.resources.levels, inserted_new ? "NEW" : "reuse",
-			            static_cast<unsigned long long>(info.data.address),
-			            static_cast<int>(info.pixel_format), info.extent.width, info.extent.height);
+			            static_cast<unsigned long long>(desc.info.data.address), result.index,
+			            result.generation, inserted_new ? "NEW" : "reuse");
 			std::fflush(stdout);
 		}
 	}
