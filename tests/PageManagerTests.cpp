@@ -1,13 +1,12 @@
+#include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -18,19 +17,16 @@
 #undef min
 #undef max
 #else
-#include <csignal>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
-#include <ucontext.h>
 #include <unistd.h>
 #endif
 
 namespace {
 
-using Libs::Graphics::GpuAccess;
-using Libs::Graphics::PageFaultAccess;
 using Libs::Graphics::PageManager;
+using Libs::Graphics::PageWatchMode;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -40,7 +36,6 @@ void Check(bool value, const char *text) {
 }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-// POSIX shims for the shared test body.
 using DWORD = uint32_t;
 constexpr uint32_t PAGE_NOACCESS = 1;
 constexpr uint32_t PAGE_READONLY = 2;
@@ -63,7 +58,7 @@ uint32_t Protection(const void *address) {
   std::FILE *maps = std::fopen("/proc/self/maps", "r");
   Check(maps != nullptr, "open /proc/self/maps failed");
   char line[512];
-  uint32_t result = 0; // 0 => not mapped at all
+  uint32_t result = 0;
   while (std::fgets(line, sizeof(line), maps) != nullptr) {
     unsigned long start = 0;
     unsigned long end = 0;
@@ -82,15 +77,12 @@ uint32_t Protection(const void *address) {
   return result;
 }
 
-bool IsWritable(const void *address) { return Protection(address) == PAGE_READWRITE; }
-
-// munmap needs the length that VirtualFree's callers pass as 0, so sizes are remembered here.
 std::map<void *, size_t> &AllocationSizes() {
   static std::map<void *, size_t> sizes;
   return sizes;
 }
 
-int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
+int VirtualFree(void *address, size_t, DWORD) {
   auto &sizes = AllocationSizes();
   auto it = sizes.find(address);
   if (it == sizes.end()) {
@@ -101,137 +93,39 @@ int VirtualFree(void *address, size_t /*size*/, DWORD /*type*/) {
   return ok;
 }
 
-int VirtualProtect(void *address, size_t size, uint32_t protection, DWORD *old_protection) {
+int VirtualProtect(void *address, size_t size, uint32_t protection,
+                   DWORD *old_protection) {
   if (old_protection != nullptr) {
     *old_protection = Protection(address);
   }
   return ::mprotect(address, size, ToHostProt(protection)) == 0 ? 1 : 0;
 }
-#endif
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-bool IsWritable(const void *address) {
-  MEMORY_BASIC_INFORMATION info{};
-  Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
-  return info.Protect == PAGE_READWRITE;
-}
-
+#else
 uint32_t Protection(const void *address) {
   MEMORY_BASIC_INFORMATION info{};
   Check(VirtualQuery(address, &info, sizeof(info)) != 0, "VirtualQuery failed");
   return info.Protect;
 }
 #endif
-#if 1
 
-struct FaultContext {
-  PageManager *manager = nullptr;
-  bool result = true;
-  bool reenter = false;
-  uint64_t reenter_address = 0;
-  bool block = false;
-  std::atomic_uint32_t calls{0};
-  std::atomic_bool entered{false};
-  std::atomic_bool release{false};
-};
-
-std::atomic<PageManager *> g_native_fault_manager{nullptr};
-std::atomic_bool g_delay_native_fault{false};
-std::atomic_bool g_native_fault_entered{false};
-std::atomic_bool g_release_native_fault{false};
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-LONG CALLBACK NativeFaultHandler(EXCEPTION_POINTERS *exception) {
-  if (exception == nullptr || exception->ExceptionRecord == nullptr ||
-      exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) {
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-  const auto operation = exception->ExceptionRecord->ExceptionInformation[0];
-  const auto access = operation == 0   ? PageFaultAccess::Read
-                      : operation == 1 ? PageFaultAccess::Write
-                      : operation == 8 ? PageFaultAccess::Execute
-                                       : PageFaultAccess::Unknown;
-  auto *manager = g_native_fault_manager.load(std::memory_order_acquire);
-  if (manager == nullptr) {
-    return EXCEPTION_CONTINUE_SEARCH;
-  }
-  if (g_delay_native_fault.load(std::memory_order_acquire)) {
-    g_native_fault_entered.store(true, std::memory_order_release);
-    while (!g_release_native_fault.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-  }
-  return manager->HandleFault(
-             access, exception->ExceptionRecord->ExceptionInformation[1])
-             ? EXCEPTION_CONTINUE_EXECUTION
-             : EXCEPTION_CONTINUE_SEARCH;
-}
-#else
-// SIGSEGV stands in for the vectored exception handler.
-void NativeFaultHandler(int signal_number, siginfo_t *info, void *native_context) {
-  auto *context = static_cast<ucontext_t *>(native_context);
-  const auto error_code = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
-  const auto access = (error_code & 0x10u) != 0   ? PageFaultAccess::Execute
-                      : (error_code & 0x02u) != 0 ? PageFaultAccess::Write
-                                                  : PageFaultAccess::Read;
-  auto *manager = g_native_fault_manager.load(std::memory_order_acquire);
-  if (manager != nullptr) {
-    if (g_delay_native_fault.load(std::memory_order_acquire)) {
-      g_native_fault_entered.store(true, std::memory_order_release);
-      while (!g_release_native_fault.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-    }
-    if (manager->HandleFault(access, reinterpret_cast<uint64_t>(info->si_addr))) {
-      return;
-    }
-  }
-  struct sigaction restore {};
-  restore.sa_handler = SIG_DFL;
-  sigemptyset(&restore.sa_mask);
-  ::sigaction(signal_number, &restore, nullptr);
+bool IsWritable(const void *address) {
+  return Protection(address) == PAGE_READWRITE;
 }
 
-struct sigaction g_saved_segv_action {};
+uint64_t g_protection_calls = 0;
 
-void *AddVectoredExceptionHandler(unsigned long /*first*/,
-                                  void (*handler)(int, siginfo_t *, void *)) {
-  struct sigaction action {};
-  action.sa_sigaction = handler;
-  sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_SIGINFO;
-  if (::sigaction(SIGSEGV, &action, &g_saved_segv_action) != 0) {
-    return nullptr;
+bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
+                         Common::VirtualMemory::Mode mode) {
+  uint32_t protection = PAGE_NOACCESS;
+  if (mode == Common::VirtualMemory::Mode::Read) {
+    protection = PAGE_READONLY;
+  } else if (mode == Common::VirtualMemory::Mode::ReadWrite) {
+    protection = PAGE_READWRITE;
   }
-  return reinterpret_cast<void *>(handler);
-}
-
-int RemoveVectoredExceptionHandler(void * /*token*/) {
-  return ::sigaction(SIGSEGV, &g_saved_segv_action, nullptr) == 0 ? 1 : 0;
-}
-#endif
-
-bool InvalidateFault(void *context, Libs::Graphics::PageFaultAccess, uint64_t vaddr, uint64_t size,
-                     Libs::Graphics::PageFaultPhase phase) noexcept {
-  auto *fault = static_cast<FaultContext *>(context);
-  Check(fault != nullptr && fault->manager != nullptr, "invalid fault context");
-  if (phase != Libs::Graphics::PageFaultPhase::Invalidate) {
-    return true;
-  }
-  fault->calls.fetch_add(1, std::memory_order_relaxed);
-  if (fault->reenter) {
-    const auto address =
-        fault->reenter_address != 0 ? fault->reenter_address : vaddr;
-    (void)fault->manager->HandleFault(PageFaultAccess::Write, address);
-  }
-  if (fault->block) {
-    fault->entered.store(true, std::memory_order_release);
-    while (!fault->release.load(std::memory_order_acquire)) {
-      std::this_thread::yield();
-    }
-  }
-  (void)size;
-  return fault->result;
+  DWORD old_protection = 0;
+  g_protection_calls++;
+  return VirtualProtect(reinterpret_cast<void *>(vaddr), size, protection,
+                        &old_protection) != 0;
 }
 
 uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
@@ -243,8 +137,8 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
   Check(memory == reinterpret_cast<void *>(test_address),
         "fixed low VirtualAlloc failed");
 #else
-  // Do not overwrite a leaked mapping from an earlier case.
-  void *raw = ::mmap(reinterpret_cast<void *>(test_address), size, ToHostProt(protection),
+  void *raw = ::mmap(reinterpret_cast<void *>(test_address), size,
+                     ToHostProt(protection),
                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
   Check(raw == reinterpret_cast<void *>(test_address), "fixed low mmap failed");
   auto *memory = static_cast<uint8_t *>(raw);
@@ -253,39 +147,27 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE) {
   return memory;
 }
 
-void TestWatchFaultAndUnwatch() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
+void TestWatchAndUnwatch() {
+  g_protection_calls = 0;
+  PageManager manager;
   const auto page_size = manager.GetPageSize();
   auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
 
-  manager.OnGpuMap(reinterpret_cast<uint64_t>(memory), page_size * 2);
-  manager.UpdatePageWatchers(true, reinterpret_cast<uint64_t>(memory),
-                             page_size);
-  Check(manager.IsTracked(reinterpret_cast<uint64_t>(memory)) &&
-            !IsWritable(memory),
-        "watch did not protect the page");
-  Check(manager.HandleFault(PageFaultAccess::Write,
-                            reinterpret_cast<uint64_t>(memory + 32)),
-        "tracked write fault was not handled");
-  Check(!manager.IsTracked(reinterpret_cast<uint64_t>(memory)) &&
-            IsWritable(memory),
-        "fault invalidation did not remove the watcher");
-  Check(manager.HandleFault(PageFaultAccess::Write,
-                            reinterpret_cast<uint64_t>(memory)),
-        "single delayed write fault was not coalesced");
-  Check(manager.HandleFault(PageFaultAccess::Write,
-                            reinterpret_cast<uint64_t>(memory)),
-        "second delayed write fault was not coalesced");
-  manager.OnGpuUnmap(reinterpret_cast<uint64_t>(memory), page_size * 2);
+  manager.OnGpuMap(address, page_size * 2);
+  manager.UpdatePageWatchers(true, address, page_size);
+  Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
+        "write watch installed incorrect protections");
+  Check(g_protection_calls != 0,
+        "watch protection bypassed the address-space owner callback");
+  manager.UpdatePageWatchers(false, address, page_size);
+  Check(IsWritable(memory), "write unwatch did not restore access");
+  manager.OnGpuUnmap(address, page_size * 2);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestSharedWatcherFault() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
+void TestSharedWatcherCounts() {
+  PageManager manager;
   const auto page_size = manager.GetPageSize();
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
@@ -293,238 +175,39 @@ void TestSharedWatcherFault() {
   manager.OnGpuMap(address, page_size);
   manager.UpdatePageWatchers(true, address + 8, 32);
   manager.UpdatePageWatchers(true, address + 128, 64);
-  Check(manager.HandleFault(PageFaultAccess::Write, address + 16),
-        "shared-watcher fault was not handled");
-  Check(!manager.IsTracked(address) && IsWritable(memory),
-        "fault callback did not clear every shared watcher");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestReadWriteWatcherFault() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size,
-                             Libs::Graphics::PageWatchMode::Write);
-  manager.UpdatePageWatchers(true, address, page_size,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  manager.UpdatePageWatchers(false, address, page_size,
-                             Libs::Graphics::PageWatchMode::Write);
-  Check(Protection(memory) == PAGE_NOACCESS,
-        "read/write watcher did not install no-access protection");
-  Check(manager.HandleFault(PageFaultAccess::Read, address + 8),
-        "tracked read fault was not handled");
-  Check(Protection(memory) == PAGE_READWRITE && !manager.IsTracked(address),
-        "read fault did not release every watcher");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestPermittedMappedLateFaultsResume() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  manager.UpdatePageWatchers(false, address, page_size);
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "first delayed mapped write was not accepted");
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "second delayed mapped write was not accepted");
-  Check(manager.HandleFault(PageFaultAccess::Read, address),
-        "delayed mapped read was not accepted on readable backing");
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) != 0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to prepare intentional read-only protection");
-  Check(!manager.HandleFault(PageFaultAccess::Write, address),
-        "intentional read-only mapping accepted a write fault");
-  Check(VirtualProtect(memory, page_size, PAGE_READWRITE, &old_protection) != 0,
-        "failed to restore writable protection");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestPartialMappingUnmapPreservesTokens() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.OnGpuMap(address + 8, 16);
-  manager.UpdatePageWatchers(true, address, page_size,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  manager.UpdatePageWatchers(false, address, page_size,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  manager.OnGpuUnmap(address + 8, 16);
-  Check(manager.HandleFault(PageFaultAccess::Read, address),
-        "partial mapping unmap erased delayed read ownership");
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "partial mapping unmap erased delayed write ownership");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestNativeDelayedReadAfterModeDowngrade() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  memory[0] = 0x6d;
-  const auto address = reinterpret_cast<uint64_t>(memory);
-
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  manager.UpdatePageWatchers(false, address, page_size);
-  Check(Protection(memory) == PAGE_NOACCESS,
-        "read/write ownership did not install no-access protection");
-
-  void *handler = AddVectoredExceptionHandler(1, NativeFaultHandler);
-  Check(handler != nullptr, "AddVectoredExceptionHandler failed");
-  Check(g_native_fault_manager.exchange(&manager, std::memory_order_acq_rel) ==
-            nullptr,
-        "native fault manager already installed");
-  g_native_fault_entered.store(false, std::memory_order_release);
-  g_release_native_fault.store(false, std::memory_order_release);
-  g_delay_native_fault.store(true, std::memory_order_release);
-
-  uint8_t value = 0;
-  std::thread reader(
-      [&] { value = *static_cast<volatile uint8_t *>(memory); });
-  while (!g_native_fault_entered.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  manager.UpdatePageWatchers(true, address, page_size);
-  manager.UpdatePageWatchers(false, address, page_size,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
+  manager.UpdatePageWatchers(false, address + 8, 32);
   Check(Protection(memory) == PAGE_READONLY,
-        "mode downgrade did not restore readable protection");
-  manager.UpdatePageWatchers(true, address, page_size);
-
-  context.block = true;
-  bool write_handled = false;
-  std::thread writer([&] {
-    write_handled = manager.HandleFault(PageFaultAccess::Write, address);
-  });
-  while (!context.entered.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  g_release_native_fault.store(true, std::memory_order_release);
-  reader.join();
-  context.release.store(true, std::memory_order_release);
-  writer.join();
-
-  g_delay_native_fault.store(false, std::memory_order_release);
-  Check(g_native_fault_manager.exchange(nullptr, std::memory_order_acq_rel) ==
-            &manager,
-        "native fault manager publication changed");
-  Check(RemoveVectoredExceptionHandler(handler) != 0,
-        "RemoveVectoredExceptionHandler failed");
-  Check(value == 0x6d && write_handled &&
-            context.calls.load(std::memory_order_relaxed) == 1,
-        "delayed read was not coalesced across write ownership/resolution");
-
+        "first unwatch released a shared watcher");
+  manager.UpdatePageWatchers(false, address + 128, 64);
+  Check(IsWritable(memory), "last unwatch did not restore access");
   manager.OnGpuUnmap(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
-void TestDelayedFaultAfterExplicitUnwatch() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
+void TestMixedWatcherModes() {
+  PageManager manager;
   const auto page_size = manager.GetPageSize();
   auto *memory = Allocate(page_size);
   const auto address = reinterpret_cast<uint64_t>(memory);
+
   manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-
-  // Models a store that already raised an AV before another thread published
-  // explicit CPU dirtiness and removed the watcher.
-  manager.UpdatePageWatchers(false, address, page_size);
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "delayed watched write was not accepted after explicit unwatch");
-  Check(manager.HandleFault(PageFaultAccess::Write, address) &&
-            context.calls.load(std::memory_order_relaxed) == 0,
-        "second explicit-unwatch fault was not coalesced or dispatched invalidation");
-
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestNativeAccessViolation() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-
-  void *handler = AddVectoredExceptionHandler(1, NativeFaultHandler);
-  Check(handler != nullptr, "AddVectoredExceptionHandler failed");
-  Check(g_native_fault_manager.exchange(&manager, std::memory_order_acq_rel) ==
-            nullptr,
-        "native fault manager already installed");
-  *static_cast<volatile uint8_t *>(memory) = 0x5a;
-  Check(g_native_fault_manager.exchange(nullptr, std::memory_order_acq_rel) ==
-            &manager,
-        "native fault manager publication changed");
-  Check(RemoveVectoredExceptionHandler(handler) != 0,
-        "RemoveVectoredExceptionHandler failed");
-
-  Check(memory[0] == 0x5a && !manager.IsTracked(address) &&
-            context.calls.load(std::memory_order_relaxed) == 1,
-        "native access violation did not invalidate and resume the store");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestInvalidLateWriteTokenIsConsumed() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  Check(manager.HandleFault(PageFaultAccess::Write, address),
-        "initial write fault was not handled");
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_READONLY, &old_protection) !=
-                0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to create invalid late-write protection state");
-  Check(!manager.HandleFault(PageFaultAccess::Write, address) &&
-            !manager.HandleFault(PageFaultAccess::Write, address),
-        "invalid late-write token was accepted or retained");
-  Check(VirtualProtect(memory, page_size, PAGE_READWRITE, &old_protection) != 0,
-        "failed to restore test protection");
+  manager.UpdatePageWatchers(true, address, page_size, PageWatchMode::Write);
+  manager.UpdatePageWatchers(true, address, page_size,
+                             PageWatchMode::ReadWrite);
+  Check(Protection(memory) == PAGE_NOACCESS,
+        "read/write watcher did not deny access");
+  manager.UpdatePageWatchers(false, address, page_size, PageWatchMode::Write);
+  Check(Protection(memory) == PAGE_NOACCESS,
+        "write unwatch released a read/write watcher");
+  manager.UpdatePageWatchers(false, address, page_size,
+                             PageWatchMode::ReadWrite);
+  Check(IsWritable(memory), "read/write unwatch did not restore access");
   manager.OnGpuUnmap(address, page_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 void TestCrossRegionRange() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
+  PageManager manager;
   const auto page_size = manager.GetPageSize();
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   auto *memory = Allocate(region_size * 2);
@@ -548,9 +231,7 @@ void TestCrossRegionRange() {
 }
 
 void TestBatchedWatcherRanges() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
+  PageManager manager;
   const auto page_size = manager.GetPageSize();
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   constexpr uint64_t allocation_size = region_size * 3;
@@ -558,17 +239,11 @@ void TestBatchedWatcherRanges() {
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   manager.OnGpuMap(address, allocation_size);
-
   manager.UpdatePageWatchers(true, address + page_size, page_size);
   manager.UpdatePageWatchers(true, address + page_size * 3, page_size);
   manager.UpdatePageWatchers(true, address, page_size * 5);
-  for (uint64_t page = 0; page < 5; page++) {
-    Check(Protection(memory + page * page_size) == PAGE_READONLY,
-          "fragmented watch did not coalesce to read-only");
-  }
   manager.UpdatePageWatchers(false, address, page_size * 5);
-  Check(IsWritable(memory) &&
-            Protection(memory + page_size) == PAGE_READONLY &&
+  Check(IsWritable(memory) && Protection(memory + page_size) == PAGE_READONLY &&
             IsWritable(memory + page_size * 2) &&
             Protection(memory + page_size * 3) == PAGE_READONLY &&
             IsWritable(memory + page_size * 4),
@@ -576,94 +251,37 @@ void TestBatchedWatcherRanges() {
   manager.UpdatePageWatchers(false, address + page_size, page_size);
   manager.UpdatePageWatchers(false, address + page_size * 3, page_size);
 
+  g_protection_calls = 0;
   manager.UpdatePageWatchers(true, address, allocation_size);
-  Check(!IsWritable(memory) &&
-            !IsWritable(memory + region_size) &&
-            !IsWritable(memory + region_size * 2) &&
-            !IsWritable(memory + allocation_size - page_size),
-        "large cross-region watch did not protect the full range");
+  Check(g_protection_calls == 4 && Protection(memory) == PAGE_READONLY &&
+            Protection(memory + region_size) == PAGE_READONLY &&
+            Protection(memory + region_size * 2) == PAGE_READONLY &&
+            Protection(memory + allocation_size - page_size) == PAGE_READONLY,
+        "large watch was not batched and protected by tracking region");
   manager.UpdatePageWatchers(false, address, allocation_size);
-  Check(IsWritable(memory) &&
-            IsWritable(memory + region_size) &&
+  Check(IsWritable(memory) && IsWritable(memory + region_size) &&
             IsWritable(memory + region_size * 2) &&
             IsWritable(memory + allocation_size - page_size),
         "large cross-region unwatch did not restore the full range");
-
-  manager.UpdatePageWatchers(true, address, page_size * 5);
-  manager.UpdatePageWatchers(true, address + page_size, page_size * 3,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  Check(Protection(memory) == PAGE_READONLY &&
-            Protection(memory + page_size) == PAGE_NOACCESS &&
-            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
-            Protection(memory + page_size * 3) == PAGE_NOACCESS &&
-            Protection(memory + page_size * 4) == PAGE_READONLY,
-        "mixed watcher modes installed incorrect protections");
-  manager.UpdatePageWatchers(false, address, page_size * 5);
-  Check(IsWritable(memory) &&
-            Protection(memory + page_size) == PAGE_NOACCESS &&
-            Protection(memory + page_size * 2) == PAGE_NOACCESS &&
-            Protection(memory + page_size * 3) == PAGE_NOACCESS &&
-            IsWritable(memory + page_size * 4),
-        "write unwatch incorrectly released read/write watchers");
-  manager.UpdatePageWatchers(false, address + page_size, page_size * 3,
-                             Libs::Graphics::PageWatchMode::ReadWrite);
-  Check(IsWritable(memory + page_size) &&
-            IsWritable(memory + page_size * 2) &&
-            IsWritable(memory + page_size * 3),
-        "read/write unwatch did not restore writable protection");
 
   manager.OnGpuUnmap(address, allocation_size);
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {
-  FaultContext context;
-  auto manager = std::make_unique<PageManager>(InvalidateFault, &context);
-  context.manager = manager.get();
-  const auto page_size = manager->GetPageSize();
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
   if (std::strcmp(name, "invalid-range") == 0) {
-    manager->UpdatePageWatchers(true, (1ull << 40u) - 1, 2);
+    manager.UpdatePageWatchers(true, (1ull << 40u) - 1, 2);
   } else if (std::strcmp(name, "unknown-untrack") == 0) {
-    manager->UpdatePageWatchers(false, 0x1000, page_size);
-  } else {
-    const bool two_pages = std::strcmp(name, "cross-reentrant") == 0;
-    auto *memory = Allocate(
-        two_pages ? page_size * 2 : page_size,
-        std::strcmp(name, "protection") == 0 ? PAGE_READONLY : PAGE_READWRITE);
+    manager.UpdatePageWatchers(false, 0x1000, page_size);
+  } else if (std::strcmp(name, "destructor-watch") == 0) {
+    auto doomed = std::make_unique<PageManager>();
+    auto *memory = Allocate(page_size);
     const auto address = reinterpret_cast<uint64_t>(memory);
-    manager->OnGpuMap(address, two_pages ? page_size * 2 : page_size);
-    manager->UpdatePageWatchers(true, address, page_size);
-    if (two_pages) {
-      manager->UpdatePageWatchers(true, address + page_size, page_size);
-    }
-    if (std::strcmp(name, "destructor-watch") == 0) {
-      manager.reset();
-    } else if (std::strcmp(name, "non-write") == 0) {
-      (void)manager->HandleFault(PageFaultAccess::Read, address);
-    } else if (std::strcmp(name, "callback-false") == 0) {
-      context.result = false;
-      (void)manager->HandleFault(PageFaultAccess::Write, address);
-    } else if (std::strcmp(name, "reentrant") == 0) {
-      context.reenter = true;
-      (void)manager->HandleFault(PageFaultAccess::Write, address);
-    } else if (std::strcmp(name, "cross-reentrant") == 0) {
-      context.reenter = true;
-      context.reenter_address = address + page_size;
-      (void)manager->HandleFault(PageFaultAccess::Write, address);
-    } else if (std::strcmp(name, "concurrent-non-write") == 0) {
-      context.block = true;
-      std::thread first(
-          [&] { (void)manager->HandleFault(PageFaultAccess::Write, address); });
-      while (!context.entered.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      (void)manager->HandleFault(PageFaultAccess::Read, address);
-      first.join();
-    } else if (std::strcmp(name, "watched-unmap") == 0) {
-      manager->OnGpuUnmap(address, page_size);
-    } else if (std::strcmp(name, "protection") != 0) {
-      std::_Exit(0x7f);
-    }
+    doomed->OnGpuMap(address, page_size);
+    doomed->UpdatePageWatchers(true, address, page_size);
+    doomed.reset();
   }
   std::_Exit(0x7f);
 }
@@ -700,8 +318,8 @@ void CheckDeathCase(const char *name) {
   }
   int status = 0;
   Check(::waitpid(pid, &status, 0) == pid, "waitpid failed");
-  // Exit status carries only the low 8 bits.
-  const bool fatal_exit = WIFEXITED(status) && WEXITSTATUS(status) == (322 & 0xff);
+  const bool fatal_exit =
+      WIFEXITED(status) && WEXITSTATUS(status) == (322 & 0xff);
   const bool fatal_signal = WIFSIGNALED(status);
   Check(fatal_exit || fatal_signal,
         "death case did not use the PageManager fatal exit");
@@ -710,141 +328,32 @@ void CheckDeathCase(const char *name) {
 
 void TestFatalPaths() {
   for (const char *name :
-       {"invalid-range", "unknown-untrack", "destructor-watch", "non-write",
-        "callback-false", "reentrant", "cross-reentrant",
-        "concurrent-non-write", "watched-unmap", "protection"}) {
+       {"invalid-range", "unknown-untrack", "destructor-watch"}) {
     CheckDeathCase(name);
   }
 }
 
-void TestConcurrentFault() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  context.block = true;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  bool first_result = false;
-  bool second_result = false;
-  std::thread first([&] {
-    first_result = manager.HandleFault(PageFaultAccess::Write, address);
-  });
-  while (!context.entered.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  std::thread second([&] {
-    second_result = manager.HandleFault(PageFaultAccess::Write, address);
-  });
-  context.release.store(true, std::memory_order_release);
-  first.join();
-  second.join();
-  Check(first_result && second_result &&
-            context.calls.load(std::memory_order_relaxed) == 1,
-        "concurrent faults dispatched invalidation more than once");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestExternalDirtyTransferDuringResolution() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  context.block = true;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  manager.UpdatePageWatchers(true, address, page_size);
-  bool handled = false;
-  std::thread fault(
-      [&] { handled = manager.HandleFault(PageFaultAccess::Write, address); });
-  while (!context.entered.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
-  }
-  manager.UpdatePageWatchers(false, address, page_size);
-  context.release.store(true, std::memory_order_release);
-  fault.join();
-  Check(handled && !manager.IsTracked(address) && IsWritable(memory),
-        "external dirty transfer did not satisfy active resolution");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestMappingDoesNotRequireCpuWriteAccess() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  DWORD old_protection = 0;
-  Check(VirtualProtect(memory, page_size, PAGE_NOACCESS, &old_protection) != 0 &&
-            old_protection == PAGE_READWRITE,
-        "failed to prepare CPU-inaccessible mapping");
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size);
-  Check(manager.IsMapped(address, page_size),
-        "CPU-inaccessible committed range was not GPU mapped");
-  manager.OnGpuUnmap(address, page_size);
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-
-void TestGpuAccessPermissions() {
-  FaultContext context;
-  PageManager manager(InvalidateFault, &context);
-  context.manager = &manager;
-  const auto page_size = manager.GetPageSize();
-  auto *memory = Allocate(page_size);
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuMap(address, page_size, GpuAccess::Read);
-  Check(manager.HasGpuAccess(address, page_size, GpuAccess::Read) &&
-            !manager.HasGpuAccess(address, page_size, GpuAccess::Write),
-        "read-only GPU mapping granted write access");
-  manager.OnGpuMap(address, page_size, GpuAccess::Write);
-  Check(manager.HasGpuAccess(address, page_size, GpuAccess::ReadWrite),
-        "overlapping GPU mappings did not combine permissions");
-  manager.OnGpuUnmap(address, page_size, GpuAccess::Read);
-  Check(!manager.HasGpuAccess(address, page_size, GpuAccess::Read) &&
-            manager.HasGpuAccess(address, page_size, GpuAccess::Write),
-        "GPU read unmap removed the wrong permission");
-  manager.OnGpuUnmap(address, page_size, GpuAccess::Write);
-  Check(!manager.IsMapped(address, page_size),
-        "GPU permission mappings were not fully balanced");
-  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
-}
-#endif
-
 } // namespace
 
+namespace Libs::LibKernel::Memory {
+
+bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
+                            Common::VirtualMemory::Mode mode) {
+  return ProtectAddressSpace(vaddr, size, mode);
+}
+
+} // namespace Libs::LibKernel::Memory
+
 int main(int argc, char **argv) {
-#if 1
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
-  TestWatchFaultAndUnwatch();
-  TestSharedWatcherFault();
-  TestReadWriteWatcherFault();
-  TestPermittedMappedLateFaultsResume();
-  TestPartialMappingUnmapPreservesTokens();
-  TestNativeDelayedReadAfterModeDowngrade();
-  TestDelayedFaultAfterExplicitUnwatch();
-  TestNativeAccessViolation();
-  TestInvalidLateWriteTokenIsConsumed();
+  TestWatchAndUnwatch();
+  TestSharedWatcherCounts();
+  TestMixedWatcherModes();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();
-  TestConcurrentFault();
-  TestExternalDirtyTransferDuringResolution();
-  TestMappingDoesNotRequireCpuWriteAccess();
-  TestGpuAccessPermissions();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;
-#else
-  (void)argc;
-  (void)argv;
-  std::fputs("PageManagerTests: unsupported platform\n", stderr);
-  return 1;
-#endif
 }

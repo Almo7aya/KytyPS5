@@ -2,15 +2,12 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
-#include "common/waitWatch.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <atomic>
-#include <cstdio>
-#include <intrin.h> // KYTY_DIAG: _ReturnAddress
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -29,26 +26,14 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	// Read-only GPU-modified test that does NOT assert the range is mapped (unlike
-	// IsRegionGpuModified's RequireMapped) and takes no page-manager locks. Safe for virtual
-	// metadata pages and for use as a pre-fault drain probe. Never downloads or mutates.
-	[[nodiscard]] bool HasGpuModifiedUnchecked(uint64_t vaddr, uint64_t size) noexcept;
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] CpuFaultAction
-	                   BeginCpuFault(uint64_t vaddr, uint64_t size,
-	                                 PageFaultAccess access = PageFaultAccess::Write) noexcept;
-	[[nodiscard]] bool CompleteCpuFault(uint64_t vaddr, uint64_t size, PageFaultAccess access,
-	                                    bool downloaded) noexcept;
-	[[nodiscard]] bool InvalidateRegion(uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) {
 		static_assert(std::is_invocable_v<Flush&>);
-		CheckNotInUploadCallback(this, vaddr);
+		CheckNotInUploadCallback();
 		ValidateRange(vaddr, size);
 
 		const auto update_cpu_state = [this, vaddr, size] {
@@ -86,10 +71,8 @@ public:
 			EXIT("memory invalidation retained GPU-owned pages\n");
 		}
 	}
-	[[nodiscard]] bool InvalidateVirtualGpuWrite(PageFaultAccess access, uint64_t vaddr,
-	                                             uint64_t size, PageFaultPhase phase) noexcept;
-	void               ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
-	                                         const char* operation) const noexcept;
+	void ValidateGpuDirtyPages(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
+	                           const char* operation) const noexcept;
 	void ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t vaddr, uint64_t size,
 	                               const char* operation);
 
@@ -97,10 +80,8 @@ public:
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Preflight&& preflight, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Preflight&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
-		CheckNotInUploadCallback(this, vaddr);
-		Kyty::WaitWatch::Scope w("mt_dl", vaddr, size); // KYTY_DIAG
-		std::lock_guard access(m_access_mutex);
-		RequireMapped(vaddr, size);
+		CheckNotInUploadCallback();
+		std::lock_guard             access(m_access_mutex);
 		std::vector<RegionManager*> managers;
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t, uint64_t) {
 			managers.push_back(manager);
@@ -112,9 +93,6 @@ public:
 		}
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const auto address = manager->GetCpuAddr() + offset;
-			if (manager->HasPendingFault(address, bytes)) {
-				EXIT("GPU download synchronization raced a pending CPU fault\n");
-			}
 			manager->template ForEachModifiedRange<DirtySource::Gpu, false>(address, bytes,
 			                                                                preflight);
 		});
@@ -140,28 +118,17 @@ public:
 		    vaddr, size, [](uint64_t, uint64_t) noexcept {}, std::forward<Func>(func));
 	}
 
-#if defined(KYTY_MEMORY_TRACKER_TESTS)
-	using UnmapContentionHook = void (*)() noexcept;
-	static void SetUnmapContentionHook(UnmapContentionHook hook) noexcept;
-#endif
-
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
 		static_assert(std::is_nothrow_invocable_v<RangeFunc&, uint64_t, uint64_t>);
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
-		CheckNotInUploadCallback(this, vaddr);
-		s_upload_ra    = _ReturnAddress();       // KYTY_DIAG: caller (upload site) for re-entry diag
-		s_upload_vaddr = vaddr;                  // KYTY_DIAG
-		s_upload_size  = size;                   // KYTY_DIAG
-		Kyty::WaitWatch::Scope w("mt_ul", vaddr, size); // KYTY_DIAG
+		CheckNotInUploadCallback();
 		std::unique_lock access(m_access_mutex);
-		RequireMapped(vaddr, size);
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->Track(manager->GetCpuAddr() + offset, bytes);
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {
@@ -184,18 +151,9 @@ public:
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 	inline static thread_local const MemoryTracker* s_upload_owner = nullptr;
-	inline static thread_local void*                s_upload_ra    = nullptr; // KYTY_DIAG
-	inline static thread_local uint64_t             s_upload_vaddr = 0;        // KYTY_DIAG
-	inline static thread_local uint64_t             s_upload_size  = 0;        // KYTY_DIAG
-	// Nested page-fault passthrough (see BeginCpuFault): the region+page a fault was allowed
-	// through without touching region state, so the matching CompleteCpuFault can succeed.
-	inline static thread_local const RegionManager* s_nested_fault_manager = nullptr;
-	inline static thread_local uint64_t           s_nested_fault_vaddr   = 0;
-	inline static thread_local uint64_t           s_nested_fault_size    = 0;
 
-	static void CheckNotInUploadCallback(const MemoryTracker* self,
-	                                     [[maybe_unused]] uint64_t vaddr = 0) noexcept {
-		if (s_upload_owner == self) {
+	void CheckNotInUploadCallback() const noexcept {
+		if (s_upload_owner == this) {
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
@@ -230,16 +188,8 @@ private:
 		return false;
 	}
 
-	static void ValidateRange(uint64_t vaddr, uint64_t size);
-	void        UntrackMemoryLocked(uint64_t vaddr, uint64_t size);
-	void        RequireMapped(uint64_t vaddr, uint64_t size) const {
-		ValidateRange(vaddr, size);
-		if (!m_page_manager.IsMapped(vaddr, size)) {
-			EXIT("memory tracker range [0x%llx, 0x%llx) is not mapped\n",
-			     static_cast<unsigned long long>(vaddr),
-			     static_cast<unsigned long long>(vaddr + size));
-		}
-	}
+	static void    ValidateRange(uint64_t vaddr, uint64_t size);
+	void           UntrackMemoryLocked(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;

@@ -1452,7 +1452,6 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid image clear\n");
 	}
-	m_buffer_cache.ValidateGpuAccess(address, size, false, true);
 	std::lock_guard      transaction(m_resource_mutex);
 	CacheLock            lock(*this, m_lock);
 	ImageId              selected {};
@@ -1900,37 +1899,6 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 		found->second.clear_mask &= ~(1u << slice);
 	}
 	return true;
-}
-
-bool TextureCache::InvalidateMemory(PageFaultAccess access, uint64_t address, uint64_t size,
-                                    PageFaultPhase phase) noexcept {
-	if ((access != PageFaultAccess::Read && access != PageFaultAccess::Write) ||
-	    !GuestRange {address, size}.Valid()) {
-		return false;
-	}
-	if (access == PageFaultAccess::Read) {
-		return false;
-	}
-	if (phase == PageFaultPhase::Invalidate) {
-		CacheLock  lock(*this, m_lock);
-		const bool tracked =
-		    std::ranges::any_of(FindImagesInRegion(address, size, true), [&](ImageId id) {
-			    const auto owner = ResolveOwner(id);
-			    return owner != nullptr && !owner->depth_id && owner->IsTracked();
-		    });
-		if (tracked) {
-			InvalidateCpuAliases(address, size);
-		}
-		return tracked;
-	}
-	if (phase != PageFaultPhase::Complete && phase != PageFaultPhase::Release) {
-		return false;
-	}
-	CacheLock lock(*this, m_lock);
-	return std::ranges::any_of(FindImagesInRegion(address, size, true), [&](ImageId id) {
-		const auto owner = ResolveOwner(id);
-		return owner != nullptr && !owner->depth_id;
-	});
 }
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {

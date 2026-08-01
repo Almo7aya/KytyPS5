@@ -175,9 +175,9 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	}
 	g_in_exception_filter = true;
 
-	auto*       uc  = static_cast<ucontext_t*>(uctx);
-	const auto* mc  = uc->uc_mcontext;
-	const auto& ss  = mc->__ss;
+	auto*       uc = static_cast<ucontext_t*>(uctx);
+	const auto* mc = uc->uc_mcontext;
+	const auto& ss = mc->__ss;
 
 	ExceptionInfo info {};
 	info.exception_address = ss.__rip;
@@ -214,7 +214,7 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 		FailFast("host exception callback is null");
 	}
 
-	const bool resolved = handler(info);
+	const bool resolved   = handler(info);
 	g_in_exception_filter = false;
 
 	if (resolved) {
@@ -255,8 +255,8 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.native_context    = context;
 
 	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
-		info.type              = ExceptionType::AccessViolation;
-		const auto error_code  = static_cast<uint64_t>(gregs[REG_ERR]);
+		info.type             = ExceptionType::AccessViolation;
+		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
 		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
 			info.access_violation_type = AccessViolationType::Execute;
 		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
@@ -324,6 +324,10 @@ bool InstallHandler(Handler handler) {
 	sa.sa_sigaction = SignalHandler;
 	sa.sa_flags     = SA_SIGINFO;
 	sigemptyset(&sa.sa_mask);
+	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
+	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request
+	// cannot preempt the handler between the protection fix and the retry.
+	sigaddset(&sa.sa_mask, SIGUSR1);
 
 	// macOS raises SIGBUS for protection faults on some paths and SIGSEGV on others;
 	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator).

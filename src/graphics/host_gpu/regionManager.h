@@ -25,8 +25,6 @@
 
 namespace Libs::Graphics {
 
-enum class CpuFaultAction { Untracked, Continue, Download };
-
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
@@ -48,13 +46,6 @@ public:
 		}
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
-	}
-	// True when the calling thread already holds the lock. A nested page-fault handler on the
-	// uploading thread uses this to avoid re-entering a region whose state is mid-transition:
-	// the lock owner is the thread itself, so the region cannot change under it, and the outer
-	// operation rewrites the region state when it completes.
-	[[nodiscard]] bool OwnedByCurrentThread() const noexcept {
-		return m_owner.load(std::memory_order_relaxed) == CurrentThread();
 	}
 
 private:
@@ -92,26 +83,6 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
-	// KYTY_DIAG: pack the page-state bits for the page containing vaddr (bit0 gpu_dirty,
-	// bit1 cpu_dirty, bit2 writable, bit3 fault_pending, bit4 tracked). Diagnostic only.
-	[[nodiscard]] uint32_t DiagPageBits(uint64_t vaddr) const {
-		const auto page = static_cast<size_t>((vaddr - m_cpu_addr) / TRACKER_PAGE_SIZE);
-		return (m_gpu_dirty.test(page) ? 1u : 0u) | (m_cpu_dirty.test(page) ? 2u : 0u) |
-		       (m_writable.test(page) ? 4u : 0u) | (m_fault_pending.test(page) ? 8u : 0u) |
-		       (m_tracked.test(page) ? 16u : 0u);
-	}
-	void                   Track(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		for (auto page = start; page < end; page++) {
-			m_tracked.set(page);
-		}
-	}
-	void Untrack(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		for (auto page = start; page < end; page++) {
-			m_tracked.reset(page);
-		}
-	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -141,15 +112,15 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			for (auto page = start; page < end; page++) {
-				if (m_gpu_dirty.test(page) || m_fault_pending.test(page)) {
-					EXIT("CPU dirty state conflicts with GPU dirty or pending fault state\n");
+				if (m_gpu_dirty.test(page)) {
+					EXIT("CPU dirty state conflicts with GPU dirty state\n");
 				}
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
 			for (auto page = start; page < end; page++) {
-				if (m_cpu_dirty.test(page) || m_fault_pending.test(page)) {
-					EXIT("GPU dirty state conflicts with CPU dirty or pending fault state\n");
+				if (m_cpu_dirty.test(page)) {
+					EXIT("GPU dirty state conflicts with CPU dirty state\n");
 				}
 			}
 		}
@@ -166,110 +137,10 @@ public:
 		return changed;
 	}
 
-	[[nodiscard]] CpuFaultAction BeginCpuFault(uint64_t vaddr, uint64_t size,
-	                                           PageFaultAccess access = PageFaultAccess::Write) {
-		if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
-			EXIT("unsupported CPU fault access while beginning ownership transfer\n");
-		}
-		const auto [start, end] = GetPageRange(vaddr, size);
-		const bool tracked      = m_tracked.test(start);
-		for (auto page = start; page < end; page++) {
-			if (m_tracked.test(page) != tracked) {
-				EXIT("CPU fault spans mixed tracked and untracked pages\n");
-			}
-			if (m_fault_pending.test(page)) {
-				return CpuFaultAction::Untracked;
-			}
-			if (m_cpu_dirty.test(page) != m_writable.test(page) ||
-			    (m_gpu_dirty.test(page) && (m_cpu_dirty.test(page) || m_writable.test(page)))) {
-				EXIT("inconsistent CPU fault page state\n");
-			}
-		}
-		if (!tracked) {
-			return CpuFaultAction::Untracked;
-		}
-		bool gpu_dirty = m_gpu_dirty.test(start);
-		bool writable  = m_writable.test(start);
-		for (auto page = start + 1; page < end; page++) {
-			if (m_gpu_dirty.test(page) != gpu_dirty || m_writable.test(page) != writable) {
-				EXIT("CPU fault spans pages with incompatible dirty or writable state\n");
-			}
-		}
-		for (auto page = start; page < end; page++) {
-			if (!gpu_dirty && access == PageFaultAccess::Write) {
-				m_cpu_dirty.set(page);
-				m_writable.set(page);
-			}
-			m_fault_pending.set(page);
-		}
-		return gpu_dirty ? CpuFaultAction::Download : CpuFaultAction::Continue;
-	}
-
-	[[nodiscard]] bool CompleteCpuFault(uint64_t vaddr, uint64_t size, PageFaultAccess access,
-	                                    bool downloaded) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		for (auto page = start; page < end; page++) {
-			if (!m_fault_pending.test(page)) {
-				return false;
-			}
-		}
-		for (auto page = start; page < end; page++) {
-			const bool gpu_dirty = m_gpu_dirty.test(page);
-			if (gpu_dirty != downloaded) {
-				EXIT("CPU fault download result disagrees with GPU dirty state\n");
-			}
-			if (gpu_dirty) {
-				m_gpu_dirty.reset(page);
-				switch (access) {
-					case PageFaultAccess::Read: break;
-					case PageFaultAccess::Write:
-						m_cpu_dirty.set(page);
-						m_writable.set(page);
-						break;
-					default: EXIT("unsupported CPU fault access after GPU download\n");
-				}
-			}
-			m_fault_pending.reset(page);
-		}
-		return true;
-	}
-
-	[[nodiscard]] bool HasPendingFault(uint64_t vaddr, uint64_t size) const {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		for (auto page = start; page < end; page++) {
-			if (m_fault_pending.test(page)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	[[nodiscard]] bool CompleteVirtualGpuWrite(uint64_t vaddr, uint64_t size) {
-		const auto [start, end] = GetPageRange(vaddr, size);
-		for (auto page = start; page < end; page++) {
-			if (!m_fault_pending.test(page)) {
-				return false;
-			}
-			if (!m_gpu_dirty.test(page)) {
-				EXIT("virtual GPU write completion found a non-GPU-dirty page\n");
-			}
-		}
-		for (auto page = start; page < end; page++) {
-			m_gpu_dirty.reset(page);
-			m_cpu_dirty.set(page);
-			m_writable.set(page);
-			m_fault_pending.reset(page);
-		}
-		return true;
-	}
-
 	template <DirtySource source, bool clear, typename Func>
 	RegionBits ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto mask               = GetBits<source>();
-		if constexpr (source == DirtySource::Cpu) {
-			mask &= ~m_fault_pending;
-		}
 		for (auto page = 0u; page < start; page++) {
 			mask.reset(page);
 		}
@@ -366,8 +237,6 @@ private:
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
-	RegionBits   m_fault_pending;
-	RegionBits   m_tracked;
 };
 
 } // namespace Libs::Graphics

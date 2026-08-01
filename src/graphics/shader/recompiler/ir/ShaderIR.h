@@ -432,6 +432,7 @@ struct MemoryInfo {
 	bool     typed           = false;
 	bool     formatted       = false;
 	bool     image_has_mip   = false;
+	bool     image_cube      = false;
 	bool     glc             = false;
 	bool     slc             = false;
 	bool     idxen           = false;
@@ -607,6 +608,7 @@ struct ImageResource {
 	bool                    written         = false;
 	bool                    atomic          = false;
 	bool                    depth_compare   = false;
+	bool                    cube            = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -677,11 +679,15 @@ enum class DescriptorBindingKind {
 	Sampled1DArray,
 	Sampled2D,
 	Sampled2DArray,
+	Sampled2DMsaa,
+	Sampled2DMsaaArray,
 	Sampled3D,
 	SampledUint1D,
 	SampledUint1DArray,
 	SampledUint2D,
 	SampledUint2DArray,
+	SampledUint2DMsaa,
+	SampledUint2DMsaaArray,
 	SampledUint3D,
 	Storage1D,
 	Storage1DArray,

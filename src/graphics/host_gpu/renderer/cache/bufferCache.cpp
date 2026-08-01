@@ -123,24 +123,6 @@ struct BufferCache::RetiredBuffer {
 	std::shared_ptr<Buffer> owner;
 };
 
-struct BufferCache::FaultReadback {
-	PageFaultAccess            access = PageFaultAccess::Unknown;
-	uint64_t                   vaddr  = 0;
-	uint64_t                   size   = 0;
-	std::vector<DownloadRange> ranges;
-	bool                       installed = false;
-
-	[[nodiscard]] bool Active() const noexcept { return !ranges.empty(); }
-
-	void Reset() {
-		access    = PageFaultAccess::Unknown;
-		vaddr     = 0;
-		size      = 0;
-		installed = false;
-		ranges.clear();
-	}
-};
-
 struct BufferCache::PendingBackingPublication {
 	uint64_t address = 0;
 	uint64_t size    = 0;
@@ -253,7 +235,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          ResourceMutex& resource_mutex)
     : m_graphics(graphics), m_scheduler(scheduler),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-      m_fault_readback(std::make_unique<FaultReadback>()), m_memory_tracker(page_manager),
+      m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
@@ -277,9 +259,6 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
-	if (m_fault_readback->Active()) {
-		EXIT("BufferCache: destroyed with an active fault readback\n");
-	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -445,93 +424,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size) {
 			m_gpu_modified_ranges.Subtract(range.address, range.size);
 		}
 	}
-}
-
-bool BufferCache::InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-                                   PageFaultPhase phase) noexcept {
-	const auto page = vaddr & ~(TRACKER_PAGE_SIZE - 1);
-	if (size == 0 || size > page + TRACKER_PAGE_SIZE - vaddr) {
-		EXIT("BufferCache: invalid page-fault range\n");
-	}
-
-	if (phase == PageFaultPhase::Complete) {
-		FaultSafeCacheLock lock(this, m_mutex);
-		auto&              fault = *m_fault_readback;
-		if (!fault.Active()) {
-			return m_memory_tracker.CompleteCpuFault(vaddr, size, access, false);
-		}
-		if (fault.access != access || fault.vaddr != vaddr || fault.size != size ||
-		    fault.installed) {
-			EXIT("BufferCache: mismatched fault readback completion\n");
-		}
-		PublishDownloads(fault.ranges);
-		if (!m_memory_tracker.CompleteCpuFault(vaddr, size, access, true)) {
-			EXIT("BufferCache: failed to complete downloaded CPU fault\n");
-		}
-		fault.installed = true;
-		return true;
-	}
-
-	if (phase == PageFaultPhase::Release) {
-		FaultSafeCacheLock lock(this, m_mutex);
-		auto&              fault = *m_fault_readback;
-		if (fault.Active()) {
-			if (fault.access != access || fault.vaddr != vaddr || fault.size != size ||
-			    !fault.installed) {
-				EXIT("BufferCache: mismatched fault readback release\n");
-			}
-			for (const auto& range: fault.ranges) {
-				m_gpu_modified_ranges.Subtract(range.address, range.size);
-			}
-			fault.Reset();
-		}
-		return true;
-	}
-
-	if (phase != PageFaultPhase::Invalidate) {
-		EXIT("BufferCache: unsupported page-fault phase\n");
-	}
-
-	const auto action = m_memory_tracker.BeginCpuFault(vaddr, size, access);
-	if (action != CpuFaultAction::Download) {
-		return action == CpuFaultAction::Continue;
-	}
-
-	auto&                     fault = *m_fault_readback;
-	std::vector<DownloadCopy> copies;
-	{
-		FaultSafeCacheLock lock(this, m_mutex);
-		if (fault.Active()) {
-			EXIT("BufferCache: nested fault readback\n");
-		}
-		fault.access = access;
-		fault.vaddr  = vaddr;
-		fault.size   = size;
-
-		m_gpu_modified_ranges.ForEachIntersection(
-		    page, TRACKER_PAGE_SIZE, [&](RangeSet::Range range) {
-			    auto owner = m_buffers.upper_bound(range.address);
-			    if (owner == m_buffers.begin()) {
-				    EXIT("BufferCache: fault readback has no buffer owner\n");
-			    }
-			    --owner;
-			    auto& cached = *owner->second;
-			    if (!cached.buffer->IsInBounds(range.address, range.size)) {
-				    EXIT("BufferCache: fault readback is outside its buffer owner\n");
-			    }
-			    copies.push_back({cached.buffer, cached.buffer->Offset(range.address),
-			                      range.address, range.size});
-		    });
-		if (copies.empty()) {
-			EXIT("BufferCache: GPU-dirty fault page has no dirty byte ranges\n");
-		}
-	}
-	fault.ranges = RecordDownloads(copies);
-	if (!fault.Active()) {
-		EXIT("BufferCache: GPU-dirty fault page has no dirty byte ranges\n");
-	}
-	m_scheduler.FinishCurrent();
-	return true;
 }
 
 void BufferCache::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -714,7 +606,6 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	if (command.IsInvalid() || command.IsExecute()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
-	ValidateGpuAccess(vaddr, size, is_read, is_written);
 	std::lock_guard transaction(m_resource_mutex);
 	(void)SynchronizeBacking(vaddr, size);
 
@@ -999,7 +890,6 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	ValidateGpuAccess(vaddr, size, false, true);
 	(void)m_texture_cache.ClearMeta(vaddr);
 	{
 		std::lock_guard transaction(m_resource_mutex);
@@ -1040,12 +930,6 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	    (dst_gds && (dst_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - dst_vaddr)) ||
 	    (src_gds && (src_vaddr > m_gds_buffer.Size() || size > m_gds_buffer.Size() - src_vaddr))) {
 		EXIT("BufferCache: invalid or overlapping copy range\n");
-	}
-	if (src_memory) {
-		ValidateGpuAccess(src_vaddr, size, true, false);
-	}
-	if (dst_memory) {
-		ValidateGpuAccess(dst_vaddr, size, false, true);
 	}
 	if (src_memory || dst_memory) {
 		std::lock_guard transaction(m_resource_mutex);
@@ -1203,34 +1087,13 @@ void BufferCache::PublishImageBuffer(uint64_t vaddr, uint64_t size) {
 	owner->second->tick_accessed_last = m_gc_tick;
 }
 
-void BufferCache::ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read,
-                                    bool is_written) const {
-	if ((!is_read && !is_written) || vaddr == 0 || size == 0 || size > UINT64_MAX - vaddr) {
-		EXIT("BufferCache: invalid GPU access request\n");
-	}
-	if (is_read && !m_page_manager.HasGpuAccess(vaddr, size, GpuAccess::Read)) {
-		EXIT("BufferCache: GPU-read access denied\n");
-	}
-	if (is_written && !m_page_manager.HasGpuAccess(vaddr, size, GpuAccess::Write)) {
-		EXIT("BufferCache: GPU-write access denied\n");
-	}
-}
-
-uint64_t BufferCache::GpuAccessExtent(uint64_t vaddr, uint64_t max_size, bool is_read,
-                                      bool is_written) const noexcept {
-	const GpuAccess access = (is_read && is_written) ? GpuAccess::ReadWrite
-	                         : is_written            ? GpuAccess::Write
-	                                                 : GpuAccess::Read;
-	return m_page_manager.GpuAccessExtent(vaddr, max_size, access);
-}
-
 void BufferCache::RunGarbageCollector() {
 	std::lock_guard transaction(m_resource_mutex);
 	const auto      tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
-	if (m_total_used_memory < m_trigger_gc_memory || m_fault_readback->Active()) {
+	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 

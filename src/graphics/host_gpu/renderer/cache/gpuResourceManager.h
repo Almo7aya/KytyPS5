@@ -29,16 +29,11 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
-	void               MapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size, GpuAccess access);
+	void               MapMemory(uint64_t vaddr, uint64_t size);
+	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
-	static bool FaultThunk(void* context, PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                       PageFaultPhase phase) noexcept;
-	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-
 	PageManager               m_page_manager;
 	ResourceMutex             m_resource_mutex;
 	BufferCache               m_buffer_cache;

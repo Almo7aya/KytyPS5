@@ -174,6 +174,12 @@ uint32_t VertexParameterInputPointerType(const EmitterState& state, VertexInputS
 	}
 }
 
+static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
+	return state.stage == ShaderType::Pixel && state.pixel_input_info != nullptr &&
+	       index < std::size(state.pixel_input_info->target_output_mode) &&
+	       state.pixel_input_info->target_output_mode[index] == 7u;
+}
+
 void AllocateInputVariables(EmitterState& state) {
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
@@ -323,23 +329,39 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 		Decorate(state.address_memory_variable, "address_memory",
 		         IR::DescriptorBindingKind::AddressMemory);
 	}
-	constexpr const char* SampledNames[] = {
-	    "sampled_1d",      "sampled_1d_array",      "sampled_2d",      "sampled_2d_array",
-	    "sampled_3d",      "sampled_uint_1d",       "sampled_uint_1d_array",
-	    "sampled_uint_2d", "sampled_uint_2d_array", "sampled_uint_3d"};
+	constexpr const char* SampledNames[] = {"sampled_1d",
+	                                        "sampled_1d_array",
+	                                        "sampled_2d",
+	                                        "sampled_2d_array",
+	                                        "sampled_3d",
+	                                        "sampled_2d_msaa",
+	                                        "sampled_2d_msaa_array",
+	                                        "sampled_uint_1d",
+	                                        "sampled_uint_1d_array",
+	                                        "sampled_uint_2d",
+	                                        "sampled_uint_2d_array",
+	                                        "sampled_uint_3d",
+	                                        "sampled_uint_2d_msaa",
+	                                        "sampled_uint_2d_msaa_array"};
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
+		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
 		Decorate(state.sampled_images[i].variable, SampledNames[i],
-		         SampledBindingKind(i >= ImageViewKindCount, view));
+		         SampledBindingKind(i >= SampledImageViewKindCount, view));
 	}
-	constexpr const char* StorageNames[] = {
-	    "storage_1d",      "storage_1d_array",      "storage_2d",      "storage_2d_array",
-	    "storage_3d",      "storage_uint_1d",       "storage_uint_1d_array",
-	    "storage_uint_2d", "storage_uint_2d_array", "storage_uint_3d"};
+	constexpr const char* StorageNames[] = {"storage_1d",
+	                                        "storage_1d_array",
+	                                        "storage_2d",
+	                                        "storage_2d_array",
+	                                        "storage_3d",
+	                                        "storage_uint_1d",
+	                                        "storage_uint_1d_array",
+	                                        "storage_uint_2d",
+	                                        "storage_uint_2d_array",
+	                                        "storage_uint_3d"};
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
+		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
 		Decorate(state.storage_images[i].variable, StorageNames[i],
-		         StorageBindingKind(i >= ImageViewKindCount, view));
+		         StorageBindingKind(i >= StorageImageViewKindCount, view));
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
@@ -409,6 +431,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.ptr_output_sample_mask_array = state.builder.AllocateId();
 	state.ptr_output_float             = state.builder.AllocateId();
 	state.ptr_output_vec4_float        = state.builder.AllocateId();
+	const auto ptr_output_vec4_uint    = state.builder.AllocateId();
 	state.per_vertex_type              = state.builder.AllocateId();
 	state.ptr_output_per_vertex        = state.builder.AllocateId();
 	state.storage_runtime_array_type   = state.builder.AllocateId();
@@ -444,15 +467,15 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		image.array_type         = state.builder.AllocateId();
 		image.array_pointer_type = state.builder.AllocateId();
 	}
-	state.sampler_type                                  = state.builder.AllocateId();
-	state.sampler_array_type                            = state.builder.AllocateId();
-	state.ptr_uniform_sampler                           = state.builder.AllocateId();
-	state.ptr_uniform_sampler_array                     = state.builder.AllocateId();
-	state.ptr_image_uint                                = state.builder.AllocateId();
-	state.func_type                                     = state.builder.AllocateId();
-	state.main_func                                     = state.builder.AllocateId();
-	state.entry_label                                   = state.builder.AllocateId();
-	state.glsl_std450                                   = state.builder.AllocateId();
+	state.sampler_type              = state.builder.AllocateId();
+	state.sampler_array_type        = state.builder.AllocateId();
+	state.ptr_uniform_sampler       = state.builder.AllocateId();
+	state.ptr_uniform_sampler_array = state.builder.AllocateId();
+	state.ptr_image_uint            = state.builder.AllocateId();
+	state.func_type                 = state.builder.AllocateId();
+	state.main_func                 = state.builder.AllocateId();
+	state.entry_label               = state.builder.AllocateId();
+	state.glsl_std450               = state.builder.AllocateId();
 
 	state.builder.AddCapability({CapabilityShader});
 	state.builder.AddCapability({CapabilitySampled1D});
@@ -462,7 +485,7 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
 	if (std::any_of(state.storage_images.begin(),
-	                state.storage_images.begin() + ImageViewKindCount,
+	                state.storage_images.begin() + StorageImageViewKindCount,
 	                [](const auto& image) { return image.variable != 0; })) {
 		state.builder.AddCapability({CapabilityStorageImageReadWithoutFormat});
 		state.builder.AddCapability({CapabilityStorageImageWriteWithoutFormat});
@@ -605,6 +628,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	    {OpTypePointer, state.ptr_output_int, StorageClassOutput, state.int_type});
 	state.builder.AddType(
 	    {OpTypePointer, state.ptr_output_vec4_float, StorageClassOutput, state.vec4_float_type});
+	state.builder.AddType(
+	    {OpTypePointer, ptr_output_vec4_uint, StorageClassOutput, state.vec4_uint_type});
 	if (state.per_vertex_variable != 0) {
 		state.builder.AddType({OpTypeStruct, state.per_vertex_type, state.vec4_float_type});
 		state.builder.AddType({OpTypePointer, state.ptr_output_per_vertex, StorageClassOutput,
@@ -615,8 +640,12 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
 		    binding.kind == IR::StageOutputKind::Mrt) {
+			const auto pointer_type =
+			    binding.kind == IR::StageOutputKind::Mrt && MrtUsesUintOutput(state, binding.index)
+			        ? ptr_output_vec4_uint
+			        : state.ptr_output_vec4_float;
 			state.builder.AddType(
-			    {OpVariable, state.ptr_output_vec4_float, binding.variable_id, StorageClassOutput});
+			    {OpVariable, pointer_type, binding.variable_id, StorageClassOutput});
 		}
 	}
 	if (state.depth_variable != 0) {
@@ -700,11 +729,11 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
 		auto&      image     = state.sampled_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		const bool integer   = i >= ImageViewKindCount;
+		const auto view      = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		const bool integer   = i >= SampledImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
-		state.builder.AddType({OpTypeImage, image.image_type, component,
-		                       ImageSpirvDimension(view), 0, ImageSpirvArrayed(view), 0, 1,
+		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
+		                       0, ImageSpirvArrayed(view), ImageSpirvMultisampled(view), 1,
 		                       ImageFormatUnknown});
 		state.builder.AddType({OpTypeSampledImage, image.sampled_image_type, image.image_type});
 		state.builder.AddType(
@@ -733,13 +762,12 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	}
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
 		auto&      image     = state.storage_images[i];
-		const auto view      = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		const bool integer   = i >= ImageViewKindCount;
+		const auto view      = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		const bool integer   = i >= StorageImageViewKindCount;
 		const auto component = integer ? state.uint_type : state.float_type;
 		const auto format    = integer ? ImageFormatR32ui : ImageFormatUnknown;
-		state.builder.AddType({OpTypeImage, image.image_type, component,
-		                       ImageSpirvDimension(view), 0, ImageSpirvArrayed(view), 0, 2,
-		                       format});
+		state.builder.AddType({OpTypeImage, image.image_type, component, ImageSpirvDimension(view),
+		                       0, ImageSpirvArrayed(view), 0, 2, format});
 		state.builder.AddType(
 		    {OpTypePointer, image.pointer_type, StorageClassUniformConstant, image.image_type});
 		if (image.variable != 0) {
@@ -786,15 +814,15 @@ void AllocateDescriptorVariables(EmitterState& state) {
 		state.flattened_srt_variable = state.builder.AllocateId();
 	}
 	for (uint32_t i = 0; i < state.sampled_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		if (DescriptorBinding(state, SampledBindingKind(i >= ImageViewKindCount, view)) !=
+		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
+		if (DescriptorBinding(state, SampledBindingKind(i >= SampledImageViewKindCount, view)) !=
 		    nullptr) {
 			state.sampled_images[i].variable = state.builder.AllocateId();
 		}
 	}
 	for (uint32_t i = 0; i < state.storage_images.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % ImageViewKindCount);
-		if (DescriptorBinding(state, StorageBindingKind(i >= ImageViewKindCount, view)) !=
+		const auto view = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
+		if (DescriptorBinding(state, StorageBindingKind(i >= StorageImageViewKindCount, view)) !=
 		    nullptr) {
 			state.storage_images[i].variable = state.builder.AllocateId();
 		}

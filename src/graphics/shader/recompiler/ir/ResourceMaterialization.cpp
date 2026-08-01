@@ -12,10 +12,11 @@ namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
-Decoder::ImageDimension DescriptorDimension(const DescriptorValue&       descriptor,
+Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
 	const bool is_array = requested == Decoder::ImageDimension::Dim1DArray ||
-	                      requested == Decoder::ImageDimension::Dim2DArray;
+	                      requested == Decoder::ImageDimension::Dim2DArray ||
+	                      requested == Decoder::ImageDimension::Dim2DMsaaArray;
 	switch (static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu)) {
 		case Prospero::ImageType::kColor1D: return Decoder::ImageDimension::Dim1D;
 		case Prospero::ImageType::kColor1DArray:
@@ -26,13 +27,17 @@ Decoder::ImageDimension DescriptorDimension(const DescriptorValue&       descrip
 		case Prospero::ImageType::kColor3D: return Decoder::ImageDimension::Dim3D;
 		case Prospero::ImageType::kCube: return Decoder::ImageDimension::Dim2DArray;
 		case Prospero::ImageType::kColor2DArray:
-		case Prospero::ImageType::kColor2DMsaaArray:
 			if (is_array) {
 				return Decoder::ImageDimension::Dim2DArray;
 			}
 			return Decoder::ImageDimension::Dim2D;
-		case Prospero::ImageType::kColor2D:
-		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2D;
+		case Prospero::ImageType::kColor2DMsaaArray:
+			if (is_array) {
+				return Decoder::ImageDimension::Dim2DMsaaArray;
+			}
+			return Decoder::ImageDimension::Dim2DMsaa;
+		case Prospero::ImageType::kColor2D: return Decoder::ImageDimension::Dim2D;
+		case Prospero::ImageType::kColor2DMsaa: return Decoder::ImageDimension::Dim2DMsaa;
 		default: return Decoder::ImageDimension::Unknown;
 	}
 }
@@ -42,8 +47,9 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 }
 
 bool ValidImageDescriptor(const DescriptorValue& descriptor) {
-	const auto type = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
-	if (type < Prospero::ImageType::kColor1D) {
+	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
 		return false;
 	}
 	if (type == Prospero::ImageType::kColor2DMsaa ||
@@ -51,14 +57,18 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor) {
 		const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
 		const auto fragments  = (descriptor.dwords[3] >> 16u) & 0xfu;
 		const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
-		return base_level == 0 && fragments >= 1 && fragments <= 3 &&
-		       max_mip == fragments;
+		return base_level == 0 && fragments >= 1 && fragments <= 3 && max_mip == fragments;
 	}
 	return true;
 }
 
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
+}
+
+bool DescriptorIsCube(const DescriptorValue& descriptor) {
+	return static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu) ==
+	       Prospero::ImageType::kCube;
 }
 
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
@@ -171,12 +181,13 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		const auto& image      = program.info.images[i];
 		const auto& descriptor = snapshot.images[i];
 		if (NullImageDescriptor(descriptor)) {
-			bool canonical_kind = image.kind == ResourceKind::Image ||
-			                      image.kind == ResourceKind::StorageImage;
+			bool canonical_kind =
+			    image.kind == ResourceKind::Image || image.kind == ResourceKind::StorageImage;
 			if (image.atomic) {
 				canonical_kind = image.kind == ResourceKind::StorageImageUint;
 			}
-			if (image.dimension != Decoder::ImageDimension::Dim2D || !canonical_kind) {
+			if (image.dimension != Decoder::ImageDimension::Dim2D || image.cube ||
+			    !canonical_kind) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "image descriptor {} no longer matches canonical null specialization", i);
@@ -186,10 +197,15 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			continue;
 		}
 		const auto dimension = DescriptorDimension(descriptor, image.dimension);
-		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension) {
+		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension ||
+		    DescriptorIsCube(descriptor) != image.cube) {
 			if (error != nullptr) {
-				*error =
-				    fmt::format("image descriptor {} no longer matches specialized dimension", i);
+				*error = fmt::format(
+				    "image descriptor {} no longer matches specialized dimension: "
+				    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+				    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+				    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+				    descriptor.dwords[6], descriptor.dwords[7]);
 			}
 			return false;
 		}
@@ -204,8 +220,12 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const auto uint_descriptor =
-			    Prospero::IsUintTextureFormat((descriptor.dwords[1] >> 20u) & 0x1ffu);
+			const auto format = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+			const bool raw_sint_storage =
+			    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
+			    !image.read && !image.atomic;
+			const bool uint_descriptor =
+			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
 			const auto uint_program = image.kind == ResourceKind::ImageUint ||
 			                          image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
@@ -361,6 +381,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		auto&       image      = next.images[i];
 		if (NullImageDescriptor(descriptor)) {
 			image.dimension = Decoder::ImageDimension::Dim2D;
+			image.cube      = false;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:
@@ -386,11 +407,19 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 			return false;
 		}
 		image.dimension = descriptor_dimension;
+		image.cube      = DescriptorIsCube(descriptor);
 		if (image.kind == ResourceKind::StorageImage ||
 		    image.kind == ResourceKind::StorageImageUint) {
 			image.storage_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		if (Prospero::IsUintTextureFormat((descriptor.dwords[1] >> 20u) & 0x1ffu)) {
+		const auto format  = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+		const bool storage = image.kind == ResourceKind::StorageImage ||
+		                     image.kind == ResourceKind::StorageImageUint;
+		const bool raw_sint_storage =
+		    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
+		    !image.read && !image.atomic;
+		const bool uint_image = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+		if (uint_image) {
 			switch (image.kind) {
 				case ResourceKind::Image: image.kind = ResourceKind::ImageUint; break;
 				case ResourceKind::StorageImage: image.kind = ResourceKind::StorageImageUint; break;
@@ -402,6 +431,7 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		std::reference_wrapper<Instruction> inst;
 		ResourceKind                        kind;
 		Decoder::ImageDimension             dimension;
+		bool                                cube;
 	};
 	std::vector<ImagePatch> patches;
 	for (auto& block: program.blocks) {
@@ -420,13 +450,14 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 				return false;
 			}
 			const auto& image = next.images[inst.memory.resource];
-			patches.push_back({std::ref(inst), image.kind, image.dimension});
+			patches.push_back({std::ref(inst), image.kind, image.dimension, image.cube});
 		}
 	}
 	program.info = std::move(next);
 	for (const auto& patch: patches) {
 		patch.inst.get().memory.kind            = patch.kind;
 		patch.inst.get().memory.image_dimension = patch.dimension;
+		patch.inst.get().memory.image_cube      = patch.cube;
 	}
 	return true;
 }

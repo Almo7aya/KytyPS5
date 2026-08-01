@@ -47,11 +47,9 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	[[nodiscard]] bool InvalidateMemory(PageFaultAccess access, uint64_t vaddr, uint64_t size,
-	                                    PageFaultPhase phase) noexcept;
-	void               InvalidateMemory(uint64_t vaddr, uint64_t size);
-	void               ReadMemory(uint64_t vaddr, uint64_t size);
-	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void                        InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                        ReadMemory(uint64_t vaddr, uint64_t size);
+	void                        UnmapMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] BufferBinding ObtainBuffer(CommandBuffer& command, uint64_t vaddr, uint64_t size,
 	                                         bool is_written = false, bool is_read = true,
 	                                         bool is_formatted = false);
@@ -77,10 +75,7 @@ public:
 	void               CompleteBackingPublication(uint64_t vaddr, uint64_t size, uint64_t tick);
 	[[nodiscard]] bool SynchronizeBacking(uint64_t vaddr, uint64_t size);
 	void               PublishImageBuffer(uint64_t vaddr, uint64_t size);
-	void ValidateGpuAccess(uint64_t vaddr, uint64_t size, bool is_read, bool is_written) const;
-	[[nodiscard]] uint64_t GpuAccessExtent(uint64_t vaddr, uint64_t max_size, bool is_read,
-	                                       bool is_written) const noexcept;
-	void RunGarbageCollector();
+	void               RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -93,7 +88,6 @@ private:
 	struct DownloadCopy;
 	struct DownloadRange;
 	struct RetiredBuffer;
-	struct FaultReadback;
 	struct PendingBackingPublication;
 	static constexpr uint64_t               DOWNLOAD_ALIGNMENT = 64;
 	[[nodiscard]] static uint64_t           AlignDown(uint64_t value) noexcept;
@@ -123,7 +117,6 @@ private:
 	Common::Mutex                                     m_mutex;
 	std::shared_ptr<Buffer>                           m_null_buffer;
 	std::map<uint64_t, std::unique_ptr<CachedBuffer>> m_buffers;
-	std::unique_ptr<FaultReadback>                    m_fault_readback;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_image_invalidated_ranges;
 	std::mutex                                        m_publication_mutex;
