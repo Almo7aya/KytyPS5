@@ -1323,6 +1323,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 		RetainImage(command, result);
 	}
+	// KYTY_DIAG: trace full-resolution surface lookups so the writer and the reader of the
+	// post-processing scene buffer can be compared -- if they share a guest address but derive
+	// different formats the bug is in the format mapping, if the addresses differ the writer is
+	// simply somewhere else.
+	if (desc.info.extent.width >= 1920) {
+		static std::atomic<uint32_t> lookup_log = 0;
+		if (lookup_log.fetch_add(1, std::memory_order_relaxed) < 200) {
+			const auto& info = ResolveImage(result).info;
+			std::printf("KYTY_DIAG surface-lookup bind=%s addr=0x%016llx size=0x%010llx guest_fmt=%u "
+			            "vk_fmt=%d tile=%u %ux%u lv=%u %s -> img_addr=0x%016llx img_vk_fmt=%d "
+			            "img_%ux%u\n",
+			            desc.type == BindingType::Storage ? "STORAGE" : "sampled",
+			            static_cast<unsigned long long>(desc.info.data.address),
+			            static_cast<unsigned long long>(desc.info.data.size),
+			            desc.info.guest_format, static_cast<int>(desc.info.pixel_format),
+			            desc.info.tile_mode, desc.info.extent.width, desc.info.extent.height,
+			            desc.info.resources.levels, inserted_new ? "NEW" : "reuse",
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<int>(info.pixel_format), info.extent.width, info.extent.height);
+			std::fflush(stdout);
+		}
+	}
 	return result;
 }
 

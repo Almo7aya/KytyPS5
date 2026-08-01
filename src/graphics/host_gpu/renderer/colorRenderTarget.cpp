@@ -92,6 +92,19 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
 		     rt.view.current_mip_level, levels);
 	}
+	// KYTY_DIAG: record which guest addresses actually become colour render targets, so they can be
+	// compared against the surfaces the post chain samples.
+	if (rt.attrib2.width + 1u >= 1920) {
+		static std::atomic<uint32_t> rt_log = 0;
+		if (rt_log.fetch_add(1, std::memory_order_relaxed) < 200) {
+			std::printf("KYTY_DIAG rt-resolve base=0x%010llx %ux%u fmt=0x%x nfmt=0x%x tile=0x%x "
+			            "slot=%u\n",
+			            static_cast<unsigned long long>(rt.base.addr), rt.attrib2.width + 1u,
+			            rt.attrib2.height + 1u, rt.info.format, rt.info.channel_type,
+			            rt.attrib3.tile_mode, rt_slot);
+			std::fflush(stdout);
+		}
+	}
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;
 		const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
