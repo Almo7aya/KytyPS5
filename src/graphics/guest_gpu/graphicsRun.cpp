@@ -146,6 +146,10 @@ private:
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
 	bool                                           m_processing        = false;
+	// Set while every queued submission is parked on a guest-visible WAIT_REG_MEM and nothing is
+	// runnable. Such work can only advance once a guest thread writes the awaited label, so a
+	// waiter that is itself a guest thread must not treat it as "not yet idle" (see WaitForIdle).
+	bool                                           m_blocked_stall     = false;
 	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
@@ -604,7 +608,13 @@ void GpuState::Enqueue(Submission submission) {
 
 void GpuState::WaitForIdle() {
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+	// A submission blocked on a WAIT_REG_MEM only completes once a guest thread writes the awaited
+	// label. Callers of this function are usually guest threads holding m_submission_mutex (see
+	// PauseSubmissions), so waiting for the queue to empty would deadlock: the GPU waits on the
+	// guest and the guest waits on the GPU. Treat a fully blocked queue as idle -- the worker is
+	// parked at a wait packet and is not touching guest memory -- and let the caller proceed. Any
+	// command it then posts is still serialized: the worker drains m_commands before submissions.
+	while ((m_processing || !m_commands.empty() || m_submission_count != 0) && !m_blocked_stall) {
 		m_idle.Wait(&m_queue_mutex);
 	}
 }
@@ -614,6 +624,8 @@ void GpuState::ThreadRun(void* data) {
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
 	g_gpu_thread = true;
+	// Register with the wait tracker so stall dumps show what the GPU worker itself is doing.
+	Kyty::WaitWatch::SetThreadName("GpuWorker", -1, Kyty::WaitWatch::CurrentHostTid()); // KYTY_DIAG
 
 	for (;;) {
 		Submission                   submission;
@@ -625,6 +637,7 @@ void GpuState::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Kyty::WaitWatch::Scope w("gpu_worker_idle", 0, 0); // KYTY_DIAG
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
@@ -634,7 +647,8 @@ void GpuState::ThreadRun(void* data) {
 			} else if (!gpu->m_commands.empty()) {
 				command = std::move(gpu->m_commands.front());
 				gpu->m_commands.pop_front();
-				gpu->m_processing = true;
+				gpu->m_processing    = true;
+				gpu->m_blocked_stall = false;
 			} else {
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
@@ -646,6 +660,11 @@ void GpuState::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					// Nothing is runnable: every queued submission is parked on a guest-visible
+					// wait. Publish that so a guest thread inside WaitForIdle can stop waiting on
+					// work that only it can unblock.
+					gpu->m_blocked_stall = true;
+					gpu->m_idle.SignalAll();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -658,9 +677,10 @@ void GpuState::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
-				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
-				gpu->m_processing = true;
-				has_submission    = true;
+				gpu->m_next_queue    = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
+				gpu->m_processing    = true;
+				gpu->m_blocked_stall = false;
+				has_submission       = true;
 			}
 		}
 		if (should_stop) {
@@ -802,7 +822,6 @@ void GpuState::PauseSubmissions() {
 	if (g_gpu_mutex_owned) {
 		EXIT("GPU submissions are already paused by this thread\n");
 	}
-	Kyty::WaitWatch::Scope watch("gpu_pause_lock", 0, 0);
 	Kyty::WaitWatch::DrainStats::pause_count.fetch_add(1, std::memory_order_relaxed);
 	Kyty::WaitWatch::DrainStats::ScopedNs t(Kyty::WaitWatch::DrainStats::pause_ns);
 	g_gpu_mutex_owned = true;
@@ -810,11 +829,18 @@ void GpuState::PauseSubmissions() {
 	// drain -- this is the proven-deadlock-free ordering. The perf win comes from replacing the old
 	// full-queue WaitForIdle with a lightweight worker PARK (wait only for the in-flight Process, not
 	// the whole queue); BufferWait still fences submitted GPU work and LabelDrain still flushes labels.
-	m_submission_mutex.Lock();
+	{
+		Kyty::WaitWatch::Scope w("gpu_pause_mtx", 0, 0); // KYTY_DIAG
+		m_submission_mutex.Lock();
+	}
 	if (!IsGpuThread()) {
+		Kyty::WaitWatch::Scope w("gpu_pause_wait", 0, 0); // KYTY_DIAG
 		WaitLocked();
 	}
-	m_renderer.GetCommandScheduler().DrainPriorityOperations();
+	{
+		Kyty::WaitWatch::Scope w("gpu_pause_drain", 0, 0); // KYTY_DIAG
+		m_renderer.GetCommandScheduler().DrainPriorityOperations();
+	}
 }
 
 void GpuState::ResumeSubmissions() {

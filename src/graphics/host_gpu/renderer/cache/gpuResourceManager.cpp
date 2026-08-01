@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 
 #include "common/assert.h"
+#include "common/waitWatch.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -13,7 +14,9 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	constexpr uint64_t fault_size = 8;
+	Kyty::WaitWatch::Scope watch("gpu_fault", fault_vaddr,
+	                             static_cast<uint64_t>(access)); // KYTY_DIAG
+	constexpr uint64_t     fault_size = 8;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
@@ -92,6 +95,17 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t GpuResourceManager::MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept {
+	if (vaddr == 0 || max_size == 0 || vaddr >= TRACKER_ADDRESS_SIZE) {
+		return 0;
+	}
+	if (max_size > TRACKER_ADDRESS_SIZE - vaddr) {
+		max_size = TRACKER_ADDRESS_SIZE - vaddr;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.ContiguousExtent(vaddr, max_size);
+}
+
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
@@ -101,7 +115,8 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
-	const auto unmap = [this, vaddr, size] {
+	Kyty::WaitWatch::Scope watch("gpu_unmap", vaddr, size); // KYTY_DIAG
+	const auto             unmap = [this, vaddr, size] {
 		m_buffer_cache.UnmapMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_page_manager.OnGpuUnmap(vaddr, size);

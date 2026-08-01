@@ -109,3 +109,37 @@ void DumpThreadStackIfStuck(const ThreadWait*, uint64_t) {}
 } // namespace Kyty::WaitWatch
 
 #endif
+
+#include <thread>
+
+namespace Kyty::WaitWatch {
+
+void StartStallWatchdog(uint64_t stall_ms) {
+	static std::once_flag once;
+	std::call_once(once, [stall_ms] {
+		std::thread([stall_ms] {
+			uint64_t last_frames = g_frames.load(std::memory_order_relaxed);
+			uint64_t last_change = NowMs();
+			bool     reported    = false;
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(500));
+				const auto frames = g_frames.load(std::memory_order_relaxed);
+				const auto now    = NowMs();
+				if (frames != last_frames) {
+					last_frames = frames;
+					last_change = now;
+					reported    = false;
+					continue;
+				}
+				// Only report the first sample of each stall episode; re-arms once frames advance
+				// again so a slow-but-alive load does not spam the log.
+				if (!reported && now - last_change >= stall_ms) {
+					reported = true;
+					Dump("frame-stall");
+				}
+			}
+		}).detach();
+	});
+}
+
+} // namespace Kyty::WaitWatch

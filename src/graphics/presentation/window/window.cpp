@@ -1,5 +1,7 @@
 #include "graphics/presentation/window.h"
 
+#include "common/waitWatch.h"
+
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -941,6 +943,7 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	Kyty::WaitWatch::FrameTick(); // KYTY_DIAG
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);

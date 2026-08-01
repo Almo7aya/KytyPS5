@@ -207,6 +207,18 @@ struct Scope {
 	Scope& operator=(const Scope&) = delete;
 };
 
+// Render-frame heartbeat. WindowContext::UpdateTitle() ticks this once per presented frame; the
+// stall watchdog samples it to tell a hang from slow-but-alive progress.
+inline std::atomic<uint64_t> g_frames {0};
+
+inline void FrameTick() {
+	g_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Starts (once) a background thread that dumps every registered thread's current wait when the
+// frame counter stops advancing for `stall_ms`. Diagnostic only; re-arms after progress resumes.
+void StartStallWatchdog(uint64_t stall_ms = 5000);
+
 inline void Dump(const char* reason) {
 	std::scoped_lock lk(RegMutex());
 	const uint64_t   now = NowMs();

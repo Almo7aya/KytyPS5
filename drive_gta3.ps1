@@ -2,13 +2,14 @@ param(
     [int]$IntroSeconds = 60,       # how long to keep pressing Cross to skip intros
     [int]$PostStartSeconds = 100,  # how long to watch (and keep the emulator alive) after Start
     [string]$LogTag = (Get-Date -Format 'MMdd_HHmmss'),  # unique per run so logs never clobber
-    [string]$Printf = "Silent"     # printf-direction: Silent or Console
+    [string]$Printf = "Silent",    # printf-direction: Silent or Console
+    [string]$Build = "windows-prod" # build dir under _Build; use windows-nolauncher for logging
 )
 
 $ErrorActionPreference = "Stop"
 # Resolve the project root from this script's location so the driver is portable.
 $root   = $PSScriptRoot
-$exe    = Join-Path $root "_Build\windows-prod\install\kyty_emulator.exe"
+$exe    = Join-Path $root "_Build\$Build\install\kyty_emulator.exe"
 $game   = "Z:\projects\PS5\games\Grand.Theft.Auto.III.The.Definitive.Edition\eboot.bin"
 $logDir = Join-Path $root "_gta3_logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }

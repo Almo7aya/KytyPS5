@@ -62,7 +62,9 @@ void MemoryTracker::ValidateGpuDirtyOwnership(const RangeSet& dirty, uint64_t va
 void MemoryTracker::ValidateRange(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
 	    size > TRACKER_ADDRESS_SIZE - vaddr) {
-		EXIT("invalid memory tracker range\n");
+		EXIT("invalid memory tracker range: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " limit=0x%016" PRIx64 "\n",
+		     vaddr, size, static_cast<uint64_t>(TRACKER_ADDRESS_SIZE));
 	}
 }
 

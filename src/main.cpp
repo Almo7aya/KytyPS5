@@ -7,6 +7,7 @@
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/waitWatch.h"
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
@@ -282,6 +283,8 @@ int main(int argc, char* argv[]) {
 		slist.DestroyAll(false);
 		return 0;
 	}
+
+	Kyty::WaitWatch::StartStallWatchdog(); // KYTY_DIAG
 
 	Run(options);
 
