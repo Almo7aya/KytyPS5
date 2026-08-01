@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
-#include "common/waitWatch.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -93,19 +92,6 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	if (levels == 0 || levels > 16 || rt.view.current_mip_level >= levels) {
 		EXIT("unsupported render-target mip range: current=%u levels=%u\n",
 		     rt.view.current_mip_level, levels);
-	}
-	// KYTY_DIAG: record which guest addresses actually become colour render targets, so they can be
-	// compared against the surfaces the post chain samples.
-	if (rt.attrib2.width + 1u >= 1920) {
-		static std::atomic<uint32_t> rt_log = 0;
-		if (rt_log.fetch_add(1, std::memory_order_relaxed) < 4000) {
-			std::printf("KYTY_DIAG rt f=%llu base=0x%010llx %ux%u fmt=0x%x nfmt=0x%x\n",
-			            static_cast<unsigned long long>(
-			                Kyty::WaitWatch::g_frames.load(std::memory_order_relaxed)),
-			            static_cast<unsigned long long>(rt.base.addr), rt.attrib2.width + 1u,
-			            rt.attrib2.height + 1u, rt.info.format, rt.info.channel_type);
-			std::fflush(stdout);
-		}
 	}
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic_uint log_count = 0;

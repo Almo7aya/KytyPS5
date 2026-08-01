@@ -1,5 +1,4 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
-#include "common/waitWatch.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -1202,23 +1201,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	}
 	ValidateImageDesc(desc);
 	if (desc.info.data.Empty()) {
-		// KYTY_DIAG: an empty guest range substitutes a 1x1 null image. If a real post-processing
-		// input lands here (e.g. the tonemap's exposure texture) the shader reads zeros and the whole
-		// frame goes black, so report what was asked for.
-		{
-			static std::atomic<uint32_t> null_log = 0;
-			if (null_log.fetch_add(1, std::memory_order_relaxed) < 200) {
-				std::printf("KYTY_DIAG null-image addr=0x%010llx size=0x%010llx guest_fmt=%u vk_fmt=%d "
-				            "%ux%u lv=%u tile=%u bind=%s\n",
-				            static_cast<unsigned long long>(desc.info.data.address),
-				            static_cast<unsigned long long>(desc.info.data.size),
-				            desc.info.guest_format, static_cast<int>(desc.info.pixel_format),
-				            desc.info.extent.width, desc.info.extent.height,
-				            desc.info.resources.levels, desc.info.tile_mode,
-				            desc.type == BindingType::Storage ? "STORAGE" : "sampled");
-				std::fflush(stdout);
-			}
-		}
 		CacheLock lock(*this, m_lock);
 		return GetNullImage(desc);
 	}
@@ -1279,33 +1261,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
-			// KYTY_DIAG: creating a new image for memory that already has overlapping images means
-			// the cache has split one guest surface across several host images -- the writer and the
-			// reader then disagree and one of them sees an empty texture.
-			if (!candidates.empty() && desc.info.extent.width >= 1920) {
-				static std::atomic<uint32_t> split_log = 0;
-				if (split_log.fetch_add(1, std::memory_order_relaxed) < 64) {
-					std::printf("KYTY_DIAG image-split new addr=0x%016llx size=0x%010llx fmt=%d "
-					            "tile=%u %ux%u lv=%u existing=%zu\n",
-					            static_cast<unsigned long long>(desc.info.data.address),
-					            static_cast<unsigned long long>(desc.info.data.size),
-					            static_cast<int>(desc.info.pixel_format), desc.info.tile_mode,
-					            desc.info.extent.width, desc.info.extent.height,
-					            desc.info.resources.levels, candidates.size());
-					for (const auto cid: candidates) {
-						if (const auto c = ResolveOwner(cid); c != nullptr) {
-							std::printf("     existing addr=0x%016llx size=0x%010llx fmt=%d tile=%u "
-							            "%ux%u lv=%u gpu_mod=%d\n",
-							            static_cast<unsigned long long>(c->info.data.address),
-							            static_cast<unsigned long long>(c->info.data.size),
-							            static_cast<int>(c->info.pixel_format), c->info.tile_mode,
-							            c->info.extent.width, c->info.extent.height,
-							            c->info.resources.levels, c->IsGpuModified() ? 1 : 0);
-						}
-					}
-					std::fflush(stdout);
-				}
-			}
 			result         = InsertImage(desc.info);
 			inserted_new   = true;
 			auto& inserted = ResolveImage(result);
@@ -1340,22 +1295,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 		RetainImage(command, result);
-	}
-	// KYTY_DIAG: trace full-resolution surface lookups so the writer and the reader of the
-	// post-processing scene buffer can be compared -- if they share a guest address but derive
-	// different formats the bug is in the format mapping, if the addresses differ the writer is
-	// simply somewhere else.
-	if (desc.info.extent.width >= 1920 && desc.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-		static std::atomic<uint32_t> lookup_log = 0;
-		if (lookup_log.fetch_add(1, std::memory_order_relaxed) < 4000) {
-			std::printf("KYTY_DIAG surf f=%llu bind=%s addr=0x%010llx img=%u.%u %s\n",
-			            static_cast<unsigned long long>(
-			                Kyty::WaitWatch::g_frames.load(std::memory_order_relaxed)),
-			            desc.type == BindingType::Storage ? "STORAGE" : "sampled",
-			            static_cast<unsigned long long>(desc.info.data.address), result.index,
-			            result.generation, inserted_new ? "NEW" : "reuse");
-			std::fflush(stdout);
-		}
 	}
 	return result;
 }

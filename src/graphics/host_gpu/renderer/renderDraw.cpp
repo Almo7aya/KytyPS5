@@ -93,7 +93,7 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
 	// Capped at 128 messages and written with ::printf rather than LOGF, so it shows up in a normal
 	// run's log without needing --graphics-debug-dump (which costs millions of lines and tanks fps).
 	auto log_id = g_framebuffer_skip_log_count.fetch_add(1, std::memory_order_relaxed);
-	if (log_id >= 128) {
+	if (log_id >= 8) {
 		return;
 	}
 
@@ -1393,7 +1393,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	if (draw_prim7_as_ngg && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
 		static std::atomic<uint32_t> skip_log_count = 0;
-		if (skip_log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
+		if (skip_log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
 			std::printf("KYTY_DIAG skipping rect-list draw with no VS param exports and PS inputs: "
 			            "ps_inputs=%u ps=0x%016llx es=0x%016llx gs=0x%016llx\n",
 			            state.ps_input_info.input_num,
