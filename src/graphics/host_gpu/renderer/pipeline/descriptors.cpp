@@ -335,6 +335,20 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u, 1,
 	                        descriptor.TileMode());
+	// KYTY_DIAG: report the cached image's own identity too. If its guest range/tiling disagree with
+	// the descriptor, the cache handed back a stale depth image for memory the guest has since
+	// repurposed as colour; if they agree, this is a genuine depth-as-colour reinterpretation.
+	if (image != nullptr) {
+		std::printf("KYTY_DIAG depth-bind-mismatch image_addr=0x%016llx image_size=0x%016llx "
+		            "image_tile=%u image_extent=%ux%u image_levels=%u image_gpu_modified=%d "
+		            "desc_tile=%u desc_addr=0x%016llx\n",
+		            static_cast<unsigned long long>(image->info.data.address),
+		            static_cast<unsigned long long>(image->info.data.size), image->info.tile_mode,
+		            image->info.extent.width, image->info.extent.height,
+		            image->info.resources.levels, image->IsGpuModified() ? 1 : 0,
+		            descriptor.TileMode(), static_cast<unsigned long long>(descriptor.Base40()));
+		std::fflush(stdout);
+	}
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
 	     "kind=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "

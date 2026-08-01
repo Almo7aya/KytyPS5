@@ -1261,6 +1261,33 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			// KYTY_DIAG: creating a new image for memory that already has overlapping images means
+			// the cache has split one guest surface across several host images -- the writer and the
+			// reader then disagree and one of them sees an empty texture.
+			if (!candidates.empty() && desc.info.extent.width >= 1920) {
+				static std::atomic<uint32_t> split_log = 0;
+				if (split_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+					std::printf("KYTY_DIAG image-split new addr=0x%016llx size=0x%010llx fmt=%d "
+					            "tile=%u %ux%u lv=%u existing=%zu\n",
+					            static_cast<unsigned long long>(desc.info.data.address),
+					            static_cast<unsigned long long>(desc.info.data.size),
+					            static_cast<int>(desc.info.pixel_format), desc.info.tile_mode,
+					            desc.info.extent.width, desc.info.extent.height,
+					            desc.info.resources.levels, candidates.size());
+					for (const auto cid: candidates) {
+						if (const auto c = ResolveOwner(cid); c != nullptr) {
+							std::printf("     existing addr=0x%016llx size=0x%010llx fmt=%d tile=%u "
+							            "%ux%u lv=%u gpu_mod=%d\n",
+							            static_cast<unsigned long long>(c->info.data.address),
+							            static_cast<unsigned long long>(c->info.data.size),
+							            static_cast<int>(c->info.pixel_format), c->info.tile_mode,
+							            c->info.extent.width, c->info.extent.height,
+							            c->info.resources.levels, c->IsGpuModified() ? 1 : 0);
+						}
+					}
+					std::fflush(stdout);
+				}
+			}
 			result         = InsertImage(desc.info);
 			inserted_new   = true;
 			auto& inserted = ResolveImage(result);
