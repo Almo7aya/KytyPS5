@@ -222,7 +222,10 @@ void StartStallWatchdog(uint64_t stall_ms = 5000);
 inline void Dump(const char* reason) {
 	std::scoped_lock lk(RegMutex());
 	const uint64_t   now = NowMs();
-	::printf("=== WAITWATCH (%s) threads=%zu ===\n", reason, Registry().size());
+	::printf("=== WAITWATCH (%s) threads=%zu faults_total=%llu faults_unique=%llu ===\n", reason,
+	         Registry().size(),
+	         static_cast<unsigned long long>(FaultStats::total.load(std::memory_order_relaxed)),
+	         static_cast<unsigned long long>(FaultStats::unique.load(std::memory_order_relaxed)));
 	for (auto* t: Registry()) {
 		const uint64_t start = t->start_ms.load(std::memory_order_relaxed);
 		const uint64_t held  = (start != 0 && now >= start) ? (now - start) : 0;

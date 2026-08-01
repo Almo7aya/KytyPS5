@@ -1830,7 +1830,23 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 	const auto page_end   = (address + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto owner = ResolveOwner(id);
-		if (owner == nullptr || owner->depth_id) {
+		if (owner == nullptr) {
+			continue;
+		}
+		if (owner->depth_id) {
+			// A depth alias cannot absorb a CPU write through InvalidateCpuWrite: its guest bytes are
+			// the HTILE-encoded depth plane, not a plain copy of the image. Skipping it outright,
+			// however, left its page watcher armed, so the faulting store was retried forever -- GTA
+			// III level load span millions of write faults on one page with the GPU worker idle.
+			// Release the watcher so the guest makes progress and flag the alias so its next use
+			// re-validates the guest contents.
+			if (owner->IsTracked()) {
+				owner->MarkMaybeCpuDirty();
+				if (owner->NeedsMaybeCpuHash()) {
+					owner->SetMaybeCpuHash(owner->HashGuestEdges());
+				}
+				UntrackImage(id);
+			}
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {

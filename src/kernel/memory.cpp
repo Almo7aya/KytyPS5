@@ -3498,6 +3498,53 @@ static void CommitOnFaultLog(uint64_t block, uint64_t size, const char* tag) {
 	}
 }
 
+// Commit a host range that the guest address space does not own. GuestAddressSpace::Commit only
+// succeeds for ranges on its own free list (it consumes a placeholder); a reservation made outside
+// that bookkeeping -- a bare MEM_RESERVE, or an anon range the guest reserved through another path
+// -- has to be committed directly. Without this fallback such a page faults forever.
+static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode) {
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	// Prefer one syscall, then fall back to the per-page path.
+	if (size > PAGE_SIZE && VirtualMemory::AllocFixed(start, size, mode)) {
+		return true;
+	}
+#endif
+
+	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != 0) {
+			if (info.State == MEM_COMMIT) {
+				if (!VirtualMemory::Protect(addr, PAGE_SIZE, mode)) {
+					return false;
+				}
+				continue;
+			}
+			if (info.State == MEM_RESERVE) {
+				if (!VirtualMemory::Commit(addr, PAGE_SIZE, mode)) {
+					return false;
+				}
+				continue;
+			}
+		}
+#endif
+		if (VirtualMemory::AllocFixed(addr, PAGE_SIZE, mode)) {
+			continue;
+		}
+		if (VirtualMemory::Commit(addr, PAGE_SIZE, mode)) {
+			continue;
+		}
+		if (VirtualMemory::Protect(addr, PAGE_SIZE, mode)) {
+			continue;
+		}
+		return false;
+	}
+
+	return true;
+}
+
 bool KernelCommitReservedOnFault(uint64_t vaddr) {
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
@@ -3509,7 +3556,20 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 	}
 
 	VirtualRanges::Range range {};
-	if (g_virtual_ranges->Query(vaddr, 0, &range) && IsReservedRangeType(range.type)) {
+	const bool           queried = g_virtual_ranges->Query(vaddr, 0, &range);
+	// KYTY_DIAG: this path silently returned false for every GTA III streaming fault; report which
+	// gate rejected it.
+	const auto diag = [&](const char* why, uint64_t extra) {
+		std::printf("KYTY_DIAG commit-on-fault-fail addr=0x%016llx block=0x%016llx why=%s "
+		            "queried=%d type=%d rstart=0x%016llx rsize=0x%016llx extra=0x%llx\n",
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(block),
+		            why, queried ? 1 : 0, queried ? static_cast<int>(range.type) : -1,
+		            static_cast<unsigned long long>(range.start),
+		            static_cast<unsigned long long>(range.size),
+		            static_cast<unsigned long long>(extra));
+		std::fflush(stdout);
+	};
+	if (queried && IsReservedRangeType(range.type)) {
 		if (block < range.start) {
 			block = range.start;
 		}
@@ -3518,10 +3578,15 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 		if (block_end > range_end) {
 			block_end = range_end;
 		}
-		const uint64_t size = block_end - block;
-		if (size != 0 && g_virtual_ranges->ConsumeReserved(block, size, range.type)) {
+		const uint64_t size     = block_end - block;
+		const bool     consumed = size != 0 && g_virtual_ranges->ConsumeReserved(block, size, range.type);
+		if (!consumed) {
+			diag("consume-reserved-failed", size);
+		}
+		if (consumed) {
 			const bool committed =
-			    g_guest_address_space->Commit(block, size, VirtualMemory::Mode::ReadWrite);
+			    g_guest_address_space->Commit(block, size, VirtualMemory::Mode::ReadWrite) ||
+			    CommitFixedHostRange(block, size, VirtualMemory::Mode::ReadWrite);
 			if (!committed) {
 				g_virtual_ranges->Add(block, size, 0, 0, 0, range.type, range.name, false);
 				return false;
@@ -3565,12 +3630,16 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 	// to read/write it, so commit the 64KB block directly. Try the placeholder-replace path first, then
 	// a plain page-by-page commit for a non-placeholder reserve.
 	MEMORY_BASIC_INFORMATION mbi {};
-	if (VirtualQuery(reinterpret_cast<const void*>(block), &mbi, sizeof(mbi)) != 0 &&
-	    mbi.State == MEM_RESERVE) {
-		if (g_guest_address_space->Commit(block, GRAN, VirtualMemory::Mode::ReadWrite)) {
+	const auto               queried_os = VirtualQuery(reinterpret_cast<const void*>(block), &mbi, sizeof(mbi));
+	if (queried_os != 0 && mbi.State == MEM_RESERVE) {
+		if (g_guest_address_space->Commit(block, GRAN, VirtualMemory::Mode::ReadWrite) ||
+		    CommitFixedHostRange(block, GRAN, VirtualMemory::Mode::ReadWrite)) {
 			CommitOnFaultLog(block, GRAN, "untracked");
 			return true;
 		}
+		diag("untracked-commit-failed", mbi.Protect);
+	} else {
+		diag("os-state-not-reserve", queried_os == 0 ? 0 : mbi.State);
 	}
 #endif
 	return false;

@@ -20,21 +20,41 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	Kyty::WaitWatch::FaultStats::Record(fault_vaddr); // KYTY_DIAG
+
+	// Resolve a window around the fault instead of only the 8 bytes that trapped. A fault raised on
+	// a thread that is not the command processor costs a full round-trip to the GPU worker, and the
+	// guest rewrites the same streaming buffers every frame: GTA III level load measured ~415k
+	// faults over only ~13.7k distinct pages (~30 per page, roughly one per frame). Page-at-a-time
+	// resolution therefore pays that round-trip once per 4 KiB per frame, which is what pins the
+	// loader near 1 fps. Widening trades a coarser CPU-dirty granularity -- the GPU re-uploads
+	// somewhat more per touched region -- for an order of magnitude fewer round-trips. The window is
+	// clamped to the contiguous mapped extent so it never reaches into a neighbouring mapping.
+	// 64 KiB measured best: 256 KiB over-invalidates (it drags unrelated textures through the
+	// texture-cache invalidate) without improving the stall rate.
+	constexpr uint64_t fault_window  = 64ull * 1024ull;
+	uint64_t           resolve_addr  = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	uint64_t           resolve_size  = MappedExtent(resolve_addr, fault_window);
+	if (resolve_size < fault_vaddr - resolve_addr + fault_size) {
+		resolve_addr = fault_vaddr;
+		resolve_size = fault_size;
+	}
+
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported guest-memory fault from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " access=%u\n",
 		     fault_vaddr, static_cast<uint32_t>(access));
 	}
 	bool       handled = false;
-	const auto resolve = [this, access, fault_vaddr, &handled](CommandProcessor& cp) {
+	const auto resolve = [this, access, resolve_addr, resolve_size, &handled](CommandProcessor& cp) {
 		cp.BeginReadbackTransaction();
 		{
 			ResourceMutex::FaultScope fault(m_resource_mutex);
 			if (access == PageFaultAccess::Write) {
-				m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
-				m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+				m_buffer_cache.InvalidateMemory(resolve_addr, resolve_size);
+				m_texture_cache.InvalidateMemory(resolve_addr, resolve_size);
 			} else {
-				m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
+				m_buffer_cache.ReadMemory(resolve_addr, resolve_size);
 			}
 			handled = true;
 		}
