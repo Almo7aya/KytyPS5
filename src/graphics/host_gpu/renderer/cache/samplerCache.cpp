@@ -50,17 +50,13 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 
 	const bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
 	if (aniso) {
-		switch (static_cast<Prospero::SamplerAnisoRatio>(r.MaxAnisoRatio())) {
-			case Prospero::SamplerAnisoRatio::kOne: aniso_ratio = 1.0f; break;
-			case Prospero::SamplerAnisoRatio::kTwo: aniso_ratio = 2.0f; break;
-			case Prospero::SamplerAnisoRatio::kFour: aniso_ratio = 4.0f; break;
-			case Prospero::SamplerAnisoRatio::kEight: aniso_ratio = 8.0f; break;
-			case Prospero::SamplerAnisoRatio::kSixteen: aniso_ratio = 16.0f; break;
-			default:
-				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
-				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
-				     r.fields[3]);
-		}
+		// MAX_ANISO_RATIO is a 3-bit field: 0..4 select 1x..16x. The values above 4 are reserved and
+		// the hardware treats them as the maximum ratio, so clamp instead of aborting -- GTA III's
+		// post-processing samplers program 7. 16x is the ceiling every desktop Vulkan driver
+		// reports for maxSamplerAnisotropy, and this value is written straight into
+		// VkSamplerCreateInfo::maxAnisotropy below.
+		const auto ratio = static_cast<uint32_t>(r.MaxAnisoRatio());
+		aniso_ratio      = static_cast<float>(1u << (ratio < 4u ? ratio : 4u));
 	}
 
 	const auto mip_filter = r.MipFilter();

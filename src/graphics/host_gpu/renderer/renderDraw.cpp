@@ -89,23 +89,27 @@ static void LogFramebufferSkip(const char* draw_name, const RenderColorInfo& col
                                uint32_t index_count, uint32_t flags) {
 	const auto& ctx  = buffer.GetRegisters();
 	const auto& ucfg = buffer.GetUserConfig();
-	if (!graphics_debug_dump_enabled()) {
-		return;
-	}
 
+	// Capped at 128 messages and written with ::printf rather than LOGF, so it shows up in a normal
+	// run's log without needing --graphics-debug-dump (which costs millions of lines and tanks fps).
 	auto log_id = g_framebuffer_skip_log_count.fetch_add(1, std::memory_order_relaxed);
 	if (log_id >= 128) {
 		return;
 	}
 
-	LOGF(
-	    "DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010" PRIx64 " color_size=0x%016" PRIx64
-	    " color_image=%s depth_format=%s depth_image=%s depth_vaddr_num=%d target_mask=0x%08" PRIx32
-	    " prim=%u index_count=%u flags=0x%08" PRIx32 "\n",
-	    log_id, draw_name, RenderColorTypeName(color.type), color.base_addr, color.buffer_size,
-	    color.image_id ? "yes" : "no", VulkanToString(depth.format).c_str(),
-	    depth.image_id ? "yes" : "no", depth.vaddr_num, ctx.GetRenderTargetMask(),
-	    ucfg.GetPrimType(), index_count, flags);
+	// Also report the raw CB_COLOR base: a resolved color_addr of 0 with a non-zero register means
+	// the resolve failed, whereas both being zero means the guest really bound no colour target
+	// (and the draw is presumably writing through UAVs instead).
+	std::printf("KYTY_DIAG DrawFramebufferSkip[%u]: %s color=%s color_addr=0x%010llx "
+	            "color_size=0x%016llx color_image=%s depth_image=%s depth_vaddr_num=%d "
+	            "target_mask=0x%08x prim=%u index_count=%u flags=0x%08x raw_cb0=0x%010llx\n",
+	            log_id, draw_name, RenderColorTypeName(color.type),
+	            static_cast<unsigned long long>(color.base_addr),
+	            static_cast<unsigned long long>(color.buffer_size), color.image_id ? "yes" : "no",
+	            depth.image_id ? "yes" : "no", depth.vaddr_num, ctx.GetRenderTargetMask(),
+	            ucfg.GetPrimType(), index_count, flags,
+	            static_cast<unsigned long long>(ctx.GetRenderTarget(0).base.addr));
+	std::fflush(stdout);
 }
 
 static void LogMrtState(const char* draw_name, const RenderCommandBuffer& buffer,
@@ -823,11 +827,21 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	if (log_setup_phases) {
 		LogDrawPhase(draw.name, "ResolveRenderColorTarget");
 	}
+	// A draw can leave CB_TARGET_MASK at zero while still binding a valid CB_COLOR base — GTA III's
+	// full-screen post-processing passes do exactly that, ~90-128 times per frame. Resolving those
+	// to NoColorOutput left them with no attachment at all, so the framebuffer check below dropped
+	// the draw and the post chain never wrote its target (the tonemap then sampled an all-zero
+	// buffer and the world never reached the screen).
+	//
+	// Honour the base address in that case, but only when a pixel shader is actually bound:
+	// a draw with no PS genuinely produces no colour, and reviving it would fail the shader lookup.
+	const bool has_pixel_shader =
+	    ShaderAddressValid(buffer.GetShaders().GetPs().ps_regs.data_addr);
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
 			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
+			                         render_target_slice_offset, slot, has_pixel_shader);
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
 			}
@@ -1376,11 +1390,15 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 
 	if (draw_prim7_as_ngg && state.vs_input_info.buffers_num == 0 &&
 	    state.vs_input_info.param_export_mask == 0 && state.ps_input_info.input_num != 0) {
-		if (graphics_debug_dump_enabled()) {
-			LOGF("DrawIndexAuto: skipping rect-list draw with no VS param exports and PS inputs: "
-			     "ps_inputs=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
-			     state.ps_input_info.input_num, sh_ctx.GetPs().ps_regs.chksum,
-			     sh_ctx.GetVs().es_regs.data_addr, sh_ctx.GetVs().gs_regs.data_addr);
+		static std::atomic<uint32_t> skip_log_count = 0;
+		if (skip_log_count.fetch_add(1, std::memory_order_relaxed) < 128) {
+			std::printf("KYTY_DIAG skipping rect-list draw with no VS param exports and PS inputs: "
+			            "ps_inputs=%u ps=0x%016llx es=0x%016llx gs=0x%016llx\n",
+			            state.ps_input_info.input_num,
+			            static_cast<unsigned long long>(sh_ctx.GetPs().ps_regs.chksum),
+			            static_cast<unsigned long long>(sh_ctx.GetVs().es_regs.data_addr),
+			            static_cast<unsigned long long>(sh_ctx.GetVs().gs_regs.data_addr));
+			std::fflush(stdout);
 		}
 		ResetBindings();
 		return;
