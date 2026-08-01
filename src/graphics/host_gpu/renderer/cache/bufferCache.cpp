@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/waitWatch.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/resourceMutex.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -13,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <source_location>
 #include <utility>
 #include <vector>
 
@@ -21,23 +23,34 @@ namespace Libs::Graphics {
 namespace {
 
 thread_local const void* g_cache_lock_owner = nullptr;
+thread_local uint32_t    g_cache_lock_line  = 0;
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
 class FaultSafeCacheLock final {
 public:
-	FaultSafeCacheLock(const void* owner, Common::Mutex& mutex): m_mutex(mutex) {
+	FaultSafeCacheLock(const void* owner, Common::Mutex& mutex,
+	                   std::source_location loc = std::source_location::current())
+	    : m_mutex(mutex) {
 		if (g_cache_lock_owner != nullptr) {
-			EXIT("BufferCache: recursive cache lock acquisition\n");
+			// Report both ends of the recursion and what the thread was doing, so the guest-memory
+			// access that faulted back into the cache can be identified from a log alone.
+			EXIT("BufferCache: recursive cache lock acquisition, outer=bufferCache.cpp:%u "
+			     "inner=bufferCache.cpp:%u scope=%s arg0=0x%016" PRIx64 "\n",
+			     g_cache_lock_line, static_cast<uint32_t>(loc.line()),
+			     Kyty::WaitWatch::Self().kind.load(std::memory_order_relaxed),
+			     Kyty::WaitWatch::Self().arg0.load(std::memory_order_relaxed));
 		}
 		g_cache_lock_owner = owner;
+		g_cache_lock_line  = static_cast<uint32_t>(loc.line());
 		m_mutex.Lock();
 	}
 
 	~FaultSafeCacheLock() {
 		m_mutex.Unlock();
 		g_cache_lock_owner = nullptr;
+		g_cache_lock_line  = 0;
 	}
 
 private:

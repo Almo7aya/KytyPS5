@@ -3,7 +3,10 @@ param(
     [int]$PostStartSeconds = 100,  # how long to watch (and keep the emulator alive) after Start
     [string]$LogTag = (Get-Date -Format 'MMdd_HHmmss'),  # unique per run so logs never clobber
     [string]$Printf = "Silent",    # printf-direction: Silent or Console
-    [string]$Build = "windows-prod" # build dir under _Build; use windows-nolauncher for logging
+    [string]$Build = "windows-prod", # build dir under _Build; use windows-nolauncher for logging
+    [string[]]$ExtraArgs = @(),      # extra emulator flags, e.g. --shader-log-direction File
+    [switch]$KeepAlive               # after the watch window, stop injecting input and leave the
+                                     # game running (for a manual RenderDoc F1 capture)
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,11 +82,11 @@ function Send-Key([IntPtr]$h, [string]$name, [int]$holdMs = 450) {
 }
 
 Write-Host "Launching emulator..."
-$p = Start-Process -FilePath $exe -ArgumentList @(
+$p = Start-Process -FilePath $exe -ArgumentList (@(
     "--printf-direction",$Printf,
     "--game",$game,
     "--avplayer-skip","true"
-) -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WorkingDirectory $root
+) + $ExtraArgs) -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru -WorkingDirectory $root
 
 Write-Host "PID=$($p.Id). Waiting for window..."
 $hwnd = [IntPtr]::Zero
@@ -134,5 +137,16 @@ while ($sw.Elapsed.TotalSeconds -lt $PostStartSeconds) {
 }
 
 Write-Host "Survived watch window. Title now: '$(Get-WindowTitle $hwnd)'"
+
+if ($KeepAlive) {
+    # Stop injecting input and hand the window over, e.g. to press F1 for a RenderDoc capture
+    # (captures land in _RenderDoc/). Exits when the game is closed or crashes.
+    Write-Host "KeepAlive: no longer injecting input. Game is yours - press F1 in the window to"
+    Write-Host "           capture a RenderDoc frame into _RenderDoc/. Close the game when done."
+    while (-not $p.HasExited) { Start-Sleep -Seconds 2 }
+    Write-Host "Game exited with code $($p.ExitCode)."
+    exit $p.ExitCode
+}
+
 if (-not $p.HasExited) { Write-Host "Still running; killing."; $p.Kill() }
 exit 0

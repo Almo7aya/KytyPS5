@@ -3552,6 +3552,9 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 	uint64_t           block = vaddr & ~(GRAN - 1);
 
 	if (g_guest_address_space == nullptr) {
+		std::printf("KYTY_DIAG commit-on-fault-fail addr=0x%016llx why=no-address-space\n",
+		            static_cast<unsigned long long>(vaddr));
+		std::fflush(stdout);
 		return false;
 	}
 
@@ -3588,6 +3591,7 @@ bool KernelCommitReservedOnFault(uint64_t vaddr) {
 			    g_guest_address_space->Commit(block, size, VirtualMemory::Mode::ReadWrite) ||
 			    CommitFixedHostRange(block, size, VirtualMemory::Mode::ReadWrite);
 			if (!committed) {
+				diag("tracked-commit-failed", size);
 				g_virtual_ranges->Add(block, size, 0, 0, 0, range.type, range.name, false);
 				return false;
 			}
