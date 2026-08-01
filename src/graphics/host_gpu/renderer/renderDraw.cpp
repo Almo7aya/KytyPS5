@@ -37,6 +37,7 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -839,6 +840,10 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	// a draw with no PS genuinely produces no colour, and reviving it would fail the shader lookup.
 	const bool has_pixel_shader =
 	    ShaderAddressValid(buffer.GetShaders().GetPs().ps_regs.data_addr);
+	// The fragment shader's output locations are the guest MRT slot numbers (out_mrt_<slot>), so
+	// packing the attachments contiguously below would misroute every export if a lower slot ever
+	// resolved to nothing. Measured on GTA III: the resolved slots are always contiguous from 0,
+	// so the packed order and the slot order agree.
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
 		                  ctx.GetRenderTarget(slot).base.addr != 0)) {

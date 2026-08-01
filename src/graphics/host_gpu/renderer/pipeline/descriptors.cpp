@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <fmt/format.h>
 #include <limits>
 #include <span>

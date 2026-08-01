@@ -5,6 +5,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 SamplerCache::~SamplerCache() {
@@ -65,6 +67,10 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	if (static_cast<Prospero::SamplerMipFilter>(mip_filter) != Prospero::SamplerMipFilter::kNone) {
 		min_lod = static_cast<float>(r.MinLod()) / 256.0f;
 		max_lod = static_cast<float>(r.MaxLod()) / 256.0f;
+		// GCN clamps the computed LOD into [MIN_LOD, MAX_LOD] one bound at a time, so an inverted
+		// pair simply pins every fetch to MAX_LOD. Vulkan instead requires minLod <= maxLod, so
+		// collapse the range onto that same value rather than creating an invalid sampler.
+		min_lod = std::min(min_lod, max_lod);
 	}
 
 	vk::SamplerCreateInfo sampler_info {};
@@ -124,8 +130,15 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
-	sampler_info.mipLodBias =
+	// LOD_BIAS is a 14-bit signed 5.8 fixed-point field, so the guest can legitimately ask for a
+	// bias up to +-32 -- GTA III programs 27 to pin a sampler to its smallest mip. Vulkan rejects
+	// anything past maxSamplerLodBias (15 on this driver), and the validation layer only warns:
+	// the sampler is still created, with undefined behaviour. Clamp to the device limit, which
+	// keeps the intent (a bias that large saturates the mip chain either way).
+	const float max_lod_bias = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
+	const float lod_bias =
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+	sampler_info.mipLodBias = std::clamp(lod_bias, -max_lod_bias, max_lod_bias);
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
@@ -146,6 +159,10 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		sampler_info.maxAnisotropy    = 1.0f;
 		sampler_info.compareEnable    = VK_FALSE;
 		sampler_info.mipLodBias       = 0.0f;
+		// Vulkan requires the two filters to match when coordinates are unnormalized; GCN has no
+		// such rule and GTA III programs NEAREST/LINEAR. magFilter is the one that matters for the
+		// full-resolution fetches these samplers are used for, so mirror it into minFilter.
+		sampler_info.minFilter = sampler_info.magFilter;
 	}
 
 	vk::Sampler vk_sampler = nullptr;

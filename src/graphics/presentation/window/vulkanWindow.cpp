@@ -45,7 +45,9 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -719,6 +721,7 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	fmt::text_style severity_style = Log::Color::Default;
 	bool            skip           = false;
 	bool            error          = false;
+	bool            warning        = false;
 	bool            debug_printf   = false;
 	switch (message_severity) {
 		case vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose:
@@ -742,6 +745,7 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		case vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning:
 			severity_str   = "W";
 			severity_style = Log::Color::Red;
+			warning        = true;
 			break;
 		case vk::DebugUtilsMessageSeverityFlagBitsEXT::eError:
 			severity_str   = "E";
@@ -754,9 +758,27 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	if (error) {
-		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
-		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+	// A validation error usually repeats every frame, so aborting on the first one only ever
+	// reports whichever error happens to come first. Report each distinct message a few times
+	// and keep running, so a single session shows every rule the emulator breaks.
+	if (error || warning) {
+		const char* id =
+		    (callback_data->pMessageIdName != nullptr ? callback_data->pMessageIdName : "<unnamed>");
+		int count = 0;
+		{
+			static std::mutex                           mutex;
+			static std::unordered_map<std::string, int> seen;
+			const std::lock_guard<std::mutex>           lock(mutex);
+			count = ++seen[id];
+		}
+		constexpr int repeats_per_id = 3;
+		if (count <= repeats_per_id) {
+			::printf("KYTY_VK [%s] %s (#%d)%s: %s\n", severity_str, id, count,
+			         count == repeats_per_id ? " [further repeats suppressed]" : "",
+			         callback_data->pMessage);
+			::fflush(stdout);
+		}
+		return VK_FALSE;
 	}
 
 	if (!skip) {
