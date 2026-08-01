@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
+#include <cstdio>
+
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
@@ -679,7 +681,23 @@ public:
 
 	void Reset() { *this = Context(); }
 
-	void SetColorBase(uint32_t slot, const ColorBase& base) { m_render_targets[slot].base = base; }
+	void SetColorBase(uint32_t slot, const ColorBase& base) {
+		// KYTY_DIAG: record every distinct CB_COLOR base the guest programs. This sits below the
+		// draw path, so an address that never appears here is one the guest never intends to render
+		// to -- which rules out a dropped draw as the reason a surface is sampled but never written.
+		// Deduplicated through a small direct-mapped table; races only cost a duplicate line.
+		if (base.addr != 0) {
+			static uint64_t seen[256] {};
+			auto&           slotted = seen[(base.addr >> 16u) & 0xffu];
+			if (slotted != base.addr) {
+				slotted = base.addr;
+				std::printf("KYTY_DIAG cb-base slot=%u addr=0x%010llx\n", slot,
+				            static_cast<unsigned long long>(base.addr));
+				std::fflush(stdout);
+			}
+		}
+		m_render_targets[slot].base = base;
+	}
 	void SetColorPitch(uint32_t slot, const ColorPitch& pitch) {
 		m_render_targets[slot].pitch = pitch;
 	}
