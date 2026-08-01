@@ -1038,8 +1038,12 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
 				                      draw.first_instance);
 			} else {
-				EXIT_NOT_IMPLEMENTED(
-				    !IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit));
+				if (!IsHostExpandedRectListDrawSupported(vs_input_info, draw, emit)) {
+					EXIT("unsupported host-expanded rect-list draw: index_count=%u "
+					     "draw_vertex_count=%u vs_buffers=%u instance_count=%u\n",
+					     draw.index_count, emit.draw_vertex_count, vs_input_info.buffers_num,
+					     draw.instance_count);
+				}
 				vk_buffer.draw(emit.draw_vertex_count, draw.instance_count, emit.first_vertex,
 				               draw.first_instance);
 			}
