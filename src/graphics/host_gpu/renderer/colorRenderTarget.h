@@ -30,6 +30,11 @@ struct RenderColorInfo {
 	uint64_t                        buffer_size      = 0;
 	uint32_t                        target_slot      = 0;
 	uint32_t                        samples          = 1;
+	// Effective per-slot CB_TARGET_MASK nibble used to resolve this attachment. When the guest
+	// leaves the mask at zero but binds a valid CB_COLOR base, ResolveRenderColorTarget substitutes
+	// a full mask; the dynamic colour-write state must agree or the draw would run with writes
+	// disabled and silently produce nothing.
+	uint32_t                        write_mask       = 0;
 	Prospero::ColorComponentMapping export_mapping;
 	bool                            color_clear_enable = false;
 	vk::ClearColorValue             color_clear_value {};

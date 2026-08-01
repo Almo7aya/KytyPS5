@@ -342,11 +342,13 @@ static PipelineDynamicParameters BuildGraphicsDynamicParams(const RenderCommandB
 	ret.stencil_back       = depth.stencil_dynamic_back;
 
 	// CB_COLOR_CONTROL.operation controls special CB operations, not the normal color component
-	// write mask. Use CB_TARGET_MASK here so scanout passes with mode=Disable do not go black.
+	// write mask. Use the mask the attachment was actually resolved with rather than re-reading
+	// CB_TARGET_MASK: ResolveRenderColorTarget substitutes a full mask when the guest leaves the
+	// nibble at zero but binds a valid CB_COLOR base (GTA III's post-processing passes). Re-deriving
+	// it here would disable colour writes for exactly those draws, so they would execute against a
+	// correctly bound attachment and still write nothing.
 	for (uint32_t i = 0; i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
-		ret.color_write_enable[i] =
-		    (i < color_count &&
-		     render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0);
+		ret.color_write_enable[i] = (i < color_count && colors[i].write_mask != 0);
 	}
 
 	return ret;

@@ -41,6 +41,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 
 	r.target_slot    = rt_slot;
 	r.export_mapping = {};
+	r.write_mask     = mask;
 
 	if (rt.base.addr == 0 || mask == 0) {
 		if (graphics_debug_dump_enabled()) {
