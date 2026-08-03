@@ -28,6 +28,29 @@ include(CTest)
 
 option(KYTY_ENABLE_CLANG_TIDY "Run clang-tidy checks during builds" OFF)
 
+set(KYTY_BUILD_ORIGIN "Source" CACHE STRING "Build provenance shown in diagnostics")
+set_property(CACHE KYTY_BUILD_ORIGIN PROPERTY STRINGS Source Official Fork)
+if(NOT KYTY_BUILD_ORIGIN STREQUAL "Source" AND NOT KYTY_BUILD_ORIGIN STREQUAL "Official" AND
+   NOT KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	message(FATAL_ERROR "KYTY_BUILD_ORIGIN must be Source, Official, or Fork")
+endif()
+
+set(KYTY_RELEASE_TAG "" CACHE STRING "Release tag embedded in official builds")
+set(KYTY_BUILD_REPOSITORY "" CACHE STRING "GitHub repository embedded in fork builds")
+set(KYTY_OFFICIAL_BUILD OFF)
+set(KYTY_FORK_BUILD OFF)
+if(KYTY_BUILD_ORIGIN STREQUAL "Official")
+	if(KYTY_RELEASE_TAG STREQUAL "")
+		message(FATAL_ERROR "Official builds require KYTY_RELEASE_TAG")
+	endif()
+	set(KYTY_OFFICIAL_BUILD ON)
+elseif(KYTY_BUILD_ORIGIN STREQUAL "Fork")
+	if(KYTY_BUILD_REPOSITORY STREQUAL "")
+		message(FATAL_ERROR "Fork builds require KYTY_BUILD_REPOSITORY")
+	endif()
+	set(KYTY_FORK_BUILD ON)
+endif()
+
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 include(TestBigEndian)
