@@ -251,6 +251,10 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
                           ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
 
+// Temporary: writes the raw guest words of an ES/GS pair rejected by ShouldSkipGeShader, so the
+// shaders blocking the colour-grading LUT can be disassembled offline.
+void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_ */

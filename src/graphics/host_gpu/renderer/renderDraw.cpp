@@ -470,6 +470,10 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 			     sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
 			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
 		}
+		// These shaders are never compiled, so nothing else dumps them. Write the raw guest words out
+		// once so the pair blocking the colour-grading LUT can be disassembled offline.
+		ShaderDumpSkippedGeShader(vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr,
+		                          vertex_info.gs_regs.chksum);
 		return true;
 	}
 

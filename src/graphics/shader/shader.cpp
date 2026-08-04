@@ -1408,6 +1408,49 @@ static void DumpShaderRecompilerOriginal(const char* type, uint64_t shader_hash,
 	}
 }
 
+void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash) {
+	// TEMPORARY (GTA III colour-grading LUT). ShouldSkipGeShader rejects the WriteToSlice ES+GS pair
+	// before anything compiles it, so the shaders that block the LUT are never decoded or dumped.
+	// Write the raw guest words out for offline disassembly. Deliberately does not invoke the
+	// recompiler: this runs on a draw that is skipped every frame, and a decoder that aborts on the
+	// TTMP scalars these shaders use would take the game down with it.
+	static std::atomic<uint32_t> dumped {0};
+	if (dumped.load(std::memory_order_relaxed) >= 2) {
+		return;
+	}
+
+	const auto dump_one = [hash](const char* type, uint64_t addr) {
+		if (addr == 0 || !ShaderAddressValid(addr)) {
+			return;
+		}
+		ShaderMappedData data {};
+		if (!ShaderGetMappedData(addr, data) || data.code_size_bytes == 0 ||
+		    data.code_size_bytes % sizeof(uint32_t) != 0) {
+			LOGF("SkippedGeShader: %s addr=0x%016" PRIx64 " has no usable mapped code\n", type, addr);
+			return;
+		}
+		auto name = Config::GetShaderLogFolder() / "skipped_ge" /
+		            fmt::format("{}_{:016x}_{:010x}.bin", type, hash, addr);
+		Common::File::CreateDirectories(name.parent_path());
+		Common::File file;
+		file.Create(name);
+		if (file.IsInvalid()) {
+			LOGF("SkippedGeShader: cannot create dump for %s addr=0x%016" PRIx64 "\n", type, addr);
+			return;
+		}
+		file.Write(reinterpret_cast<const void*>(addr), data.code_size_bytes);
+		file.Close();
+		LOGF("SkippedGeShader: dumped %s addr=0x%016" PRIx64 " bytes=0x%08" PRIx32 "\n", type, addr,
+		     data.code_size_bytes);
+	};
+
+	if (dumped.fetch_add(1, std::memory_order_relaxed) >= 2) {
+		return;
+	}
+	dump_one("es", es_addr);
+	dump_one("gs", gs_addr);
+}
+
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                           std::vector<uint32_t>& spirv) {
