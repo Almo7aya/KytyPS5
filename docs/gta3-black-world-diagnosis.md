@@ -629,9 +629,24 @@ the same structural fault as Part 6's depth/colour split, but between two colour
 explains the flashing exactly: when the tonemapper resolves to the freshly written side the frame looks
 right, and when it resolves to the stale side the frame goes black.
 
-**Not yet confirmed:** that `3680` and `3731` share a guest address. RenderDoc does not expose guest
-addresses, so this needs an emulator-side probe logging the guest address and format of every 1×1 image
-resolved for sampling versus storage. That is the next step, and it is cheap.
+**Refuted.** Two probes killed this. A probe on the format-incompatibility branch of `ResolveOverlap`
+reported **nothing**, and a probe logging every ≤4×4 image creation with its guest address showed that
+**every 1×1 image has a unique address** — no two host images share one. `3680` and `3731` are genuinely
+different guest resources, so the cache is not splitting anything here.
+
+**Correction to the labelling above.** `3731` is `R8G8B8A8_UNORM`, which is not an exposure format;
+Unreal's eye adaptation is float, and the healthy `1.265625` was written to a float 1×1 (`3680`, and the
+probe shows several `fmt=109` `R32G32B32A32_SFLOAT` 1×1 images, the usual eye-adaptation set). So `3731`
+is far more likely one of Unreal's **1×1 constant textures** — the probe shows many small `fmt=37`
+`R8G8B8A8_UNORM` 1×1 images with sizes `0x100`–`0x1000`. Calling it "the exposure image" was wrong.
+
+What survives from Part 7 is narrower but still solid: **the tonemapper multiplies by a 1×1 constant
+texture that reads `(0,0,0,1)` when it should read `(1,1,1,1)`**, and that blacks out the frame. The
+same 1×1 read `(1,1,1,1)` in working captures.
+
+The open question is therefore not aliasing but **why that texture's contents are missing** — most
+likely a guest CPU write that never reaches the host image, which would also explain the intermittency.
+The next step is to probe upload/invalidation for tiny CPU-written textures rather than the image cache.
 
 Worth recording: the Part 6 image-recreation probe filtered to `extent.width >= 256`, so it could never
 have reported these 1×1 images. The filter was meant to suppress texture churn and instead hid the
