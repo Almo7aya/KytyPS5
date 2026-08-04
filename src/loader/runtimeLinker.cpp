@@ -828,6 +828,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+
+		if ((info->access_violation_type == CoreAccess::Write ||
+		     info->access_violation_type == CoreAccess::Read) &&
+		    Libs::LibKernel::Memory::KernelCommitReservedOnFault(
+		        info->access_violation_vaddr)) {
+			return true;
+		}
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);

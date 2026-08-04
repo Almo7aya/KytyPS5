@@ -3428,6 +3428,108 @@ bool KernelHandleReservedRangeAccessViolation(uint64_t vaddr) {
 	EXIT("AMM virtual-memory unmap is unsupported: addr=0x%016" PRIx64 "\n", vaddr);
 }
 
+// GTA III streams through 64 KiB blocks in a large anonymous reservation. Some blocks are
+// accessed before an explicit map, so commit the faulting allocation-granularity block on demand.
+static bool CommitFixedHostRange(uint64_t start, uint64_t size, VirtualMemory::Mode mode) {
+	constexpr uint64_t PAGE_SIZE = 0x4000;
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	if (size > PAGE_SIZE && VirtualMemory::AllocFixed(start, size, mode)) {
+		return true;
+	}
+#endif
+
+	for (uint64_t addr = start; addr < start + size; addr += PAGE_SIZE) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(addr), &info, sizeof(info)) != 0) {
+			if (info.State == MEM_COMMIT) {
+				if (!VirtualMemory::Protect(addr, PAGE_SIZE, mode)) {
+					return false;
+				}
+				continue;
+			}
+			if (info.State == MEM_RESERVE) {
+				if (!VirtualMemory::Commit(addr, PAGE_SIZE, mode)) {
+					return false;
+				}
+				continue;
+			}
+		}
+#endif
+		if (VirtualMemory::AllocFixed(addr, PAGE_SIZE, mode) ||
+		    VirtualMemory::Commit(addr, PAGE_SIZE, mode) ||
+		    VirtualMemory::Protect(addr, PAGE_SIZE, mode)) {
+			continue;
+		}
+		return false;
+	}
+
+	return true;
+}
+
+bool KernelCommitReservedOnFault(uint64_t vaddr) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	constexpr uint64_t COMMIT_GRANULARITY = 0x10000;
+	constexpr int      CPU_RW_PROTECTION  = 0x3;
+	auto               block              = vaddr & ~(COMMIT_GRANULARITY - 1u);
+
+	if (g_guest_address_space == nullptr || g_virtual_ranges == nullptr ||
+	    g_flexible_memory == nullptr) {
+		return false;
+	}
+
+	VirtualRanges::Range reserved {};
+	if (g_virtual_ranges->Query(vaddr, 0, &reserved) &&
+	    IsReservedRangeType(reserved.type)) {
+		const auto range_end = reserved.start + reserved.size;
+		block                = std::max(block, reserved.start);
+		const auto block_end = std::min(block + COMMIT_GRANULARITY, range_end);
+		const auto size      = block_end - block;
+
+		if (size == 0 ||
+		    !g_virtual_ranges->ConsumeReservedSpan(block, size, nullptr, reserved.type)) {
+			return false;
+		}
+
+		if (!g_flexible_memory->Map(block, size, CPU_RW_PROTECTION,
+		                            VirtualMemory::Mode::ReadWrite, GpuAccessMode::NoAccess,
+		                            reserved.name)) {
+			EXIT_IF(!g_virtual_ranges->Add(block, size, 0, 0, 0, reserved.type, reserved.name));
+			return false;
+		}
+		if (!g_virtual_ranges->Add(block, size, 0, CPU_RW_PROTECTION, 0,
+		                           VirtualRangeType::Flexible, reserved.name, true)) {
+			GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
+			EXIT_IF(!g_flexible_memory->Unmap(block, size, &rollback_gpu_mode));
+			EXIT_IF(!g_virtual_ranges->Add(block, size, 0, 0, 0, reserved.type, reserved.name));
+			return false;
+		}
+
+		MapGpuRange(block, size);
+		if (g_alloc_callback != nullptr) {
+			g_alloc_callback(block, size);
+		}
+		return true;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Some large GPU-aperture reservations predate the virtual-range table. If Windows confirms
+	// that the faulting block is reserved but uncommitted, commit it directly and resume.
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(block), &info, sizeof(info)) != 0 &&
+	    info.State == MEM_RESERVE &&
+	    (g_guest_address_space->Commit(block, COMMIT_GRANULARITY,
+	                                    VirtualMemory::Mode::ReadWrite) ||
+	     CommitFixedHostRange(block, COMMIT_GRANULARITY, VirtualMemory::Mode::ReadWrite))) {
+		return true;
+	}
+#endif
+
+	return false;
+}
+
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {
 	PRINT_NAME();
