@@ -421,6 +421,57 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 	       db.shader_execute_on_noop;
 }
 
+// A UE "WriteToSlice" volume render: a passthrough geometry shader that fans a fullscreen primitive
+// to every slice of a 3D/layered color target via SV_RenderTargetArrayIndex. This is how the
+// colour-grading LUT and the volumetric-fog volumes are produced, and dropping it is what leaves
+// GTA III sampling a neutral LUT (docs/gta3-black-world-diagnosis.md, Part 9).
+//
+// The emulator has no geometry-shader stage, but this pattern needs none: the GS is a strict 1:1
+// passthrough, so ES+GS together are just an instanced vertex shader that writes gl_Layer.
+//
+// Classification only for now - the draw is still skipped. Letting it through before the ES/GS
+// lowering exists would run a vertex shader that exports no position, because this ES only writes
+// its outputs to the ESGS ring in LDS and the GS owns every export.
+struct WriteToSliceInfo {
+	bool     matched     = false;
+	uint32_t slice_count = 0;
+	uint32_t rt_slot     = 0;
+};
+
+static WriteToSliceInfo ClassifyWriteToSliceGs(const RenderCommandBuffer& buffer) {
+	const auto& ctx         = buffer.GetRegisters();
+	const auto& sh_ctx      = buffer.GetShaders();
+	const auto& sh_regs     = ctx.GetShaderRegisters();
+	const auto& vertex_info = sh_ctx.GetVs();
+
+	// Must be a real ES+GS pipeline whose GS emits a single triangle - one triangle in, one out.
+	// Any amplification beyond fanning to slices is outside this pattern.
+	if (!ShaderAddressValid(vertex_info.es_regs.data_addr) ||
+	    !ShaderAddressValid(vertex_info.gs_regs.data_addr)) {
+		return {};
+	}
+	if (sh_regs.m_vgtGsMaxVertOut != 0x00000003 ||
+	    static_cast<Prospero::GsOutputPrimitiveType>(sh_regs.m_vgtGsOutPrimType) !=
+	        Prospero::GsOutputPrimitiveType::kTriangles) {
+		return {};
+	}
+
+	// The bound colour target must be a volume or layered surface; its slice count is the fan-out.
+	const auto  rt_slot = render_target_first_bound_slot(buffer);
+	const auto& rt      = ctx.GetRenderTarget(rt_slot);
+	const bool  layered = rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
+	                     rt.view.base_array_slice_index != rt.view.last_array_slice_index;
+	if (!layered) {
+		return {};
+	}
+	const uint32_t slice_count = rt.attrib3.depth + 1u;
+	if (slice_count <= 1u) {
+		return {};
+	}
+
+	return {true, slice_count, rt_slot};
+}
+
 static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	const auto& ctx         = buffer.GetRegisters();
 	const auto& ucfg        = buffer.GetUserConfig();
@@ -461,14 +512,22 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
+			const auto  wts     = ClassifyWriteToSliceGs(buffer);
+			const auto  rt_slot = render_target_first_bound_slot(buffer);
+			const auto& rt      = ctx.GetRenderTarget(rt_slot);
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32
 			     " prim_group=0x%04" PRIx16 " vert_group=0x%04" PRIx16 " ngg=0x%08" PRIx32
 			     " max_out=0x%08" PRIx32 " gs_max_vert=0x%08" PRIx32 " gs_out_prim=0x%08" PRIx32
-			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 "\n",
+			     " es=0x%016" PRIx64 " gs=0x%016" PRIx64 " RT_addr=0x%010" PRIx64 " RT=%ux%u"
+			     " dim=%u depth=%u slices=[%u..%u] fmt=0x%08" PRIx32
+			     " writetoslice=%d slice_count=%u\n",
 			     stages, ge_cntl.primitive_group_size, ge_cntl.vertex_group_size,
 			     sh_regs.m_geNggSubgrpCntl, sh_regs.m_geMaxOutputPerSubgroup,
 			     sh_regs.m_vgtGsMaxVertOut, sh_regs.m_vgtGsOutPrimType,
-			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
+			     vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr, rt.base.addr,
+			     rt.attrib2.width + 1, rt.attrib2.height + 1, rt.attrib3.dimension,
+			     rt.attrib3.depth, rt.view.base_array_slice_index, rt.view.last_array_slice_index,
+			     rt.info.format, wts.matched ? 1 : 0, wts.slice_count);
 		}
 		// These shaders are never compiled, so nothing else dumps them. Write the raw guest words out
 		// once so the pair blocking the colour-grading LUT can be disassembled offline.
