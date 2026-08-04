@@ -709,6 +709,44 @@ the fix for the darkness.**
 Flashing remains unexplained. It may be easier to judge once the image is correctly exposed, since at
 a mean of 4.7/255 almost anything reads as popping in and out.
 
+### Scoping the fix: finishing WriteToSlice
+
+The `graphics-gs-writetoslice-volume` branch already has the right idea. Rather than implementing
+general geometry shaders, it renders the WriteToSlice pattern as **layered instanced draws**, emitting
+`gl_Layer = gl_InstanceIndex` from the vertex shader — the guest already issues one instance per slice.
+By `1943e1d` that worked: the 48³ volumetric fog volumes became GPU-written. Only the 32³ grading LUT
+was left, and that is the one this title needs.
+
+Three things stand between here and that fix.
+
+**1. The branch has to be ported by hand.** The change is compact — about 133 lines across 10 files
+(`renderDraw.cpp`, `colorRenderTarget.cpp`, the SPIR-V emitter, `shader.{h,cpp}`, `ShaderIR.h`) — but
+the branches diverged long ago: 49 commits on the branch and 130 on this one since merge-base
+`8fe4765`, and the recompiler moved (`recompiler/ShaderIR.h` is now `recompiler/ir/ShaderIR.h`). A
+cherry-pick will conflict throughout, so the changes need re-applying against the current structure.
+
+**2. The TTMP gap is the real blocker.** The LUT's ES vertex shader reads TTMP (trap-temporary) scalars,
+which the hardware fills at wave launch. The branch decodes them symbolically but rejects them when
+lowering to IR — *"TTMP scalar is launch-supplied state the recompiler does not model"*
+(`shaderIR/ShaderIR.cpp:145`). This branch has no TTMP handling at all. Until those values can be
+modelled or supplied, that shader cannot be compiled, so the LUT cannot be produced by any amount of
+layered-rendering work.
+
+**3. The shader's ISA is not currently obtainable**, which is what the TTMP work needs to be scoped at
+all:
+
+- `ShouldSkipGeShader` returns at `renderDraw.cpp:1152`, *before* any shader compilation, so the
+  skipped ES/GS pair is never decoded.
+- The guest-ISA dumper `DumpShaderRecompilerOriginal` (`shader.cpp:1372`) is dead code: its config gate
+  is commented out and it opens with an unconditional `return`. That is why `_Shaders/` holds a single
+  stale `.rdna2` from an earlier session.
+
+So the immediate next step is small and well defined: **decode and dump the ES and GS shaders at the
+skip point** — the draw already logs `es=` and `gs=` guest addresses — and read what the ES shader does
+with TTMP. That determines whether the values can be supplied cheaply (a constant or a system value the
+layered path already knows) or whether this needs real launch-state modelling, which would be a much
+larger job.
+
 ### Tooling note
 
 The RenderDoc MCP server is not required. `C:\Program Files\RenderDoc` ships a Python module
