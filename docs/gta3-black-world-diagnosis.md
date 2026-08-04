@@ -253,6 +253,41 @@ judged. Two things to check on a daylight frame before calling this finished:
 - **A hard-edged blue rectangle in the upper sky** in the verified screenshot. Straight-edged sky
   patches are not a natural cloud/skybox result and may indicate a separate broken draw.
 
+## What the guest binary can and cannot tell us (Ghidra)
+
+`eboot.bin` loaded and analysed in Ghidra: ELF, x86-64, image base 0, 88,292 functions, 236,993
+symbols, 121 MB of memory. `ue4commandline.txt` is
+`../../../Gameface/Gameface.uproject GTA3World`, so the UE4 project is `Gameface`.
+
+Useful confirmations:
+
+- Unreal's separate-translucency path is present — strings `SeparateTranslucency`,
+  `SeparateTranslucencyColor`, `SeparateTranslucencyModulateColor`, and the GBuffer visualisation
+  list containing `SeparateTranslucencyRGB` / `SeparateTranslucencyA`.
+- The full `PostProcessSettings.AutoExposure*` and `r.DefaultFeature.AutoExposure.*` cvar set exists,
+  including `ExtendDefaultLuminanceRange`.
+
+Limitations found the hard way:
+
+- **The build is stripped of UE4 symbols.** `search_functions("Translucen")` returns nothing; the
+  symbols are auto-generated `FUN_*` labels plus imports/exports. Locating specific render code means
+  string-xref archaeology across 88k functions.
+- The three xrefs to the `"SeparateTranslucency"` string land in `FUN_038bed50`, which decompiles to
+  227 KB and turns out to be Unreal's **show-flag dumper** (`"%s=%d"` over flag names), not the render
+  target allocation. It does not carry the clear colour.
+- **The engine config is not on disk.** Only `crashreportclient.ini` and a manifest are loose;
+  everything else lives in `gameface/content/paks/pakchunk0-ps5.pak` (4.86 GB, single chunk). Reading
+  the title's auto-exposure settings would need a UE4 pak extractor, and a shipping PS5 pak is likely
+  AES-encrypted.
+
+Conclusion on tooling: for a *rendering* defect, RenderDoc plus emulator-side instrumentation is
+strictly more informative than the guest binary, because it shows what the GPU was actually told to
+do — which is the ground truth Kyty has to reproduce. Every load-bearing fact in this document came
+from that route. Ghidra is the right instrument for guest **CPU** questions instead, for example the
+still-open read from `0xfffffffffffffff8` at guest instruction `0x0000000900643fa0` noted in
+`gta3-runtime-fixes.md`; with Kyty's module base at `0x900000000` that is file offset `0x643fa0`,
+which is directly decompilable.
+
 ## Notes for whoever picks this up
 
 - The world being dim (`92766` mean ≈ 0.004) is expected: the in-game clock reads 05:13 and Unreal's
