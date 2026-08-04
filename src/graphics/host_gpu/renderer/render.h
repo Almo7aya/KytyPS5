@@ -117,8 +117,17 @@ public:
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] bool              IsExecute() const { return m_execute; }
 
+	// Emulates the hardware Z-pass counter that PixelPipeStatDump samples. The guest brackets a
+	// single occlusion-test draw with two dumps and takes the difference, so a begin dump records 0
+	// and the matching end dump records the query result. Returns false when the sample cannot be
+	// serviced -- outside a render pass, or with the pool exhausted -- so the caller can fall back
+	// to reporting the primitive visible rather than silently culling it.
+	[[nodiscard]] bool SampleZPassCounter(void* dst_gpu_addr);
+
 private:
 	void Release();
+	void ResolveZPassCounters();
+	void ResetZPassCounters();
 	void FinalizeFence(bool reset_recording);
 	void ReleaseResourcesAfterFence();
 	void DeleteBuffersAfterFence();
@@ -143,6 +152,20 @@ private:
 	std::vector<VulkanDescriptorSet*>          m_descriptor_sets_after_fence;
 	mutable RenderState                        m_render_state;
 	mutable bool                               m_rendering = false;
+
+	// Occlusion query emulation. One slot per guest query; a pending entry with slot < 0 is the
+	// begin dump of a pair and resolves to zero.
+	static constexpr uint32_t OcclusionQuerySlots = 2048;
+
+	struct PendingZPass {
+		void*   address = nullptr;
+		int32_t slot    = -1;
+	};
+
+	vk::QueryPool             m_occlusion_pool      = nullptr;
+	uint32_t                  m_occlusion_next_slot = 0;
+	mutable int32_t           m_occlusion_open_slot = -1;
+	std::vector<PendingZPass> m_pending_z_pass;
 };
 
 class RenderCommandBuffer final: public CommandBuffer {

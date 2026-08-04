@@ -1548,13 +1548,20 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index, v
 		// treats camera-containing primitives as unconditionally visible and occlusion-tests
 		// everything else.
 		//
-		// Kyty has no Z-pass counter yet, so report a monotonically increasing value. Every
-		// end-minus-begin difference is then positive and every primitive is reported visible.
-		// This does not emulate occlusion culling, it disables it -- more geometry is drawn than the
-		// title intended -- but it can never cull something that is actually on screen. A monotonic
-		// counter stays correct no matter how the query pairs interleave or nest.
+		// A real Vulkan occlusion query is used where the sample can be serviced: the guest brackets
+		// a single occlusion-test draw, so the pair maps onto beginQuery/draw/endQuery and the
+		// results are published once the fence is signalled.
+		//
+		// Where it cannot be -- outside a render pass instance, or with the query pool exhausted --
+		// fall back to a monotonically increasing value. Every end-minus-begin difference is then
+		// positive, so the primitive is reported visible. That loses culling for those samples, but
+		// it can never cull something that is actually on screen, which is the failure that hid
+		// characters and vehicles until the camera entered their bounds.
 		case 0x00000039:
 			if (dst_gpu_addr != nullptr) {
+				if (GetScheduler().Active() && CurrentBuffer().SampleZPassCounter(dst_gpu_addr)) {
+					break;
+				}
 				const uint64_t z_pass_count =
 				    m_z_pass_counter.fetch_add(1, std::memory_order_relaxed) + 1;
 				std::memcpy(dst_gpu_addr, &z_pass_count, sizeof(z_pass_count));

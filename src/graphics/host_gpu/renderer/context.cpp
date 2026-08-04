@@ -72,6 +72,10 @@ void CommandBuffer::Release() {
 	m_slot->busy = false;
 	m_slot->Reset();
 	ReleaseResourcesAfterFence();
+	if (m_occlusion_pool != nullptr) {
+		m_graphics.device.destroyQueryPool(m_occlusion_pool, nullptr);
+		m_occlusion_pool = nullptr;
+	}
 	m_slot = nullptr;
 
 	EXIT_NOT_IMPLEMENTED(!IsInvalid());
@@ -102,6 +106,89 @@ void CommandBuffer::RecycleDescriptorsAfterFence() {
 	m_descriptor_sets_after_fence.clear();
 }
 
+bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
+	if (dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
+		return false;
+	}
+	// A Vulkan occlusion query has to begin and end inside the same render pass instance. The guest
+	// brackets one occlusion-test draw, so in practice both dumps land inside one instance; anything
+	// else is refused here and reported visible instead of guessed at.
+	if (!m_rendering) {
+		return false;
+	}
+
+	if (m_occlusion_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.sType      = vk::StructureType::eQueryPoolCreateInfo;
+		info.queryType  = vk::QueryType::eOcclusion;
+		info.queryCount = OcclusionQuerySlots;
+		if (m_graphics.device.createQueryPool(&info, nullptr, &m_occlusion_pool) !=
+		        vk::Result::eSuccess ||
+		    m_occlusion_pool == nullptr) {
+			m_occlusion_pool = nullptr;
+			return false;
+		}
+		Handle().resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);
+	}
+
+	if (m_occlusion_open_slot >= 0) {
+		// End dump: close the query that brackets the draw and record its slot.
+		Handle().endQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot));
+		m_pending_z_pass.push_back({dst_gpu_addr, m_occlusion_open_slot});
+		m_occlusion_open_slot = -1;
+		return true;
+	}
+
+	if (m_occlusion_next_slot >= OcclusionQuerySlots) {
+		return false;
+	}
+
+	// Begin dump: the guest reads this as the counter value before the draw, so it resolves to zero
+	// and the difference against the end dump is the visible-pixel count.
+	m_pending_z_pass.push_back({dst_gpu_addr, -1});
+	m_occlusion_open_slot = static_cast<int32_t>(m_occlusion_next_slot++);
+	Handle().beginQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot),
+	                    vk::QueryControlFlags {});
+	return true;
+}
+
+void CommandBuffer::ResolveZPassCounters() {
+	if (m_pending_z_pass.empty()) {
+		ResetZPassCounters();
+		return;
+	}
+
+	std::vector<uint64_t> results(m_occlusion_next_slot, 0);
+	if (m_occlusion_pool != nullptr && m_occlusion_next_slot != 0) {
+		// The fence has already been waited on, so the results are available and this does not stall.
+		const auto status = m_graphics.device.getQueryPoolResults(
+		    m_occlusion_pool, 0, m_occlusion_next_slot, results.size() * sizeof(uint64_t),
+		    results.data(), sizeof(uint64_t),
+		    vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		if (status != vk::Result::eSuccess) {
+			// Report visible rather than culling on a readback failure.
+			std::fill(results.begin(), results.end(), uint64_t {1});
+		}
+	}
+
+	for (const auto& pending: m_pending_z_pass) {
+		uint64_t value = 0;
+		if (pending.slot >= 0 && static_cast<size_t>(pending.slot) < results.size()) {
+			value = results[static_cast<size_t>(pending.slot)];
+		}
+		std::memcpy(pending.address, &value, sizeof(value));
+	}
+	ResetZPassCounters();
+}
+
+void CommandBuffer::ResetZPassCounters() {
+	m_pending_z_pass.clear();
+	m_occlusion_open_slot = -1;
+	if (m_occlusion_next_slot != 0 && m_occlusion_pool != nullptr && !IsInvalid()) {
+		m_occlusion_next_slot = 0;
+	}
+}
+
 void CommandBuffer::Begin() const {
 	EXIT_IF(m_rendering);
 	auto buffer = Handle();
@@ -115,6 +202,13 @@ void CommandBuffer::Begin() const {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	// Slot numbering restarts with each recording, so the pool has to be reset before reuse. This
+	// must happen outside a render pass instance, which Begin always is.
+	if (m_occlusion_pool != nullptr) {
+		buffer.resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);
+	}
+	m_occlusion_open_slot = -1;
 }
 
 void CommandBuffer::End() const {
@@ -245,6 +339,8 @@ void CommandBuffer::FinalizeFence(bool reset_recording) {
 }
 
 void CommandBuffer::ReleaseResourcesAfterFence() {
+	// Publish occlusion results before anything else: the guest polls these addresses.
+	ResolveZPassCounters();
 	RecycleDescriptorsAfterFence();
 	m_fence_resources.ReleaseAfterFence();
 }
@@ -311,6 +407,13 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
+	}
+	if (m_occlusion_open_slot >= 0) {
+		// A query must not outlive its render pass instance. This should not happen -- the guest
+		// brackets a single draw -- but closing it here keeps the command stream valid, and the
+		// pending begin entry simply resolves to zero alongside an unwritten result.
+		Handle().endQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot));
+		m_occlusion_open_slot = -1;
 	}
 	Handle().endRendering();
 	m_rendering    = false;
