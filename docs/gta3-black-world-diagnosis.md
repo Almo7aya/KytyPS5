@@ -241,29 +241,92 @@ that mattered were: the decoded clear value per colour target in `ResolveRenderC
 actually applied where `attachment.is_clear` is set in `AcquireRenderTargets`, and the address plus
 filled value at each `TextureCache::ClearMeta` hit.
 
-## Still open
+## Part 2 — the revert is not sufficient (daylight frame 9321)
 
-### Brightness — probably not a defect
+**Correction.** An earlier revision of this document argued the leftover darkness was probably not a
+defect, reasoning from the night frame that auto-exposure looked healthy. That was wrong. A daylight
+capture (`_RenderDoc/kyty_frame9321.rdc`, in-game 09:01) shows an unmistakable second defect: a black
+sky above a flat blown-out grey ground, split by a hard horizontal seam, with heavy blocky dithering.
 
-The verified frame was at in-game 04:11 (night). The evidence available says auto-exposure is
-*working*, and the darkness is expected rather than a bug:
+### It is the same failure, still
 
-- The eye-adaptation buffer (resource 4451, 1×1 `R32G32B32A32_FLOAT`) reads **1.2656**. That is a
-  non-trivial converged value — a broken or unwired adaptation pass would sit at exactly 1.0 or 0.
-- Unreal's default auto-exposure clamp is `AutoExposureMinBrightness = 0.03`,
-  `AutoExposureMaxBrightness = 2.0`. 1.2656 sits comfortably inside that range, so exposure is not
-  saturated against a limit.
-- With max exposure capped at 2.0, a scene whose average luminance is ≈ 0.004 *cannot* be brought up
-  to mid-grey. A 4 AM scene therefore renders close to black by design, with only street lights,
-  vehicle lights and the sky above the noise floor — which is exactly what the verified screenshot
-  shows.
+Pass structure in frame 9321 (783 shadow draws now that it is daytime):
 
-A daylight frame would confirm this in one step, but this is no longer the leading suspect.
+| Pass | Events | Target | Role |
+| --- | --- | --- | --- |
+| 0 | 21–10370 | depth only | shadow maps, 783 draws |
+| 1 | 10801–11463 | 32099 + G-buffers | base pass, 38 draws |
+| 3 | 11540–11663 | 32099 | lighting, 6 draws |
+| 7 | 12237–12410 | 32099 | translucency, 7 draws |
+| 8 | 12481–12553 | **3419** | **separate translucency**, 4 draws |
+| 9 | 12578–12622 | 3530 | **separate-translucency composite**, 2 draws |
+| 17 | 12878 | 3722 | tonemap |
+| 18 | 12930–13126 | 3808 | HUD |
 
-### The sky rectangle — the real loose end
+Measurements:
 
-A hard-edged blue rectangle in the upper sky in the verified screenshot. Straight-edged sky patches
-are not a natural cloud/skybox result and may indicate a separate broken draw.
+- Scene colour `32099` after lighting is **healthy**: mean `(0.040, 0.070, 0.107)`, max b `0.3125` —
+  a plausible daylight HDR scene, blue-dominant. The world is intact right up to the composite, exactly
+  as in the night case.
+- Separate translucency `3419` has **alpha = 0 everywhere**, with RGB ≈ `(0.0023, 0.0023, 0.0022)` in
+  the sky region (y = 300) and RGB ≈ `(0.206, 0.217, 0.228)` in the ground region (y = 1400).
+
+Feed that through the composite `out = SceneColor * A + C` with `A = 0`:
+
+- sky → `0.0023` ⇒ black upper half
+- ground → `0.21` ⇒ flat grey lower half
+
+So the final image is *nothing but* the separate-translucency RGB, and the horizontal seam is simply
+the silhouette of whatever was drawn into that buffer. The world is still being multiplied out.
+
+### The content is stale, not blended down
+
+`pixel_history` on `3419` at (1600, 1400) reports exactly **one** modification in the whole frame —
+event 12553, which *failed* the depth test. Its `pre_value` is already
+`(0.206, 0.217, 0.228, a = 0.0)`. So that content was present at **attachment load**, before any draw
+in the pass. It is leftover from an earlier frame, not the result of alpha blending.
+
+### Conclusion: the clear is genuinely required
+
+Both behaviours tried so far are wrong:
+
+- `b38962b` cleared the attachment to the unprogrammed `CB_COLOR#_CLEAR_WORD` value `(0,0,0,0)`
+  ⇒ alpha 0 ⇒ world black.
+- The revert loads the attachment ⇒ stale content, alpha still 0 ⇒ world replaced by flat grey.
+
+Unreal needs this attachment to start at `(0,0,0,1)`. The revert remains the better of the two (it at
+least renders a plausible night scene, and it removes a clear that fires on unvalidated metadata
+writes), but it is not the fix. The missing piece is unchanged and now sharply defined: **where does
+the guest's `(0,0,0,1)` clear value go?**
+
+### Ruled out in this frame
+
+- **A raw compute fill of the surface.** Dispatch 12437 sits immediately before the separate-translucency
+  pass and *is* a single-dword buffer fill (it reads one dword from `buffers[0]` and splats it across
+  `buffers[1]`), which looked like a perfect candidate. But its target buffer `32118` is smaller than
+  8 MB, while the surface is 3360×1892×8 ≈ 50 MB. Wrong target.
+
+### A real latent gap found while checking that
+
+`BufferCache::ObtainBuffer` only propagates GPU writes into an aliasing host image for **formatted**
+buffers (`bufferCache.cpp:555`):
+
+```cpp
+if (is_formatted && is_written) {
+    (void)m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, true);
+}
+```
+
+`descriptors.cpp:115` passes `resource.formatted` straight through, so a **raw** storage-buffer write
+that aliases a render target leaves the host image stale. The guard is deliberate — 
+`InvalidateMemoryFromGPU` with `formatted_buffer_write = false` deliberately `EXIT`s on
+"buffer write aliases GPU-modified image" (`textureCache.cpp:1889-1894`) — so widening it naively would
+turn a silent staleness bug into a crash. A probe now reports raw writes that overlap an image, without
+changing behaviour, to establish whether this path is actually taken.
+
+### The sky rectangle
+
+Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
 `Gameface/Content/Common/ProceduralSky/BP_GTA_ProceduralSky` is the natural first suspect.
 
 ### Why the config route was abandoned
