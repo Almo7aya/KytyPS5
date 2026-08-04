@@ -606,7 +606,44 @@ This also fits the secondary symptoms: intermittent appearance and flashing foll
 uninitialised memory changing under the query addresses, and frame 1605 simply captured a moment when
 the character was culled.
 
-### Two ways to fix
+### Implemented
+
+Both fixes landed, in sequence:
+
+- `f98bc33` — parse the destination and write a monotonically increasing counter, so every
+  `end - begin` is positive and every primitive reports visible. Characters and vehicles appeared
+  immediately, but with occlusion culling effectively disabled the frame rate fell from ~28 to 8 fps.
+  Note the ~28 fps baseline was *not* healthy: it was fast because nearly everything was being culled,
+  including the player and all traffic.
+- `06927c6` — real `VK_QUERY_TYPE_OCCLUSION` queries, with the counter retained as a fallback.
+- `760db0f` — corrects `06927c6`. It began the query at the dump and refused the sample when no render
+  pass was open, but Kyty opens the render pass **lazily in the draw path**
+  (`renderDraw.cpp` `BeginRendering`), so no instance exists when the begin dump arrives and *every*
+  sample was refused. The always-visible fallback ran unchanged. Split across the three points where
+  the information exists: the begin dump arms the query, the draw path brackets it with
+  `beginQuery`/`endQuery`, and the end dump binds the completed slot.
+
+### Measured effectiveness
+
+Instrumented run, final sample:
+
+```
+serviced=49152  fallback=13306  occluded=6805  visible=11006
+```
+
+- **38% of resolved queries report occluded** (6805 / 17811), so culling genuinely works.
+- **21% of samples fall back** (13306 / 62458) to always-visible. Those are conservative — they add
+  some over-draw but never cull wrongly. The fallback fires when no draw was bracketed between the two
+  dumps, so reducing it means understanding why some armed queries see no draw.
+- `serviced` counts both begin and end dumps, so completed queries are roughly half that figure.
+- No Vulkan validation output, i.e. no query-scoping violations.
+
+The conclusion for performance work: over-draw from broken occlusion is **no longer** the dominant
+cost. Further effort there has limited headroom; the remaining gap is general emulator cost.
+
+The effectiveness probe in `context.cpp` is temporary and should be removed once this is settled.
+
+### The two options, as originally scoped
 
 1. **Conservative (small).** Parse the destination from `buffer[1]`/`buffer[2]` and write a
    **monotonically increasing 64-bit counter** on each `PIXEL_PIPE_STAT_DUMP`. Every `end - begin`
