@@ -313,7 +313,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (owner->info.HasMetadata()) {
+	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
 	UnregisterImage(id);
@@ -1443,10 +1443,6 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	RefreshImage(id, desc);
-	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
-		image.info.metadata = desc.info.metadata;
-		m_surface_metas.try_emplace(desc.info.metadata.range.address, MetaDataInfo {});
-	}
 	CommitGpuWrite(image);
 	image.usage.render_target = true;
 	TrackImageDownloadLocked(id, image);
