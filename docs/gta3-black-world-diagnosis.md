@@ -860,8 +860,69 @@ So no new render-target work is expected. The remaining gap is the shader loweri
 3. Route `POS1.z` to SPIR-V `gl_Layer` (`BuiltIn Layer`), which needs the `ShaderViewportIndexLayerEXT`
    capability or Vulkan 1.2 `shaderOutputLayer`.
 
-Steps 1 and 3 are small. Step 2 is the real work, and the ~133-line hand-port described in Part 8
-(obstacle 1) still stands — that estimate is unaffected by these findings.
+Steps 1 and 3 are small. Step 2 is the real work — and it is bigger than Part 8 assumed, for the
+reason in the next section.
+
+### Correction: the old branch's approach cannot work for this shader
+
+This invalidates part of the Part 8 plan, so it is recorded explicitly rather than quietly dropped.
+
+`graphics-gs-writetoslice-volume` fixes the problem by **compiling the ES as the vertex shader and
+adding `gl_Layer = gl_InstanceIndex`** (`c478722`, `1943e1d`). The current tree already compiles the ES
+as the VS — `shader.cpp`, `ShaderCompileSpirvVS`:
+
+	const uint64_t shader_addr = regs.es_regs.data_addr;
+
+That is correct for **NGG passthrough** draws (`stages == 0x02002000`), where there is no real GS and
+the ES performs its own exports. It does not hold here:
+
+- **This ES exports nothing.** It contains no `exp` instruction and no `s_endpgm`; it ends at `0x194`
+  with `s_setpc_b64 s6`, a subroutine return. All it does is write 7 dwords per vertex to LDS.
+- **The GS owns every export**, and reads its inputs back out of that same LDS ring — three vertices
+  at base `28*v2`, `28*v0`, `28*v3`, each reading offsets 0/4, 8/12, 16/20, 24. That is the exact
+  layout the ES writes.
+
+So compiling this ES as a VS and bolting `gl_Layer` on produces a vertex shader with **no position
+output**. It would emit valid SPIR-V and draw nothing. The branch's success on the 48³ fog volumes at
+`1943e1d` does not carry over — those must take the passthrough path, where the ES does export.
+
+A second, smaller discrepancy: the branch routes `gl_Layer = gl_InstanceIndex`, but this shader
+computes `LayerIndex = MinZ + InstanceID`. That is only equivalent when `MinZ == 0`, which is the
+common full-volume case but not guaranteed.
+
+The branch's *classification* work (`ClassifyWriteToSliceGs`) and its *SPIR-V layer plumbing* — the
+`BuiltInLayer` output, `CapabilityShaderViewportIndexLayerEXT`,
+`SPV_EXT_shader_viewport_index_layer`, and the entry-point interface wiring — are both sound and worth
+porting as-is. Only the "ES is already the whole vertex shader" assumption is wrong.
+
+### The design that does work: retarget the ES's ring stores into exports
+
+Because the GS is a strict 1:1 passthrough — vertex *i* in, vertex *i* out, no cross-vertex math and no
+amplification — the ES+GS pair is semantically a plain vertex shader, and the LDS round-trip can be
+elided entirely rather than emulated:
+
+1. **Analyse the GS once** to build a map from ESGS ring byte offset to export slot and component, by
+   tracing each `ds_read` into the export operand it feeds. For this shader that map is:
+
+   | offset | export |
+   |---|---|
+   | 0, 4 | `POS0.x`, `POS0.y` |
+   | 8, 12 | `PARAM0.x`, `PARAM0.y` |
+   | 16, 20 | `POS0.z`, `POS0.w` |
+   | 24 | `POS1.z` → `gl_Layer` |
+
+   Note this is *not* the order a naive struct layout would predict — position is split across offsets
+   0–7 and 16–23 with the UV packed between. The map has to be derived, not assumed.
+
+2. **Rewrite the ES's ring `ds_write`s as those exports** and drop the GS. The ES needs no other
+   change; its stride is identified by `v_mul_u32_u24 v5, 28, v12`.
+
+3. Reject the pattern (and keep skipping) whenever the GS is not a strict passthrough, so this stays
+   safe for any other title that trips the same classifier.
+
+This is a genuine recompiler pass — a GS export-mapping analysis plus an ES store-retargeting
+transform — not the ~133-line port Part 8 estimated. The layer plumbing and classifier from the branch
+still drop in underneath it.
 
 ### Tooling note
 
