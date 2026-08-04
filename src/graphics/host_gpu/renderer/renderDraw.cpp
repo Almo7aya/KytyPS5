@@ -1091,7 +1091,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	// The guest arms an occlusion query with a PixelPipeStatDump immediately before its
+	// occlusion-test draw. The render pass only opens here, so the query has to be bracketed around
+	// the draw rather than at the dump itself.
+	const bool z_pass_query = buffer.BeginArmedZPassQuery();
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	if (z_pass_query) {
+		buffer.EndArmedZPassQuery();
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

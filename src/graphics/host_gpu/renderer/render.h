@@ -118,11 +118,17 @@ public:
 	[[nodiscard]] bool              IsExecute() const { return m_execute; }
 
 	// Emulates the hardware Z-pass counter that PixelPipeStatDump samples. The guest brackets a
-	// single occlusion-test draw with two dumps and takes the difference, so a begin dump records 0
-	// and the matching end dump records the query result. Returns false when the sample cannot be
-	// serviced -- outside a render pass, or with the pool exhausted -- so the caller can fall back
-	// to reporting the primitive visible rather than silently culling it.
+	// single occlusion-test draw with two dumps and takes the difference, so the begin dump records 0
+	// and the matching end dump records the query result.
+	//
+	// The dumps cannot drive the query directly: Kyty opens the render pass lazily at draw time, so
+	// no render pass instance exists yet when the begin dump arrives. The begin dump therefore only
+	// arms the query, the draw path brackets it, and the end dump collects the slot. Returns false
+	// when the sample cannot be serviced, so the caller reports the primitive visible rather than
+	// silently culling it.
 	[[nodiscard]] bool SampleZPassCounter(void* dst_gpu_addr);
+	[[nodiscard]] bool BeginArmedZPassQuery();
+	void               EndArmedZPassQuery();
 
 private:
 	void Release();
@@ -165,6 +171,8 @@ private:
 	vk::QueryPool             m_occlusion_pool      = nullptr;
 	uint32_t                  m_occlusion_next_slot = 0;
 	mutable int32_t           m_occlusion_open_slot = -1;
+	bool                      m_occlusion_armed     = false;
+	int32_t                   m_occlusion_last_slot = -1;
 	std::vector<PendingZPass> m_pending_z_pass;
 };
 

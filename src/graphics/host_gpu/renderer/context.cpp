@@ -16,7 +16,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 namespace Libs::Graphics {
@@ -106,17 +108,38 @@ void CommandBuffer::RecycleDescriptorsAfterFence() {
 	m_descriptor_sets_after_fence.clear();
 }
 
+// TEMPORARY PROBE: occlusion-query effectiveness. Distinguishes "samples fall back to always-visible"
+// from "queries run but nothing is occluded" from "over-draw is not where the cost is".
+namespace {
+std::atomic<uint64_t> g_zpass_serviced {0};
+std::atomic<uint64_t> g_zpass_fallback {0};
+std::atomic<uint64_t> g_zpass_occluded {0};
+std::atomic<uint64_t> g_zpass_visible {0};
+std::atomic<uint32_t> g_zpass_reports {0};
+
+void ProbeReportZPass() {
+	const auto serviced = g_zpass_serviced.load(std::memory_order_relaxed);
+	if (serviced == 0 || serviced % 4096 != 0) {
+		return;
+	}
+	if (g_zpass_reports.fetch_add(1, std::memory_order_relaxed) >= 16) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[gta3-probe] zpass serviced=%llu fallback=%llu occluded=%llu visible=%llu\n",
+	             static_cast<unsigned long long>(serviced),
+	             static_cast<unsigned long long>(g_zpass_fallback.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(g_zpass_occluded.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(g_zpass_visible.load(std::memory_order_relaxed)));
+	std::fflush(stderr);
+}
+} // namespace
+
 bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 	if (dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
+		g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
-	// A Vulkan occlusion query has to begin and end inside the same render pass instance. The guest
-	// brackets one occlusion-test draw, so in practice both dumps land inside one instance; anything
-	// else is refused here and reported visible instead of guessed at.
-	if (!m_rendering) {
-		return false;
-	}
-
 	if (m_occlusion_pool == nullptr) {
 		vk::QueryPoolCreateInfo info {};
 		info.sType      = vk::StructureType::eQueryPoolCreateInfo;
@@ -126,30 +149,64 @@ bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 		        vk::Result::eSuccess ||
 		    m_occlusion_pool == nullptr) {
 			m_occlusion_pool = nullptr;
+			g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
 			return false;
 		}
 		Handle().resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);
 	}
 
-	if (m_occlusion_open_slot >= 0) {
-		// End dump: close the query that brackets the draw and record its slot.
-		Handle().endQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot));
-		m_pending_z_pass.push_back({dst_gpu_addr, m_occlusion_open_slot});
-		m_occlusion_open_slot = -1;
+	if (m_occlusion_armed) {
+		// End dump: the draw path has already bracketed the query, so bind its slot to this address.
+		// If the draw never ran, m_occlusion_last_slot is -1 and the caller falls back.
+		const auto slot   = m_occlusion_last_slot;
+		m_occlusion_armed = false;
+		if (slot < 0) {
+			g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
+			ProbeReportZPass();
+			return false;
+		}
+		m_pending_z_pass.push_back({dst_gpu_addr, slot});
+		m_occlusion_last_slot = -1;
+		g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
+		ProbeReportZPass();
 		return true;
 	}
 
 	if (m_occlusion_next_slot >= OcclusionQuerySlots) {
+		g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
+		ProbeReportZPass();
 		return false;
 	}
 
 	// Begin dump: the guest reads this as the counter value before the draw, so it resolves to zero
-	// and the difference against the end dump is the visible-pixel count.
+	// and the difference against the end dump is the visible-pixel count. Only arm here; the render
+	// pass does not exist yet.
 	m_pending_z_pass.push_back({dst_gpu_addr, -1});
+	m_occlusion_armed     = true;
+	m_occlusion_last_slot = -1;
+	g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
+	ProbeReportZPass();
+	return true;
+}
+
+bool CommandBuffer::BeginArmedZPassQuery() {
+	if (!m_occlusion_armed || m_occlusion_pool == nullptr || !m_rendering || IsInvalid() ||
+	    m_occlusion_open_slot >= 0 || m_occlusion_next_slot >= OcclusionQuerySlots) {
+		return false;
+	}
 	m_occlusion_open_slot = static_cast<int32_t>(m_occlusion_next_slot++);
 	Handle().beginQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot),
 	                    vk::QueryControlFlags {});
 	return true;
+}
+
+void CommandBuffer::EndArmedZPassQuery() {
+	if (m_occlusion_open_slot < 0) {
+		return;
+	}
+	Handle().endQuery(m_occlusion_pool, static_cast<uint32_t>(m_occlusion_open_slot));
+	m_occlusion_last_slot = m_occlusion_open_slot;
+	m_occlusion_open_slot = -1;
 }
 
 void CommandBuffer::ResolveZPassCounters() {
@@ -175,6 +232,7 @@ void CommandBuffer::ResolveZPassCounters() {
 		uint64_t value = 0;
 		if (pending.slot >= 0 && static_cast<size_t>(pending.slot) < results.size()) {
 			value = results[static_cast<size_t>(pending.slot)];
+			(value == 0 ? g_zpass_occluded : g_zpass_visible).fetch_add(1, std::memory_order_relaxed);
 		}
 		std::memcpy(pending.address, &value, sizeof(value));
 	}
@@ -184,6 +242,8 @@ void CommandBuffer::ResolveZPassCounters() {
 void CommandBuffer::ResetZPassCounters() {
 	m_pending_z_pass.clear();
 	m_occlusion_open_slot = -1;
+	m_occlusion_armed     = false;
+	m_occlusion_last_slot = -1;
 	if (m_occlusion_next_slot != 0 && m_occlusion_pool != nullptr && !IsInvalid()) {
 		m_occlusion_next_slot = 0;
 	}
