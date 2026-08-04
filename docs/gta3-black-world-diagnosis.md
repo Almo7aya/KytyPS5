@@ -280,6 +280,24 @@ Limitations found the hard way:
   the title's auto-exposure settings would need a UE4 pak extractor, and a shipping PS5 pak is likely
   AES-encrypted.
 
+### Extracted pak contents
+
+A partial extraction of `pakchunk0-ps5.pak` exists at
+`gameface/content/paks/extracted` (9,840 files: 4,992 `.uexp`, 4,313 `.ubulk`, 30 `.umap`, 10 `.ini`).
+It does **not** settle the exposure question:
+
+- The only file in the whole extraction mentioning `AutoExposure` / `r.DefaultFeature` is
+  `Engine/Config/BaseEngine.ini`, and there it appears solely as Matinee property redirects — no
+  values.
+- The title's own `DefaultEngine.ini` is absent; `Gameface/Config` contains only `DefaultInput.ini`.
+- The 30 extracted `.umap`s are geometry sublevels (`comN*`, `indust*`, `land*`). Spot-checking
+  `industNE.umap` finds `Volume` and `StaticMesh` in the name table but no `PostProcess`, `Exposure`
+  or `Fog`, so the persistent map and its post-process volumes are not in the extracted set.
+
+Two assets are worth remembering: `BP_GTA_ProceduralSky.uexp` (references `SkyLight`) and `BET.uexp`
+(references `PostProcess`). `BP_GTA_ProceduralSky` is the natural first suspect for the hard-edged
+sky rectangle, though reading blueprint logic would need a real UE4 asset parser.
+
 Conclusion on tooling: for a *rendering* defect, RenderDoc plus emulator-side instrumentation is
 strictly more informative than the guest binary, because it shows what the GPU was actually told to
 do — which is the ground truth Kyty has to reproduce. Every load-bearing fact in this document came
