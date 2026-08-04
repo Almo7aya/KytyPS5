@@ -72,7 +72,9 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t clear_code = 0,
+	                             bool clear_code_valid = false);
+	[[nodiscard]] bool MetaClearCode(uint64_t address, uint32_t& clear_code);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -91,6 +93,11 @@ private:
 
 	struct MetaDataInfo {
 		uint32_t clear_mask = 0;
+		// Byte-replicated DCC clear code recorded by the guest metadata fill that marked this
+		// surface cleared. GFX9/GFX10 constant-encoded codes carry the clear colour themselves, so
+		// this is what decides the attachment clear value -- not CB_COLOR#_CLEAR_WORD.
+		uint32_t clear_code       = 0;
+		bool     clear_code_valid = false;
 	};
 
 	struct OverlapResult {

@@ -517,6 +517,38 @@ IsSupportedDisplayRenderTargetTileMode(uint32_t tile_mode) noexcept {
 	return true;
 }
 
+// GFX9/GFX10 DCC clear codes are byte-replicated across the metadata surface. The constant-encoded
+// codes carry the clear colour themselves and the hardware does not consult CB_COLOR#_CLEAR_WORD
+// for them, which is why a title can fast-clear to (0,0,0,1) while leaving those registers at zero.
+constexpr uint32_t DCC_CLEAR_CODE_0000     = 0x00u;
+constexpr uint32_t DCC_CLEAR_CODE_0001     = 0x40u;
+constexpr uint32_t DCC_CLEAR_CODE_1110     = 0x80u;
+constexpr uint32_t DCC_CLEAR_CODE_1111     = 0xc0u;
+constexpr uint32_t DCC_CLEAR_CODE_REGISTER = 0x20u;
+constexpr uint32_t DCC_CODE_UNCOMPRESSED   = 0xffu;
+
+// Decodes a constant-encoded DCC clear code into a colour. Returns false for codes that are not a
+// constant clear, including DCC_CLEAR_CODE_REGISTER (the caller must then use the clear registers)
+// and DCC_CODE_UNCOMPRESSED (a decompressed surface, which must not become an attachment clear).
+[[nodiscard]] inline bool DecodeDccConstantClear(uint32_t code, vk::ClearColorValue& clear) {
+	vk::ClearColorValue next {};
+	const auto          set = [&next](float r, float g, float b, float a) {
+		next.float32[0] = r;
+		next.float32[1] = g;
+		next.float32[2] = b;
+		next.float32[3] = a;
+	};
+	switch (code & 0xffu) {
+		case DCC_CLEAR_CODE_0000: set(0.0f, 0.0f, 0.0f, 0.0f); break;
+		case DCC_CLEAR_CODE_0001: set(0.0f, 0.0f, 0.0f, 1.0f); break;
+		case DCC_CLEAR_CODE_1110: set(1.0f, 1.0f, 1.0f, 0.0f); break;
+		case DCC_CLEAR_CODE_1111: set(1.0f, 1.0f, 1.0f, 1.0f); break;
+		default: return false;
+	}
+	clear = next;
+	return true;
+}
+
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {
 	const auto value = static_cast<uint8_t>(packed);
 	if (packed != static_cast<uint32_t>(value) * 0x01010101u) {

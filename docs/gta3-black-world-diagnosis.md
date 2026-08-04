@@ -515,21 +515,48 @@ Decode the DCC clear code and derive the colour from it, per the table above. Th
 safety concern recorded earlier in this document: only recognised *clear* codes become attachment
 clears, and `0xFF` (a DCC initialise/decompress) explicitly must not — which was invariant #1.
 
-One implementation question remains: **how Kyty obtains the code.** The fill is a compute dispatch that
-splats a dword read from another buffer (`buffers[0]`), and `TryConsumeComputeMetaClear`
-(`renderCompute.cpp:64-75`) currently *skips* that dispatch, so the value is never observed. Options:
+### Implemented (option 1 — read the fill source)
 
-1. **Read the fill source.** The shader computes its value as `buffers[0][(vsharp[8] >> 2) & 63]`, and
-   Kyty already decodes both descriptors plus `resources.user_data` in that function, so it can
-   `TryReadBacking` the source dword. Cheap and synchronous, but keyed to this shader shape — though
-   note `ResolveComputeImageClear` is already shape-specific in exactly this way.
-2. **Let the dispatch execute** and read the DCC byte from guest backing at render-target bind time.
-   More general, but the GPU write has to reach guest backing first, which costs a download per target
-   per frame and introduces a one-frame lag.
-3. **CP DMA path.** `BufferCache::FillBuffer` already receives the value directly, so titles that clear
-   metadata by DMA need no extra work — worth wiring up regardless of which option above is chosen.
+The fill is a compute dispatch that splats a dword sourced from a companion read-only buffer, and
+`TryConsumeComputeMetaClear` skips that dispatch, so the value had to be recovered another way. The
+key observation is that the recompiled shader reads `buffers[0][(vsharp[8] >> 2) & 63]`, and that index
+is *purely Kyty's own host alignment adjustment* (`descriptors.cpp:114-123`) applied on top of guest
+offset 0 — `descriptors.cpp:1020-1025` pushes `user_data` verbatim as the `vsharp` block. So the guest
+value simply lives at the read-only descriptor's base address, which makes this robust rather than
+shape-fragile.
 
-Option 1 is the cheapest correct route for this title; option 2 is the more general mechanism.
+The change:
+
+- `imageInfo.h` — the DCC code constants plus `DecodeDccConstantClear`, which maps a constant-encoded
+  code to a colour and **returns false for anything else**, including `DCC_CLEAR_CODE_REGISTER` and
+  `DCC_CODE_UNCOMPRESSED`.
+- `renderCompute.cpp` — when a metadata fill is consumed, read the source dword via `TryReadBacking`,
+  require it to be byte-replicated, and record it as the clear code.
+- `textureCache.{h,cpp}` — `MetaDataInfo` carries `clear_code` / `clear_code_valid`; `ClearMeta` takes
+  the code (defaulted, so the HTile callers and tests are unaffected); `MetaClearCode` reads it back.
+  `DeleteImage` now erases metadata for any kind, not just HTile, since colour entries exist too.
+- `colorRenderTarget.cpp` — register DCC metadata for colour targets, and decode
+  `CB_COLOR#_CLEAR_WORD0/1` into `color_clear_value` for the `DCC_CLEAR_CODE_REGISTER` case only.
+- `renderDraw.cpp` — at `AcquireRenderTargets`, a recorded code decides the clear: constant-encoded
+  codes supply the colour directly, `0x20` falls back to the clear registers, and anything else
+  (notably `0xff`) is **not** treated as a clear so the attachment keeps its contents.
+
+This satisfies all three invariants recorded earlier: the written value is inspected rather than
+assumed, the colour never comes from unprogrammed registers, and a decompress cannot masquerade as a
+clear.
+
+Remaining known risk, unchanged by this work: `m_surface_metas` is still keyed on the metadata address
+alone, and two full-res `R11G11B10` surfaces were observed sharing DCC address `0x2034eb0000`. A clear
+recorded for one can therefore be consumed by the other. Worth addressing separately by keying on the
+range rather than the base address.
+
+For reference, the other two routes considered:
+
+- **Let the dispatch execute** and read the DCC byte from guest backing at bind time. More general, but
+  the GPU write must reach guest backing first, costing a download per target per frame plus a
+  one-frame lag.
+- **CP DMA path.** `BufferCache::FillBuffer` already receives the value directly, so titles that clear
+  metadata by DMA would need the same code plumbed through there.
 
 ### The sky rectangle
 

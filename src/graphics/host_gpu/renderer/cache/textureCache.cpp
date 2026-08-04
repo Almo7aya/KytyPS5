@@ -313,7 +313,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
+	if (owner->info.HasMetadata()) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
 	UnregisterImage(id);
@@ -1443,6 +1443,10 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	RefreshImage(id, desc);
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+		image.info.metadata = desc.info.metadata;
+		m_surface_metas.try_emplace(desc.info.metadata.range.address, MetaDataInfo {});
+	}
 	CommitGpuWrite(image);
 	image.usage.render_target = true;
 	TrackImageDownloadLocked(id, image);
@@ -1967,14 +1971,26 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint32_t clear_code, bool clear_code_valid) {
 	std::lock_guard transaction(m_resource_mutex);
 	CacheLock       lock(*this, m_lock);
 	const auto      found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask       = UINT32_MAX;
+	found->second.clear_code       = clear_code;
+	found->second.clear_code_valid = clear_code_valid;
+	return true;
+}
+
+bool TextureCache::MetaClearCode(uint64_t address, uint32_t& clear_code) {
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || !found->second.clear_code_valid) {
+		return false;
+	}
+	clear_code = found->second.clear_code;
 	return true;
 }
 

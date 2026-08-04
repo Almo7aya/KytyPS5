@@ -537,14 +537,35 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle());
-		state.width             = std::min(state.width, target.extent.width);
-		state.height            = std::min(state.height, target.extent.height);
-		state.num_layers        = std::min(state.num_layers, view.layer_count);
-		auto& attachment        = state.color_attachments[i];
-		attachment.image_view   = target.image_view;
-		attachment.image_layout = layout;
-		attachment.clear_value  = target.color_clear_value.uint32;
-		attachment.is_clear     = target.color_clear_enable;
+		state.width                 = std::min(state.width, target.extent.width);
+		state.height                = std::min(state.height, target.extent.height);
+		state.num_layers            = std::min(state.num_layers, view.layer_count);
+		auto& attachment            = state.color_attachments[i];
+		attachment.image_view       = target.image_view;
+		attachment.image_layout     = layout;
+		attachment.clear_value      = target.color_clear_value.uint32;
+		attachment.is_clear         = target.color_clear_enable;
+		const auto metadata_address = target.desc.info.metadata.range.address;
+		uint32_t   clear_code       = 0;
+		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		    cache.IsMetaCleared(metadata_address, view.base_layer)) {
+			// A recorded DCC clear code decides the colour. Constant-encoded codes carry it
+			// directly; DCC_CLEAR_CODE_REGISTER falls back to CB_COLOR#_CLEAR_WORD. Anything else,
+			// notably DCC_CODE_UNCOMPRESSED, is a decompress rather than a clear and is ignored so
+			// the attachment keeps its contents.
+			if (cache.MetaClearCode(metadata_address, clear_code)) {
+				vk::ClearColorValue color {};
+				if (DecodeDccConstantClear(clear_code, color)) {
+					attachment.clear_value = color.uint32;
+					attachment.is_clear    = true;
+				} else if ((clear_code & 0xffu) == DCC_CLEAR_CODE_REGISTER) {
+					attachment.is_clear = true;
+				}
+			}
+			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
+				EXIT("failed to consume DCC clear state\n");
+			}
+		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);

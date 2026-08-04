@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -62,12 +63,39 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		// A metadata clear splats a value sourced from a companion read-only buffer. The recompiled
+		// shader adds only Kyty's own host alignment adjustment on top of guest offset 0, so the
+		// value itself lives at that descriptor's base address and can be read from guest backing.
+		// Recording it matters because a constant-encoded DCC clear code carries the clear colour,
+		// while an uncompressed code (0xff) is a decompress that must not become a clear at all.
+		uint32_t clear_code       = 0;
+		bool     clear_code_valid = false;
+		uint32_t read_only_count  = 0;
+		uint64_t source_address   = 0;
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			if (!program.info.buffers[i].written) {
+				read_only_count++;
+				source_address =
+				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]).Base48();
+			}
+		}
+		if (read_only_count == 1 && source_address != 0) {
+			uint32_t value = 0;
+			if (Libs::LibKernel::Memory::TryReadBacking(source_address, &value, sizeof(value))) {
+				const uint32_t code = value & 0xffu;
+				if (value == (code | (code << 8u) | (code << 16u) | (code << 24u))) {
+					clear_code       = code;
+					clear_code_valid = true;
+				}
+			}
+		}
+
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				if (cache.ClearMeta(descriptor.Base48(), clear_code, clear_code_valid)) {
 					return true;
 				}
 			}
