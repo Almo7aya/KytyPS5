@@ -1,6 +1,6 @@
 # GTA III Definitive Edition runtime fixes
 
-This document describes the five commits on `fix/gta3-runtime-fixes`. The commits were kept
+This document describes the six fix commits on `fix/gta3-runtime-fixes`. The commits were kept
 separate so each failure mode can be reviewed, tested, bisected, or reverted independently.
 
 The reproducer used throughout the investigation was:
@@ -22,6 +22,7 @@ Only the `kyty_emulator` target was built. The launcher was not needed for these
 | `5b080c0` | Storage-buffer descriptors | Oversized reads and `invalid memory tracker range` |
 | `3bf05d7` | Kernel virtual memory | Reads or writes into reserved but uncommitted guest pages |
 | `8c425c5` | Vulkan sampler cache | `unknown ratio: 7` in `samplerCache.cpp` |
+| `667515b` | Texture cache / post-processing | World tonemapping to black through an empty 3D color-grading LUT |
 
 The fixes form a progression through the same GTA III startup and level-streaming path. Removing
 an earlier blocker exposed the next one, but the implementations are not intentionally coupled.
@@ -484,6 +485,143 @@ quality.
 
 - `src/graphics/host_gpu/renderer/cache/samplerCache.cpp`
 
+## 6. `667515b` — restore the missing color-grading LUT
+
+### Visible failure
+
+GTA III could reach active gameplay, but the 3D world was almost entirely black. The following
+elements remained visible:
+
+- HUD text and icons;
+- the circular minimap and parts of its geometry;
+- location text;
+- a small number of extremely bright effects.
+
+That split was important. It showed that presentation and late UI rendering were working while the
+scene-color path feeding the final tonemapper was not.
+
+### RenderDoc evidence
+
+A capture of gameplay frame 2254 was inspected stage by stage. The capture established these facts:
+
+1. G-buffer resources 3144 and 3277 contained the expected road, bridge, and world geometry. About
+   68.8 percent of the inspected pixels were nonblack, so vertex processing, textures, rasterization,
+   and the primary render targets were not the cause.
+2. Lighting and HDR intermediates still contained scene data, although much of it was dark.
+3. Tonemap draw event 1945 sampled HDR scene resource 3586 and a 32x32x32
+   `R10G10B10A2_UNORM` 3D texture, resource 3736.
+4. All 131,072 bytes of resource 3736 were zero.
+5. Tonemap output resource 3728 was also completely zero after the draw.
+6. The HUD was rendered later onto display resource 919, explaining why it remained visible over a
+   black world.
+
+The host SPIR-V for the tonemap pass was decompiled as an additional check. It performs a 3D sampled
+image lookup from the grading texture and carries that value to the final color export. A zero-filled
+grading volume therefore maps every scene color to black; it is not merely an unused auxiliary
+texture.
+
+### Why the grading texture was empty
+
+Unreal Engine builds its combined color-grading table with a `WriteToSlice` geometry-shader pass.
+The pass expands a draw across the depth slices of the 32-cubed render target. Kyty does not yet
+provide general geometry-shader execution for this guest pipeline. `ShouldSkipGeShader` rejects the
+unsupported ES+GS draw, so the LUT-producing draw is intentionally dropped and the newly allocated
+volume retains its zero initialization.
+
+A general geometry-shader implementation was considered but not folded into this fix. The existing
+experimental work still has unresolved behavior around user SGPRs, temporary registers, and slice
+routing. Enabling it for all titles would have made this narrowly understood GTA III failure depend
+on a much larger and less stable emulation change.
+
+### Exact fallback detector
+
+`IsEmptyColorGradingLut` deliberately requires all of the following before substituting data:
+
+- host format `vk::Format::eA2B10G10R10UnormPack32`;
+- extent exactly 32x32x32;
+- exactly one mip level;
+- guest tile mode `TileMode::kRenderTarget`;
+- a nonempty guest backing range representable by `size_t`;
+- successful access to that guest backing;
+- every byte in the backing is zero;
+- the image is being imported as a sampled texture, not as a render target, storage image, depth
+  image, or video-out image.
+
+The zero check is performed against guest backing with `TryReadBacking`; it does not dereference the
+guest virtual address directly. This remains valid for aliased or flexibly backed guest mappings.
+The guest backing allocation is allowed to be larger than the linear 131,072-byte image because a
+tiled allocation can include layout padding.
+
+These conditions make the fallback specific to the missing combined-LUT product. A populated LUT,
+another format, another size, a mipmapped volume, or an image used through another binding path
+continues through the normal texture upload unchanged.
+
+### Neutral Unreal-compatible LUT generation
+
+Using a raw RGB identity cube would still be wrong. Unreal addresses the combined grading LUT in a
+logarithmic scene-color domain, so returning the normalized cube coordinate directly would crush most
+ordinary scene values toward black.
+
+For each red, green, and blue coordinate in the 32-cubed volume, the fallback first converts the
+normalized coordinate from Unreal's log encoding back to linear scene color:
+
+```text
+linear range = 14
+linear grey  = 0.18
+log grey     = 444 / 1023
+black        = exp2(-log grey * linear range) * linear grey
+linear       = max(exp2((encoded - log grey) * linear range) * linear grey - black, 0)
+```
+
+It then applies a neutral filmic curve:
+
+```text
+mapped = clamp(linear * (2.51 * linear + 0.03) /
+               (linear * (2.43 * linear + 0.59) + 0.14), 0, 1)
+```
+
+Finally, it applies the standard piecewise sRGB display transfer. Each channel is rounded to ten
+bits and packed as Vulkan `A2B10G10R10`:
+
+```text
+bits  0.. 9: red
+bits 10..19: green
+bits 20..29: blue
+bits 30..31: alpha = 3
+```
+
+The resulting vector contains 32 * 32 * 32 dwords, exactly 131,072 bytes. It restores a neutral
+scene-to-display mapping without inventing title-specific color-grading controls.
+
+### Upload and ownership path
+
+The replacement data follows the texture cache's existing transfer machinery:
+
+1. `BuildColorTransfer` creates the normal upload regions and slice layout for the image.
+2. The code checks that the plan is valid and that its total slice size equals the generated LUT
+   size.
+3. `BufferCache::UploadTransient` places the LUT in a host-visible transient buffer with 16-byte
+   alignment.
+4. The transient allocation offset is added to every `VkBufferImageCopy` region.
+5. `Image::Upload` performs the Vulkan buffer-to-image transfer.
+6. The existing `InitializeImage` completion path clears the buffer-modified flag and completes CPU
+   refresh bookkeeping exactly as it does after a normal guest upload.
+
+The guest memory itself is not overwritten. The substitution exists only in the host image used by
+the renderer, so it cannot change game-side ownership, serialization, or guest CPU observations.
+
+### Scope and limitation
+
+This is a compatibility fallback for one missing output, not geometry-shader emulation. It restores
+neutral log decode, filmic response, and display transfer, but it cannot reproduce game-specific
+grading parameters that the skipped Unreal `CombineLUT` pass would have applied. When Kyty gains a
+correct implementation of that geometry pipeline, the real populated guest LUT will fail the
+all-zero predicate and automatically use the normal upload path.
+
+### File changed
+
+- `src/graphics/host_gpu/renderer/cache/textureCache.cpp`
+
 ## Verification history
 
 All verification builds used only this target:
@@ -504,6 +642,12 @@ The following results were observed with the exact Silent reproducer:
 5. After the sampler clamp, the exact run passed the former 954-shader boundary, reached 971 shaders,
    remained responsive during the watch window, and contained zero `unknown ratio` messages. The
    verification instance was then stopped manually.
+6. The black-world investigation captured intact G-buffers, a zero 32-cubed grading LUT, and an
+   all-zero tonemap output in the same frame. The neutral-LUT implementation then built and linked in
+   the Release `kyty_emulator` target. Current end-to-end attempts reached the title-to-level
+   transition but were repeatedly terminated by the already documented guest read from
+   `0xfffffffffffffff8` before the LUT was instantiated; that unrelated failure remains a separate
+   investigation rather than being hidden inside this rendering commit.
 
 `git diff --check` passed before the fixes were split into commits and again after the split.
 
@@ -540,8 +684,9 @@ git show 1f0f3fb
 git show 5b080c0
 git show 3bf05d7
 git show 8c425c5
+git show 667515b
 ```
 
 Each commit includes all declarations and call sites required for its own fix. There are no known
-mandatory revert-order dependencies between the five commits, although reverting an earlier blocker
+mandatory revert-order dependencies between the six commits, although reverting an earlier blocker
 can prevent runtime testing from reaching later code.
