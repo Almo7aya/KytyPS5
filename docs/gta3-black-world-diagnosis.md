@@ -558,6 +558,50 @@ For reference, the other two routes considered:
 - **CP DMA path.** `BufferCache::FillBuffer` already receives the value directly, so titles that clear
   metadata by DMA would need the same code plumbed through there.
 
+## Part 6 — depth/storage binding ping-pong destroys and rebuilds shadow maps every frame
+
+Chasing the flashing led to a separate, well-evidenced defect.
+
+A probe on `TextureCache::InsertImage` reporting host images recreated at an address they already
+occupied showed unbounded growth on shadow-map-sized surfaces — `addr=0x209b310000`, `2048x2048`,
+format 124 (`D16_UNORM`), recreated **232 times and climbing** in one short run, alongside the full-res
+`R11G11B10` scene colour and a half-res `R16` target.
+
+Tagging the deletion sites attributed **100%** of the repeated destruction to `ResolveDepthOverlap` —
+zero from the garbage collector, zero from invalidation. (The GC was the intuitive suspect given its
+trigger sits at roughly 2 GiB on a 12 GB card, but it was not responsible.)
+
+Instrumenting the condition gave a single shape, 24 out of 24 identical:
+
+```
+binding=1 (Storage)
+cached{depth=1 fmt=124 D16_UNORM bpp=2 stencil=0 lay=1 mip=1}
+  want{depth=0 fmt=70  R16_UNORM bpp=2 stencil=0 lay=1 mip=1}
+```
+
+The branch is `case BindingType::Storage: recreate |= cached.info.IsDepth();`
+(`textureCache.cpp:791`). So:
+
+1. the shadow pass renders the surface as **D16 depth**;
+2. a compute pass binds the same memory as an **R16_UNORM storage image**, and because the cached image
+   is depth the surface is destroyed, recreated as colour, and convert-copied;
+3. the next frame's shadow pass binds it as a depth target, the cached image is now *not* depth
+   (`recreate |= !cached.info.IsDepth()`), and it is destroyed and rebuilt again.
+
+Every frame, for every shadow map, that is two image creations plus two full-surface conversion copies
+at 2048×2048. Vulkan cannot express this directly: a depth format cannot carry `STORAGE` usage, and a
+`D16` image cannot be viewed as `R16`, so a single image genuinely cannot serve both bindings.
+
+**Scope of the claim.** This is a strong explanation for the frame rate. It is *not* established that it
+causes the flashing: contents do appear to survive, because `CopyImage` routes `D16`↔`R16` through the
+dedicated `CopyD16` helper rather than an illegal aspect-mismatched `vkCmdCopyImage`. Flashing remains
+unexplained.
+
+**Fix direction.** Stop destroying one representation to build the other. The surface needs a depth
+image and a colour alias coexisting, synced on binding change, instead of a single cache slot that
+flip-flops. That is a real texture-cache change — the cache currently maps one guest address to one
+image — and it should be scoped deliberately rather than bolted on.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
