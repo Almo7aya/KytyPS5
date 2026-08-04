@@ -563,7 +563,69 @@ For reference, the other two routes considered:
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
 `Gameface/Content/Common/ProceduralSky/BP_GTA_ProceduralSky` is the natural first suspect.
 
-## Part 4 — missing character and vehicles (separate defect, not a renderer bug)
+## Part 5 — root cause of missing characters/vehicles: occlusion queries are discarded
+
+The decisive symptom, reported by the user: **characters and cars only render when the camera overlaps
+their model.** That is the signature of broken occlusion queries. Unreal marks primitives whose bounds
+contain the camera as unconditionally visible, because they cannot be occlusion-tested reliably;
+everything else is culled according to the query result. If every query reports "occluded", only
+camera-overlapping objects survive — exactly what is observed.
+
+`graphicsRun.cpp:1551-1557` discards the entire `PIXEL_PIPE_STAT` family:
+
+```cpp
+case 0x00000038:   // PIXEL_PIPE_STAT_CONTROL
+case 0x00000039:   // PIXEL_PIPE_STAT_DUMP     <- occlusion query result
+case 0x0000003a:   // PIXEL_PIPE_STAT_RESET
+    LOGF("\t temporary: ignoring unsupported event_write type ...");
+    break;
+```
+
+On RDNA, `PIXEL_PIPE_STAT_DUMP` is how Z-pass counts are written back — it *is* the occlusion query
+mechanism. It fired **127,878 times** in a single run of `_gta3_logs/skipdraw.log`, which is the
+per-primitive query traffic of a whole session.
+
+The packet carries a destination address that Kyty throws away. `CpOpEventWrite`
+(`pm4Handlers.cpp`) reads only `buffer[0]` and returns `KYTY_PM4_LEN(cmd_id) - 1`, and
+`CommandProcessor::TriggerEvent(event_type, event_index)` is not even given the address. From the PM4
+dump:
+
+```
+0xc0024600  IT_EVENT_WRITE CNT:3
+  buffer[0] = 0x00000139     event_type = 0x39, event_index = 1
+  buffer[1] = 0x8132a8c0     destination address low
+  buffer[2] = 0x00000011     destination address high   => 0x11_8132a8c0
+```
+
+Consecutive dumps target addresses 8 bytes apart (`…a8c0` then `…a8c8`), i.e. begin/end pairs of a
+64-bit counter, with the guest taking `end - begin` as the visible-pixel count. Because nothing is ever
+written, the guest reads whatever is already in that memory — giving a delta of zero, i.e. "occluded",
+for every primitive.
+
+This also fits the secondary symptoms: intermittent appearance and flashing follow from stale
+uninitialised memory changing under the query addresses, and frame 1605 simply captured a moment when
+the character was culled.
+
+### Two ways to fix
+
+1. **Conservative (small).** Parse the destination from `buffer[1]`/`buffer[2]` and write a
+   **monotonically increasing 64-bit counter** on each `PIXEL_PIPE_STAT_DUMP`. Every `end - begin`
+   delta is then positive, so every primitive reports visible. Interleaved queries stay correct because
+   a monotonic counter yields a positive delta regardless of ordering. This disables occlusion culling
+   — a GPU cost, since Unreal then draws everything — but it can never wrongly cull.
+2. **Correct (larger).** Real Vulkan occlusion queries: a `VK_QUERY_TYPE_OCCLUSION` pool,
+   `vkCmdBeginQuery`/`vkCmdEndQuery` bracketing the guest's query range, and asynchronous readback
+   into the guest address. Preserves culling but needs query-pool lifetime management and a result
+   path that does not stall the GPU thread.
+
+Option 1 is the right first move: it is a few lines, it directly removes the false culling, and it
+gives a correct baseline that option 2 can later optimise.
+
+## Part 4 — missing character and vehicles (superseded by Part 5)
+
+> The analysis below predates the occlusion-query finding and is kept for the evidence it records. Its
+> conclusion — that skeletal draws are simply never submitted — is explained by Part 5: the draws are
+> culled by failed occlusion queries, not absent from the engine.
 
 With the DCC clear fix in place the world renders, but the player character and street vehicles are
 absent. Evidence from `_RenderDoc/kyty_frame1605.rdc` (captured with the player standing next to a car)
