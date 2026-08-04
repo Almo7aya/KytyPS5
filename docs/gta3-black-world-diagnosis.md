@@ -613,11 +613,40 @@ checkerboard pattern, and the earlier daylight frame showed heavy blocky ditheri
 image. Unreal uses **dithered opacity** for LOD fade and masked materials and relies on **TAA** to
 resolve it into smooth coverage. A persistent stipple is the classic signature of TAA not accumulating.
 
-That is consistent with the pipeline already mapped in Part 1: TAA is a compute dispatch (event 2113 in
-`kyty_frame2404.rdc`) reading scene colour plus a history target and writing the post-TAA colour. Worth
-checking whether its history input is valid across frames, and whether its output is the surface the
-rest of the chain consumes. A stray teal curved line across the same frame is unexplained and may be
-unrelated.
+The user additionally reports the character **flashing** — present some frames, completely hidden on
+others. A symptom that alternates per frame points at a double-buffered resource, and the TAA history
+is exactly that.
+
+Traced in `kyty_frame1605.rdc`:
+
+| Event | Role | Resource |
+| --- | --- | --- |
+| 5349, 5393 | separate-translucency composite | writes `3535` |
+| 5366 | **TAA compute** | reads scene `3535`, reads **history `3587`**, writes **`3538`** |
+| 5796 | tonemap | reads **`3538`** |
+
+`3587` is **only ever read** in this frame — four usages (5230, 5252, 5324 in the separate-translucency
+pass, and 5366) and never written. `3538` is written by TAA and consumed by the tonemapper. So
+`{3587, 3538}` is a **ping-pong pair whose roles swap every frame**: next frame TAA should read `3538`
+as history and write `3587`, and the tonemapper should follow.
+
+That is the leading hypothesis for both symptoms: if Kyty mishandles one side of that pair — a fresh
+host image created for one of them, the two aliasing one guest allocation but backed by separate host
+images, or the swap not being tracked — then every other frame TAA blends against a wrong or empty
+history. Alternating frames is precisely "flashing", and a history that is wrong half the time also
+prevents dithered opacity from ever resolving. Note this is the same *class* of bug as the DCC clear:
+a resource whose per-frame state Kyty does not reproduce.
+
+The history sampled non-empty in this frame (mean ≈ 0.0066), so it is not simply zero — which is why
+this needs two consecutive frames to confirm, not one.
+
+A stray teal curved line across the same frame is unexplained and may be unrelated.
+
+**Next step.** Two consecutive captures, or one taken on a bad frame, to see which side of the pair is
+wrong — currently blocked by the capture crash. A capture-free alternative is to log, per frame, the
+host image ids Kyty resolves for the TAA history and output plus whether either was freshly created;
+if one side is recreated on alternate frames its contents are undefined, which would confirm this
+outright.
 
 ### Capturing now crashes
 
