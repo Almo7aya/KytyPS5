@@ -44,6 +44,17 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t GpuResourceManager::MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept {
+	if (vaddr == 0 || max_size == 0 || vaddr >= TRACKER_ADDRESS_SIZE) {
+		return 0;
+	}
+	if (max_size > TRACKER_ADDRESS_SIZE - vaddr) {
+		max_size = TRACKER_ADDRESS_SIZE - vaddr;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges.ContiguousExtent(vaddr, max_size);
+}
+
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);

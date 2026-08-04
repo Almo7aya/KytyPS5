@@ -85,6 +85,23 @@ public:
 		}
 	}
 
+	// Number of contiguous bytes covered starting at `address`, capped at `max_size`. Ranges are
+	// coalesced on insertion, so the entry containing `address` already spans the whole run.
+	[[nodiscard]] uint64_t ContiguousExtent(uint64_t address, uint64_t max_size) const {
+		if (address == 0 || max_size == 0) {
+			return 0;
+		}
+		auto it = m_ranges.upper_bound(address);
+		if (it == m_ranges.begin()) {
+			return 0;
+		}
+		--it;
+		if (it->first > address || it->second <= address) {
+			return 0;
+		}
+		return std::min(it->second - address, max_size);
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:
