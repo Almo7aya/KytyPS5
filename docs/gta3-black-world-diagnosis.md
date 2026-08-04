@@ -652,6 +652,70 @@ Worth recording: the Part 6 image-recreation probe filtered to `extent.width >= 
 have reported these 1×1 images. The filter was meant to suppress texture churn and instead hid the
 resource that mattered.
 
+## Part 8 — the darkness: the real colour-grading LUT is still missing
+
+Two corrections first, both mine.
+
+**The "black frame" was never black.** Part 7 called `kyty_frame1659` a black frame from *looking at a
+JPEG*. Measured numerically through the RenderDoc Python API:
+
+```
+tonemap_output 3727  3360x1892 B8G8R8A8_UNORM
+  r[min=0 max=255 mean=4.724]  g[max=87 mean=4.771]  b[max=103 mean=4.608]
+  nonzero_bytes = 299831 of the first 400000
+```
+
+Mean **4.7/255** — roughly 1.8% brightness. Very dark, not black. A JPEG of that reads as black.
+
+**The zeroed 1×1 is not a lost texture.** The guest-backing probe shows the tonemapper's `(0,0,0,1)`
+1×1 at `0x20047f0000` genuinely contains `0xff000000` in guest memory, next to a white
+`0xffffffff` at `0x20047e0000` and a default normal `0xff8080ff` at `0x2010d70000`. These are Unreal's
+1×1 dummy textures and Kyty is reproducing them correctly. Part 7's conclusion is withdrawn.
+
+### What the darkness actually is
+
+The colour-grading volume sampled by the tonemapper is **still the neutral fallback** from `667515b`.
+Read out of the capture, its grey diagonal is perfectly neutral and matches
+`BuildNeutralColorGradingLut` value for value:
+
+```
+LUT 3735  32x32x32 R10G10B10A2_UNORM
+  red ramp  0.00000 0.00293 0.00782 0.01564 0.02835 0.04888 0.07527 0.10948 ...
+  grey diag [0] 0.00000  [4] 0.02835  [8] 0.15054  [12] 0.41838  [16] 0.75953  [20] 0.93842
+```
+
+A real game grade is never a perfectly neutral diagonal. And the arithmetic closes exactly:
+
+```
+scene 0.0039 x exposure 1.2656 = 0.0049
+Unreal log encode -> 0.107
+neutral LUT at 0.107      -> ~0.020
+                          -> 5.1 / 255      (measured mean 4.724)
+```
+
+So nothing downstream is broken. The tonemapper is faithfully applying a neutral curve, and that curve
+is far darker in the shadows than the grade the title intends.
+
+**Root cause:** Unreal builds its combined grading LUT with a `WriteToSlice` ES+GS pass that expands a
+draw across the 32 slices of the volume. `ShouldSkipGeShader` drops unsupported ES+GS draws, so the
+volume is never written, stays all-zero, and `667515b` substitutes the neutral curve. The neutral
+fallback was always documented as a stopgap; this quantifies its cost.
+
+This is the same family as the skipped `Clear Surfaces` GS pass in Part 4 — both are unsupported ES+GS
+draws — and it lands back on the `graphics-gs-writetoslice-volume` branch found at the very start of
+this investigation, which stalled at `1943e1d` on an ES-VS TTMP decode gap. **Finishing that branch is
+the fix for the darkness.**
+
+Flashing remains unexplained. It may be easier to judge once the image is correctly exposed, since at
+a mean of 4.7/255 almost anything reads as popping in and out.
+
+### Tooling note
+
+The RenderDoc MCP server is not required. `C:\Program Files\RenderDoc` ships a Python module
+(`import renderdoc`, version 1.45 here) that drives the same replay API, and the repo already used it
+in `_gta3_logs/analyze_renderdoc_targets.py`. Both measurements above were taken that way, so captures
+can be analysed whenever the MCP is unavailable.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
