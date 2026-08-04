@@ -247,6 +247,22 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	// TEMPORARY PROBE (GTA III flashing). A host image recreated at an address it already occupied
 	// starts with undefined contents, which is what a per-frame ping-pong pair would look like from
 	// the outside. Report repeat creations at the same guest address, ignoring first sightings.
+	// TEMPORARY PROBE (GTA III flashing). The exposure resource is 1x1, and the tonemapper was seen
+	// sampling a zeroed 1x1 image while eye adaptation wrote a healthy value into a different one.
+	// Log every tiny image creation with its guest address so it can be established directly whether
+	// two host images share one address, without assuming which mechanism split them.
+	if (!info.data.Empty() && info.extent.width <= 4 && info.extent.height <= 4) {
+		static std::mutex            probe_mutex;
+		static std::atomic<uint32_t> probe_reports {0};
+		std::lock_guard              probe_lock(probe_mutex);
+		if (probe_reports.fetch_add(1, std::memory_order_relaxed) < 40) {
+			std::fprintf(stderr, "[gta3-probe] tiny-image addr=0x%010llx %ux%u fmt=%u size=0x%llx\n",
+			             static_cast<unsigned long long>(info.data.address), info.extent.width,
+			             info.extent.height, static_cast<uint32_t>(info.pixel_format),
+			             static_cast<unsigned long long>(info.data.size));
+			std::fflush(stderr);
+		}
+	}
 	if (!info.data.Empty() && info.extent.width >= 256) {
 		static std::mutex                     probe_mutex;
 		static std::map<uint64_t, uint32_t>   probe_seen;
@@ -1021,10 +1037,35 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
 			const auto result    = ResolveOwner(result_id);
-			return {result != nullptr && ImageViewOps::FormatsCompatible(result->info.pixel_format,
-			                                                             requested.pixel_format)
-			            ? result_id
-			            : ImageId {}};
+			const bool compatible =
+			    result != nullptr &&
+			    ImageViewOps::FormatsCompatible(result->info.pixel_format, requested.pixel_format);
+			if (!compatible) {
+				// TEMPORARY PROBE (GTA III flashing). Returning a null id here makes the caller build
+				// a *second* host image for this guest address, so writes through one view are
+				// invisible through the other. Suspected cause of the tonemapper sampling a stale
+				// exposure image. Report the split, with small surfaces called out since the exposure
+				// resource is 1x1.
+				static std::mutex                   probe_mutex;
+				static std::map<uint64_t, uint32_t> probe_seen;
+				static std::atomic<uint32_t>        probe_reports {0};
+				std::lock_guard                     probe_lock(probe_mutex);
+				const auto                          count = ++probe_seen[requested.data.address];
+				if ((requested.extent.width <= 4 ? count <= 4 : (count >= 8 && count % 32 == 0)) &&
+				    probe_reports.fetch_add(1, std::memory_order_relaxed) < 40) {
+					std::fprintf(stderr,
+					             "[gta3-probe] format-split addr=0x%010llx times=%u %ux%u "
+					             "cached_fmt=%u want_fmt=%u binding=%u\n",
+					             static_cast<unsigned long long>(requested.data.address), count,
+					             requested.extent.width, requested.extent.height,
+					             result != nullptr ? static_cast<uint32_t>(result->info.pixel_format)
+					                               : 0u,
+					             static_cast<uint32_t>(requested.pixel_format),
+					             static_cast<uint32_t>(binding));
+					std::fflush(stderr);
+				}
+			}
+			return {compatible ? result_id : ImageId {}};
 		}
 		if (requested.type == cached.info.type && requested.resources > cached.info.resources) {
 			return {ExpandImage(requested, cached_id)};
