@@ -602,6 +602,41 @@ image and a colour alias coexisting, synced on binding change, instead of a sing
 flip-flops. That is a real texture-cache change — the cache currently maps one guest address to one
 image — and it should be scoped deliberately rather than bolted on.
 
+## Part 7 — the flashing: the tonemapper samples a stale exposure image
+
+`_RenderDoc/kyty_frame1659.rdc` was captured on a **black frame**, which finally made this measurable.
+
+| Resource | Role | Contents |
+| --- | --- | --- |
+| `3539` | tonemapper scene input | mean 0.0039, max 0.041 — **populated** |
+| `3680` | written by eye adaptation, dispatch 17333 | **1.265625** — a healthy exposure |
+| `3731` | **sampled by the tonemapper**, event 17404 | **`(0,0,0,1)`** |
+| `3727` | tonemap output | **entirely black** |
+
+Dispatch 17333 reads the 53×30 bloom mip and writes the adapted exposure into `3680`. The value
+`1.265625` is exactly what a *working* frame measured earlier (`4451` in `kyty_frame2404.rdc`). So
+exposure is being computed correctly — and then the tonemapper samples a **different 1×1 image** that
+holds zeros. Multiplying by zero exposure blacks out the whole frame.
+
+`3731` is read **17 times across the frame and never written**. Note also that `3680` returns
+`1.265625`, a value above 1.0, so it is a float format, while `3731` is `R8G8B8A8_UNORM`. Two host
+images, two formats, one guest resource.
+
+That points at the colour-format split in `ResolveOverlap` (`textureCache.cpp:936-943`): when the
+requested format is not `FormatsCompatible` with the cached one it returns a null id, and the caller
+creates a **second** image for the same address. Writes to one are then invisible to the other. This is
+the same structural fault as Part 6's depth/colour split, but between two colour formats, and it
+explains the flashing exactly: when the tonemapper resolves to the freshly written side the frame looks
+right, and when it resolves to the stale side the frame goes black.
+
+**Not yet confirmed:** that `3680` and `3731` share a guest address. RenderDoc does not expose guest
+addresses, so this needs an emulator-side probe logging the guest address and format of every 1×1 image
+resolved for sampling versus storage. That is the next step, and it is cheap.
+
+Worth recording: the Part 6 image-recreation probe filtered to `extent.width >= 256`, so it could never
+have reported these 1×1 images. The filter was meant to suppress texture churn and instead hid the
+resource that mattered.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
