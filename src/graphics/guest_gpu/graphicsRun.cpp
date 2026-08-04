@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <semaphore>
@@ -1506,7 +1507,7 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
 }
 
-void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
+void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index, void* dst_gpu_addr) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
@@ -1540,6 +1541,26 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 			}
 			EmitGlobalBarrier();
 			break;
+		// PixelPipeStatDump samples the Z-pass counter into guest memory. The guest brackets a draw
+		// with two dumps and takes the difference as its visible-pixel count, so a destination that
+		// is never written leaves the difference at zero and Unreal culls the primitive. That is why
+		// characters and vehicles only appeared when the camera was inside their bounds: Unreal
+		// treats camera-containing primitives as unconditionally visible and occlusion-tests
+		// everything else.
+		//
+		// Kyty has no Z-pass counter yet, so report a monotonically increasing value. Every
+		// end-minus-begin difference is then positive and every primitive is reported visible.
+		// This does not emulate occlusion culling, it disables it -- more geometry is drawn than the
+		// title intended -- but it can never cull something that is actually on screen. A monotonic
+		// counter stays correct no matter how the query pairs interleave or nest.
+		case 0x00000039:
+			if (dst_gpu_addr != nullptr) {
+				const uint64_t z_pass_count =
+				    m_z_pass_counter.fetch_add(1, std::memory_order_relaxed) + 1;
+				std::memcpy(dst_gpu_addr, &z_pass_count, sizeof(z_pass_count));
+				break;
+			}
+			[[fallthrough]];
 		case 0x0000000d:
 		case 0x0000000e:
 		case 0x00000012:
@@ -1549,12 +1570,16 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 		case 0x0000001a:
 		case 0x0000001b:
 		case 0x00000038:
-		case 0x00000039:
-		case 0x0000003a:
-			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
-			     ", index 0x%08" PRIx32 "\n",
-			     event_type, event_index);
+		case 0x0000003a: {
+			// Bounded: an unbounded message here produced 127878 lines in a single run.
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
+				     ", index 0x%08" PRIx32 "\n",
+				     event_type, event_index);
+			}
 			break;
+		}
 		default:
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);
 	}

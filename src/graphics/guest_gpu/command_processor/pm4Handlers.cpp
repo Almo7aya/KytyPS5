@@ -2133,7 +2133,15 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	uint32_t event_index = (buffer[0] >> 8u) & 0x7u;
 	uint32_t event_type  = (buffer[0]) & 0x3fu;
 
-	cp.TriggerEvent(event_type, event_index);
+	// The PIXEL_PIPE_STAT_* events carry a 64-bit destination for the Z-pass counter in the two
+	// dwords after the event selector; the plain one-dword form has no address.
+	void* dst_gpu_addr = nullptr;
+	if (KYTY_PM4_LEN(cmd_id) - 1u >= 3) {
+		dst_gpu_addr = reinterpret_cast<void*>(buffer[1] |
+		                                       (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
+	}
+
+	cp.TriggerEvent(event_type, event_index, dst_gpu_addr);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }

@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include <atomic>
 #include <cstdint>
 #include <vector>
 
@@ -95,7 +96,7 @@ public:
 	                    uint32_t mode);
 	void DispatchIndirect(uint32_t data_offset, uint32_t mode);
 	void WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index);
-	void TriggerEvent(uint32_t event_type, uint32_t event_index);
+	void TriggerEvent(uint32_t event_type, uint32_t event_index, void* dst_gpu_addr = nullptr);
 
 	void SetUserDataMarker(HW::UserSgprType type) { m_user_data_marker = type; }
 	[[nodiscard]] HW::UserSgprType GetUserDataMarker() const { return m_user_data_marker; }
@@ -163,6 +164,9 @@ private:
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;
 	bool     m_ce_complete = false;
+
+	// Stand-in for the hardware Z-pass counter sampled by PixelPipeStatDump. See TriggerEvent.
+	std::atomic<uint64_t> m_z_pass_counter {0};
 
 	uint32_t m_const_ram[0x3000] = {0};
 
