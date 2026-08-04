@@ -747,6 +747,122 @@ with TTMP. That determines whether the values can be supplied cheaply (a constan
 layered path already knows) or whether this needs real launch-state modelling, which would be a much
 larger job.
 
+## Part 9 — the WriteToSlice shaders, disassembled: obstacles 2 and 3 above are both gone
+
+Both shaders have now been dumped and disassembled. **Obstacle 2 (TTMP) does not exist, and obstacle 3
+is solved.** The remaining work is smaller and much better defined than Part 8 assumed.
+
+### How they were obtained
+
+`ShaderDumpSkippedGeShader` (`shader.cpp`, commit `10bd34f`) writes the raw guest words of both
+shaders at the `ShouldSkipGeShader` skip point, into `<shader-log-folder>/skipped_ge/`. It runs at most
+twice and deliberately does **not** invoke the recompiler — that draw is skipped every frame, so an
+abort inside a decoder would take the game down on every frame.
+
+Disassembly happens offline instead, via a new `shader_disasm` CMake target
+(`tests/ShaderDisasmTool.cpp`) that links only the six files in `recompiler/decompiler/` plus `fmt`.
+It uses the emulator's own `Decoder::DecodeProgram` / `ProgramToString`, so the output is exactly what
+the recompiler would see. Note that MSVC's bundled clang has no AMDGPU target, so no external
+disassembler is available on this machine — this tool is the only route.
+
+	cmake --build _Build/v3 --target shader_disasm
+	_Build\v3\shader_disasm.exe _Shaders\gta3\skipped_ge\es_*.bin
+
+### There is no TTMP problem
+
+Part 8 recorded the TTMP rejection as "the real blocker". It is not present in these shaders.
+
+- **GS: 275 instructions, 0 unsupported.**
+- **ES: 82 decoded, 14 "unsupported" — all past the end of the program.** They are twelve
+  `0xbf9f0000` (`s_code_end`, the prefetch padding LLVM emits after `s_endpgm`) followed by two zero
+  words. The last real instruction is `s_setpc_b64 s6` at `0x194`.
+
+Neither shader references a trap-temporary register. Whatever prompted the TTMP note on the
+`graphics-gs-writetoslice-volume` branch, it does not apply to the shaders this title's LUT actually
+uses. **Obstacle 2 is withdrawn.**
+
+### Why the draw is skipped: four conditions, not one
+
+From `skipdraw.log`:
+
+	stages=0x00002030 prim_group=0x0040 vert_group=0x0040 ngg=0x00000001
+	max_out=0x000000c0 gs_max_vert=0x00000003 gs_out_prim=0x00000002
+	es=0x2008ab0000 gs=0x2008a90000
+
+`stages=0x2030` decodes as `ES_EN=REAL` (bits 4:3=2), `GS_EN=1` (bit 5), `GS_FAST_LAUNCH=1` (bit 13).
+The only stage mask `ShouldSkipGeShader` accepts is `0x02002000` — `GS_FAST_LAUNCH` plus
+`PRIMGEN_PASSTHRU_EN` (bit 25), i.e. NGG passthrough with no real GS. So four of its conditions fire
+independently: `unsupported_stage_mask`, `unsupported_gs_stage`, `gs_max_vert != 0` (3), and
+`max_out > 0x40` (0xc0). This is a genuine hardware geometry shader.
+
+`VGT_GS_MAX_VERT_OUT = 3` is `[maxvertexcount(3)]`.
+
+### What the two shaders do — an exact match to UE4 `RasterizeToVolumeTexture`
+
+**ES** = UE4's `WriteToSliceMainVS`. It exports nothing; it writes 7 dwords per vertex to LDS (the
+ESGS ring), stride confirmed by `v_mul_u32_u24 v5, 28, v12` — 28 bytes:
+
+| bytes | value | instruction |
+|---|---|---|
+| 0, 4 | `Position.xy` | `v_mad_f32 v6, s28, v6, s30` / `v_mad_f32 v9, v7, s29, s31` |
+| 8, 12 | `UV.xy` | second `buffer_load_format_xy v10, v8, s8, s18`, passed through |
+| 16, 20 | `Position.zw` = `(0.0, 1.0)` | `v_mov_b32 v10, 0` / `v_mov_b32 v11, 1.0` |
+| 24 | **`LayerIndex`** | **`v_add_nc_u32 v9, s16, v8`** |
+
+`s28..s31` come from `s_buffer_load_dwordx4 s28, s8` and `s16` from `s_buffer_load_dword s16, s8`.
+That is line-for-line the UE4 source:
+
+	Output.Vertex.Position = float4(InPosition * UVScaleBias.xy + UVScaleBias.zw, 0, 1);
+	Output.LayerIndex      = LayerIndex + MinZ;      // LayerIndex : SV_InstanceID
+
+so `s28..s31` = `UVScaleBias`, `s16` = `MinZ`, and `v8` = the instance ID.
+
+**GS** = `WriteToSliceMainGS`, a pure 3-in/3-out passthrough. Its exports are the whole story:
+
+	exp target=0x0c en=0xf  v0, v1, v2, v3    ; POS0   = position
+	exp target=0x0d en=0x4  v0, v0, v7, v0    ; POS1.z = v7  -> render-target array index
+	exp target=0x20 en=0xf  v4, v5, v6, v6    ; PARAM0 = UV
+
+`en=0x4` selects only `.z` of the POS1 "misc" export, which on GCN/RDNA is the render-target slice
+index (`.x` point size, `.y` edge flag, `.z` layer, `.w` viewport). **`POS1.z` is `gl_Layer`.**
+
+Because the GS neither amplifies nor reorders, ES+GS together are semantically just an instanced
+vertex shader that writes `gl_Layer`. This is precisely the shape the
+`graphics-gs-writetoslice-volume` branch targeted, and it confirms that approach was correct.
+
+### The chain, closed
+
+`FCombineLUTsPS` builds the 32³ colour-grading LUT through `RasterizeToVolumeTexture`, one instance
+per slice. That draw is skipped → the LUT is never written → the neutral fallback from `667515b` is
+sampled instead → the frame is dark. The arithmetic already closed in Part 8 (predicted 5.1/255 vs
+measured 4.724); the mechanism is now confirmed at instruction level rather than inferred.
+
+### The layered-rendering infrastructure already exists
+
+Checked before scoping the fix, because it was the main cost risk — and it is already present:
+
+- `renderTarget.h:52` — `enum class TargetViewType { Image2D, Image2DArray, Unsupported }`
+- `renderTarget.h:66` — picks `Image2DArray` whenever `base_layer != last_layer`
+- `colorRenderTarget.cpp:358`, `depthRenderTarget.cpp:342` — `vk::ImageViewType::e2DArray` when
+  `layer_count != 1`
+- `context.cpp:462` — `rendering.layerCount = state.num_layers`
+- `colorRenderTarget.cpp:280,319` — an existing `volume` path for 3D targets
+- `renderDraw.cpp:511-631` — `state.num_layers` already computed across attachments
+
+So no new render-target work is expected. The remaining gap is the shader lowering only.
+
+### What is actually left
+
+1. Narrow `ShouldSkipGeShader` so this pattern is no longer rejected: real ES+GS, fast launch,
+   `gs_max_vert == 3`, passthrough GS.
+2. Lower the pair to one instanced vertex shader. The ES's `ds_write`s at the four known offsets
+   become the VS outputs, using the byte→semantic table above; the GS is dropped as a no-op.
+3. Route `POS1.z` to SPIR-V `gl_Layer` (`BuiltIn Layer`), which needs the `ShaderViewportIndexLayerEXT`
+   capability or Vulkan 1.2 `shaderOutputLayer`.
+
+Steps 1 and 3 are small. Step 2 is the real work, and the ~133-line hand-port described in Part 8
+(obstacle 1) still stands — that estimate is unaffected by these findings.
+
 ### Tooling note
 
 The RenderDoc MCP server is not required. `C:\Program Files\RenderDoc` ships a Python module

@@ -421,6 +421,18 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(shader_disasm EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderDisasmTool.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ExportOps.cpp"
+)
+target_link_libraries(shader_disasm fmt::fmt)
+target_include_directories(shader_disasm PRIVATE ${inc_headers})
+
 add_executable(resource_mutex_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceMutexTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/resourceMutex.cpp"
