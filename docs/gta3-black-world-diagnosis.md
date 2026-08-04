@@ -324,6 +324,56 @@ that aliases a render target leaves the host image stale. The guard is deliberat
 turn a silent staleness bug into a crash. A probe now reports raw writes that overlap an image, without
 changing behaviour, to establish whether this path is actually taken.
 
+### Probe results — the guest programs no fast-clear colour for this surface
+
+Instrumented run, `_gta3_logs/probe_clearwords.stderr.log`. 48 distinct colour render targets reported.
+The decisive rows are the three full-res `R16G16B16A16_SFLOAT` targets (`vkfmt=97`, 3360×1892):
+
+```
+base=0x2014580000 vkfmt=97 3360x1892 dcc_en=1 dcc=0x2038910000 cw0=0x00000000 cw1=0x00000000
+base=0x20452d0000 vkfmt=97 3360x1892 dcc_en=1 dcc=0x2045280000 cw0=0x00000000 cw1=0x00000000
+base=0x203e9b0000 vkfmt=97 3360x1892 dcc_en=1 dcc=0x20429b0000 cw0=0x00000000 cw1=0x00000000
+```
+
+**`CB_COLOR#_CLEAR_WORD0/1` are zero.** The guest never programs a fast-clear colour for the
+separate-translucency surface, so `b38962b` was structurally incapable of producing `(0,0,0,1)` — it
+could only ever have cleared to `(0,0,0,0)`. The revert is the correct baseline.
+
+Supporting observations from the same run:
+
+- **The register plumbing works.** `base=0x207de30000` (`vkfmt=44` = `B8G8R8A8_UNORM`, `cmask_fc=1`)
+  reports `cw0=0xff000000`, which in `B8G8R8A8_UNORM` *is* `(0,0,0,1)`. Another target
+  (`base=0x20719f0000`, 9×1) reports `cw0=0x70e20000`. So clear words are captured correctly when the
+  guest actually sets them — the zeros above are real, not a capture failure.
+- **CMASK fast clear is rare**: only the two 3840×2160 display targets and one 3360×1892 `B8G8R8A8`
+  target set `cmask_fc=1`. DCC is enabled on almost everything else.
+- **The DCC-address collision is real**: `base=0x2032eb0000` and `base=0x2035110000` (both `vkfmt=122`,
+  3360×1892) share DCC address `0x2034eb0000`. Since `m_surface_metas` is keyed on that address alone,
+  any metadata-driven clear would cross-trigger between those two surfaces.
+- **Raw writes do alias images, but not this one.** `raw-write-aliases-image` fired only for
+  `vaddr=0x20773e0000 size=0x90000` (576 KB) and `vaddr=0x2077260000 size=0x100000` (1 MB), both with
+  `gpu_modified=0`. Those are bloom-chain sized; the translucency surface is 3360×1892×8 ≈ 50 MB.
+
+So Kyty sees **no** guest clear of that surface through either the CB fast-clear path or a raw buffer
+write.
+
+### Next instrumentation round
+
+The first probe set had a blind spot: only the *raw* branch of `ObtainBuffer` was logged, so a
+**formatted** surface-sized write would have been invisible. Three probes now cover the remaining
+candidates:
+
+- `[gta3-probe] formatted-write-aliases-image` — formatted GPU writes ≥ 1 MB that alias a host image.
+  A ~50 MB hit here means the guest clears the surface through the formatted path, and the question
+  becomes whether the cleared bytes reach guest backing before the image re-uploads.
+- `[gta3-probe] rejected-nonuniform-image-clear` — fires when `ResolveComputeImageClear` rejects a
+  128-bit fill because its four dwords are not identical (`renderCompute.cpp:107-111`). A clear to
+  `(0,0,0,1)` in `R16G16B16A16` is `{0x00000000, 0x3C000000, 0x00000000, 0x3C000000}`, which lands
+  exactly there. This tests a long-standing suspicion directly instead of assuming it.
+- `[gta3-probe] image-clear-candidate` — every single-buffer, write-only dispatch ≥ 1 MB, logged
+  *before* the strict shape checks, with format/stride/user-data size. Catches a guest clear shader
+  whose shape the matcher does not anticipate.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
