@@ -164,8 +164,13 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	// The other representation of this exact surface, kept alive but unregistered while this one is
+	// active. A guest surface used both as a depth target and as a colour storage image cannot be a
+	// single Vulkan image -- a depth format cannot carry STORAGE usage and D16 cannot be viewed as
+	// R16 -- so the pair is swapped instead of destroyed and rebuilt on every binding change.
+	ImageId  alias_id {};
+	uint64_t tick_accessed_last = 0;
+	size_t   lru_id             = 0;
 
 private:
 	friend struct ImageTestAccess;

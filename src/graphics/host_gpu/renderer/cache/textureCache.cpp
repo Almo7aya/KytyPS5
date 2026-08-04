@@ -315,9 +315,67 @@ void TextureCache::UnregisterImage(ImageId id) {
 	image.registered = false;
 }
 
+// TEMPORARY PROBE (GTA III flashing). Attributes repeated image destruction to a call site. Images
+// recreated every frame start with undefined contents, which flashes, and the churn costs allocations.
+void TextureCache::ProbeImageDelete(const char* reason, ImageId id) {
+	auto owner = ResolveOwner(id);
+	if (owner == nullptr || owner->info.data.Empty() || owner->info.extent.width < 1024) {
+		return;
+	}
+	static std::mutex                   probe_mutex;
+	static std::map<uint64_t, uint32_t> probe_seen;
+	static std::atomic<uint32_t>        probe_reports {0};
+	std::lock_guard                     probe_lock(probe_mutex);
+	const auto                          count = ++probe_seen[owner->info.data.address];
+	if (count >= 8 && count % 8 == 0 && probe_reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+		std::fprintf(stderr, "[gta3-probe] image-deleted reason=%s addr=0x%010llx times=%u %ux%u\n",
+		             reason, static_cast<unsigned long long>(owner->info.data.address), count,
+		             owner->info.extent.width, owner->info.extent.height);
+		std::fflush(stderr);
+	}
+}
+
+void TextureCache::EraseImageSlot(ImageId id) {
+	auto owner = ResolveOwner(id);
+	if (owner == nullptr) {
+		return;
+	}
+	UnregisterImage(id);
+	const auto erase_slot = [this, id, retained = owner] {
+		auto& slot = m_slots[id.index];
+		if (slot.generation != id.generation || slot.image != retained) {
+			EXIT("TextureCache: retired image slot changed before deferred erasure\n");
+		}
+		slot.image.reset();
+		if (++slot.generation == 0) {
+			slot.generation = 1;
+		}
+		m_free_slots.push_back(id.index);
+	};
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferOperation(erase_slot);
+	} else {
+		erase_slot();
+	}
+}
+
 void TextureCache::DeleteImage(ImageId id) {
 	auto owner = ResolveOwner(id);
-	if (owner == nullptr || !owner->registered) {
+	if (owner == nullptr) {
+		return;
+	}
+	// A dormant depth/colour alias is deliberately unregistered but still owns a Vulkan image, so it
+	// would never be reached by the registered-only path below and would leak with its partner.
+	if (owner->alias_id) {
+		const auto alias_id = owner->alias_id;
+		owner->alias_id     = ImageId {};
+		if (auto alias = ResolveOwner(alias_id); alias != nullptr) {
+			alias->alias_id = ImageId {};
+			ClearGpuModified(alias_id);
+			EraseImageSlot(alias_id);
+		}
+	}
+	if (!owner->registered) {
 		return;
 	}
 	if (!owner->depth_id) {
@@ -340,23 +398,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (owner->info.HasMetadata()) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
-	UnregisterImage(id);
-	const auto erase_slot = [this, id, retained = owner] {
-		auto& slot = m_slots[id.index];
-		if (slot.generation != id.generation || slot.image != retained) {
-			EXIT("TextureCache: retired image slot changed before deferred erasure\n");
-		}
-		slot.image.reset();
-		if (++slot.generation == 0) {
-			slot.generation = 1;
-		}
-		m_free_slots.push_back(id.index);
-	};
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation(erase_slot);
-	} else {
-		erase_slot();
-	}
+	EraseImageSlot(id);
 }
 
 void TextureCache::DeleteImages(std::span<const ImageId> ids,
@@ -777,6 +819,59 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	}
 }
 
+// Swaps a surface to its alias representation, creating the alias on first use. Returns the alias id
+// on success, or a null id when the pair cannot be maintained and the caller should fall back to
+// recreating the image. Only exactly-matching shapes are aliased so the blast radius stays small.
+ImageId TextureCache::SwapDepthAlias(const ImageInfo& requested, ImageId cached_id) {
+	auto& cached = ResolveImage(cached_id);
+	if (!cached.registered || cached.depth_id || cached.info.HasStencil() || requested.HasStencil()) {
+		return {};
+	}
+	// Depth/colour aliasing only makes sense for a plain single-sample 2D surface occupying exactly
+	// the same guest bytes; anything else keeps the existing recreate path.
+	if (cached.info.data != requested.data || cached.info.samples != 1 || requested.samples != 1 ||
+	    cached.info.IsVolume() || requested.IsVolume() || cached.info.resources != requested.resources ||
+	    cached.info.extent != requested.extent || cached.info.tile_mode != requested.tile_mode ||
+	    cached.info.bytes_per_block != requested.bytes_per_block ||
+	    cached.info.IsDepth() == requested.IsDepth()) {
+		return {};
+	}
+
+	auto alias_id = cached.alias_id;
+	if (alias_id) {
+		auto alias = ResolveOwner(alias_id);
+		// The alias must still describe exactly what is being asked for, and must not have been
+		// re-registered behind our back.
+		if (alias == nullptr || alias->registered || alias->info.pixel_format != requested.pixel_format ||
+		    alias->info.extent != requested.extent || alias->info.resources != requested.resources) {
+			alias_id = ImageId {};
+		}
+	}
+	if (!alias_id) {
+		alias_id = InsertImage(requested);
+		// InsertImage registers when the range is non-empty; the alias stays dormant until swapped in.
+		auto& fresh = ResolveImage(alias_id);
+		if (fresh.registered) {
+			UnregisterImage(alias_id);
+		}
+	}
+
+	auto& alias = ResolveImage(alias_id);
+	alias.usage = cached.usage;
+	// CopyImage propagates the GPU-modified flag, so the alias takes over responsibility for writing
+	// these contents back; leaving it set on the dormant side would trip DeleteImage's guard later.
+	CopyImage(alias_id, cached_id);
+	ClearGpuModified(cached_id);
+	if (cached.binding.is_bound || cached.binding.is_target) {
+		cached.binding.needs_rebind = true;
+	}
+	UnregisterImage(cached_id);
+	RegisterImage(alias_id);
+	alias.alias_id  = cached_id;
+	cached.alias_id = alias_id;
+	return alias_id;
+}
+
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = ResolveImage(cached_id);
@@ -801,9 +896,18 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	}
 	RefreshImage(cached_id,
 	             ImageDesc {.info = cached.info, .view_info = {}, .type = UploadBinding(cached)});
-	auto info                 = requested;
-	info.resources            = std::max(requested.resources, cached.info.resources);
-	info.htile_clear_mask     = 0;
+	auto info             = requested;
+	info.resources        = std::max(requested.resources, cached.info.resources);
+	info.htile_clear_mask = 0;
+
+	// A surface alternating between a depth target and a colour storage image flips on every binding
+	// change. Destroying and rebuilding it each time costs two image allocations and two conversion
+	// copies per frame per surface; GTA III does this for every shadow map. Keep the previous
+	// representation alive as an alias and swap which one is registered instead.
+	if (const auto alias_id = SwapDepthAlias(info, cached_id)) {
+		return alias_id;
+	}
+
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = ResolveImage(replacement_id);
 	replacement.usage         = cached.usage;
@@ -840,6 +944,30 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
+	}
+	{
+		// TEMPORARY PROBE: which ResolveDepthOverlap condition keeps recreating this surface.
+		static std::mutex                   probe_mutex;
+		static std::map<uint64_t, uint32_t> probe_seen;
+		static std::atomic<uint32_t>        probe_reports {0};
+		std::lock_guard                     probe_lock(probe_mutex);
+		const auto                          count = ++probe_seen[requested.data.address];
+		if (count >= 8 && count % 8 == 0 &&
+		    probe_reports.fetch_add(1, std::memory_order_relaxed) < 24) {
+			std::fprintf(stderr,
+			             "[gta3-probe] depth-overlap addr=0x%010llx times=%u binding=%u "
+			             "cached{depth=%d fmt=%u bpp=%u stencil=%d lay=%u mip=%u} "
+			             "want{depth=%d fmt=%u bpp=%u stencil=%d lay=%u mip=%u}\n",
+			             static_cast<unsigned long long>(requested.data.address), count,
+			             static_cast<uint32_t>(binding), cached.info.IsDepth() ? 1 : 0,
+			             static_cast<uint32_t>(cached.info.pixel_format),
+			             cached.info.bytes_per_block, cached.info.HasStencil() ? 1 : 0,
+			             cached.info.resources.layers, cached.info.resources.levels,
+			             requested.IsDepth() ? 1 : 0, static_cast<uint32_t>(requested.pixel_format),
+			             requested.bytes_per_block, requested.HasStencil() ? 1 : 0,
+			             requested.resources.layers, requested.resources.levels);
+			std::fflush(stderr);
+		}
 	}
 	if (copied) {
 		DeleteImages(std::array {cached_id}, cached_id);
@@ -2050,6 +2178,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		if (owner->IsGpuModified()) {
 			ClearGpuModified(id);
 		}
+		ProbeImageDelete("invalidate", id);
 		DeleteImage(id);
 	}
 }
@@ -2099,6 +2228,7 @@ void TextureCache::RunGarbageCollector() {
 				}
 				ClearGpuModified(id);
 			}
+			ProbeImageDelete("gc", id);
 			DeleteImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
