@@ -563,6 +563,75 @@ For reference, the other two routes considered:
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
 `Gameface/Content/Common/ProceduralSky/BP_GTA_ProceduralSky` is the natural first suspect.
 
+## Part 4 — missing character and vehicles (separate defect, not a renderer bug)
+
+With the DCC clear fix in place the world renders, but the player character and street vehicles are
+absent. Evidence from `_RenderDoc/kyty_frame1605.rdc` (captured with the player standing next to a car)
+and `_gta3_logs/skipdraw.log` (a `--printf-direction File` run):
+
+1. **They are not rasterised.** The G-buffer normal target `3146` contains road, kerb, bridge, distant
+   city and road markings, and no character or vehicle anywhere in frame. The albedo target `3476` is
+   entirely black, which is worth a separate look.
+2. **Kyty is not dropping them.** In the whole 620 MB log there are only two skip categories: 32×
+   `Skipping unsupported GE shader draw` (all *one* shader pair, under a `Clear Surfaces` marker) and
+   32× `skipping zero-sized dispatch` (four shaders, `groups=0x1x1`, which the guest itself asked for).
+   There are **zero** `null storage` or `unmapped` hits, so the storage-buffer clamp from `5b080c0` is
+   not collapsing skinned vertices — that hypothesis is dead.
+3. **No skinned draw exists in the frame at all.** Every base-pass draw uses the same UE4 GPU-Scene
+   static-mesh layout — `in_attr_0` = `R32G32B32_FLOAT` position at stride 12, plus a per-instance
+   `R32_UINT` id (checked on event 3727). There are no bone-weight or blend-index streams anywhere.
+
+**Correction — do not read the above as "skeletal meshes never render".** A later screenshot at frame
+2432 shows the player character rendering correctly and in full: body, arms, legs, head all present and
+correctly positioned. The three observations above are accurate *for frame 1605 specifically*, but the
+conclusion drawn from them was too strong. Whatever is happening is **intermittent and
+camera-dependent** — the user reports it appearing after moving the camera for a while — not a
+permanent absence of skeletal-mesh submission.
+
+That reframes the problem: it is not "skeletal draws are never submitted" but "skeletal draws are
+sometimes absent". Frame 1605 captured one of the bad moments. A capture taken *while the character is
+visibly missing* is what would actually pin this, and frame 1605 may already be that — but it must be
+compared against a good frame rather than treated as the steady state.
+
+Caveat on the log evidence: the skip counter caps at 32 emissions and all 32 shared one signature, so a
+*later* different signature would be invisible. Raising that cap is cheap if this needs ruling out.
+
+### Two smaller findings from the same log
+
+- **A GS-based `Clear Surfaces` pass is skipped** — `stages=0x00002030`, `gs_max_vert=3`,
+  `max_out=0xc0`, `es=0x2008ab0000`, `gs=0x2008a90000`. It is a *clear*, and this investigation has
+  shown how much damage a missing clear does, so it is a plausible contributor to remaining lighting
+  oddities. Same class of unsupported ES+GS draw that the stalled
+  `graphics-gs-writetoslice-volume` branch was built for.
+- **Depth bias is not implemented** — 8× `ignoring polygon offset context register (depth bias not
+  implemented)`. That produces shadow acne and decal z-fighting, which reads as "lighting looks off".
+
+### Dithered opacity is not resolving (frame 2432 screenshot)
+
+In the frame where the character does render, its shorts and legs show a strong regular stipple /
+checkerboard pattern, and the earlier daylight frame showed heavy blocky dithering across the whole
+image. Unreal uses **dithered opacity** for LOD fade and masked materials and relies on **TAA** to
+resolve it into smooth coverage. A persistent stipple is the classic signature of TAA not accumulating.
+
+That is consistent with the pipeline already mapped in Part 1: TAA is a compute dispatch (event 2113 in
+`kyty_frame2404.rdc`) reading scene colour plus a history target and writing the post-TAA colour. Worth
+checking whether its history input is valid across frames, and whether its output is the surface the
+rest of the chain consumes. A stray teal curved line across the same frame is unexplained and may be
+unrelated.
+
+### Capturing now crashes
+
+RenderDoc capture reportedly crashes the emulator as of this build, which blocks the obvious next step.
+That needs fixing (or working around) before the intermittent-character and dithering issues can be
+investigated properly.
+
+### A caution recorded for future work
+
+Post-VS output is not a reliable visibility test on its own here. Draw 3709 looked clipped (`w` negative
+on its first vertices), but draw 3116 — which demonstrably renders — has the same constant `z = 10.0`
+and off-screen leading vertices. Sampling the first few vertices of a mesh says nothing about whether
+the draw covers pixels.
+
 ### Why the config route was abandoned
 
 The title's exposure settings are **not shipped as `.ini` anywhere**:
