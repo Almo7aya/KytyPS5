@@ -20,6 +20,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -32,8 +33,65 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+constexpr uint32_t ColorGradingLutSize     = 32;
 
 thread_local const TextureCache* g_locked_cache = nullptr;
+
+bool IsEmptyColorGradingLut(const ImageInfo& info) {
+	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+	    info.extent != vk::Extent3D {ColorGradingLutSize, ColorGradingLutSize,
+	                                ColorGradingLutSize} ||
+	    info.resources.levels != 1 ||
+	    static_cast<Prospero::TileMode>(info.tile_mode) != Prospero::TileMode::kRenderTarget ||
+	    info.data.Empty() || info.data.size > std::numeric_limits<size_t>::max()) {
+		return false;
+	}
+
+	std::vector<uint8_t> backing(static_cast<size_t>(info.data.size));
+	return LibKernel::Memory::TryReadBacking(info.data.address, backing.data(), info.data.size) &&
+	       std::all_of(backing.begin(), backing.end(), [](uint8_t byte) { return byte == 0; });
+}
+
+float DecodeUnrealLogColor(float encoded) {
+	// UE addresses its combined color-grading LUT in logarithmic scene-color space. A raw RGB
+	// identity cube would therefore return the logarithmic address and crush ordinary scene colors.
+	constexpr float LinearRange = 14.0f;
+	constexpr float LinearGrey  = 0.18f;
+	constexpr float LogGrey     = 444.0f / 1023.0f;
+	const float     black       = std::exp2(-LogGrey * LinearRange) * LinearGrey;
+	return std::max(std::exp2((encoded - LogGrey) * LinearRange) * LinearGrey - black, 0.0f);
+}
+
+float NeutralFilmicToSrgb(float linear) {
+	// Supply only the essential log decode, neutral filmic highlight rolloff, and display transfer;
+	// game-specific grading remains absent until the geometry-shader CombineLUT pass is supported.
+	const float mapped =
+	    std::clamp(linear * (2.51f * linear + 0.03f) /
+	                   (linear * (2.43f * linear + 0.59f) + 0.14f),
+	               0.0f, 1.0f);
+	return mapped <= 0.0031308f ? mapped * 12.92f
+	                           : 1.055f * std::pow(mapped, 1.0f / 2.4f) - 0.055f;
+}
+
+std::vector<uint32_t> BuildNeutralColorGradingLut() {
+	std::vector<uint32_t> lut(ColorGradingLutSize * ColorGradingLutSize *
+	                          ColorGradingLutSize);
+	for (uint32_t blue = 0; blue < ColorGradingLutSize; ++blue) {
+		for (uint32_t green = 0; green < ColorGradingLutSize; ++green) {
+			for (uint32_t red = 0; red < ColorGradingLutSize; ++red) {
+				const auto encode = [](uint32_t value) {
+					const float log_color = static_cast<float>(value) /
+					                        static_cast<float>(ColorGradingLutSize - 1u);
+					const float display = NeutralFilmicToSrgb(DecodeUnrealLogColor(log_color));
+					return static_cast<uint32_t>(std::lround(display * 1023.0f));
+				};
+				lut[(blue * ColorGradingLutSize + green) * ColorGradingLutSize + red] =
+				    encode(red) | (encode(green) << 10u) | (encode(blue) << 20u) | (3u << 30u);
+			}
+		}
+	}
+	return lut;
+}
 
 class CacheLock final {
 public:
@@ -1111,13 +1169,31 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	bool       data_imported = false;
 	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto source =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source.buffer == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		if (desc.type == BindingType::Texture && IsEmptyColorGradingLut(image.info)) {
+			auto       plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+			const auto lut  = BuildNeutralColorGradingLut();
+			EXIT_NOT_IMPLEMENTED(!plan.valid || lut.size() * sizeof(uint32_t) !=
+			                                       plan.layout.slice_stride * image.info.extent.depth);
+			const auto source =
+			    m_buffer_cache.UploadTransient(lut.data(), lut.size() * sizeof(uint32_t), 16);
+			for (auto& copy: plan.regions) {
+				copy.bufferOffset += source.offset;
+			}
+			image.Upload(plan.regions, source.buffer, source.offset,
+			             lut.size() * sizeof(uint32_t));
+			LOGF("TextureCache: initialized empty 32x32x32 color-grading LUT with neutral "
+			     "log/filmic fallback at 0x%016" PRIx64 "\n",
+			     image.info.data.address);
+			data_imported = true;
+		} else {
+			const auto source =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			if (source.buffer == nullptr) {
+				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			data_imported = true;
+			UploadImage(image, desc, *source.buffer, source.offset);
 		}
-		data_imported = true;
-		UploadImage(image, desc, *source.buffer, source.offset);
 	}
 	if (data_imported) {
 		image.ClearBufferModified();
