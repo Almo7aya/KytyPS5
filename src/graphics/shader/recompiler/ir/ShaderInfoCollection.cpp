@@ -172,8 +172,11 @@ void CollectOutputs(const Program& program, const ShaderPixelInputInfo* pixel, S
 			}
 			switch (inst.export_info.kind) {
 				case ExportTargetKind::Position:
-					AddOutput(info, StageOutputKind::Position, inst.export_info.index, 0,
-					          "out_position");
+					// POS0 is gl_Position. POS1-POS3 are separate built-ins and must not register
+					// as the clip-space position output.
+					if (inst.export_info.index == 0) {
+						AddOutput(info, StageOutputKind::Position, 0, 0, "out_position");
+					}
 					break;
 				case ExportTargetKind::Parameter:
 					AddOutput(info, StageOutputKind::Parameter, inst.export_info.index,
