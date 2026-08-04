@@ -261,11 +261,7 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
 	if (exp.kind == IR::ExportTargetKind::Position) {
-		// Only POS0 is the clip-space position. POS1-POS3 contain miscellaneous
-		// vertex exports such as point size, layer/viewport indices, and clip or
-		// cull distances. Mapping them to gl_Position makes their ordering decide
-		// whether an otherwise valid position is overwritten.
-		return exp.index == 0 ? state.per_vertex_variable : 0;
+		return state.per_vertex_variable;
 	}
 	if (exp.kind == IR::ExportTargetKind::MrtZ) {
 		return state.depth_variable;
