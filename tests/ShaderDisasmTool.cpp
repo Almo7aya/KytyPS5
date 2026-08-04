@@ -8,6 +8,7 @@
 // Usage: shader_disasm <file.bin> [...]
 
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
+#include "graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -84,8 +85,13 @@ int main(int argc, char** argv) {
 				       inst.unsupported_reason.c_str());
 			}
 		}
-		printf("---- %zu instructions, %u unsupported ----\n\n", program.instructions.size(),
+		printf("---- %zu instructions, %u unsupported ----\n", program.instructions.size(),
 		       unsupported);
+
+		// If this is a passthrough WriteToSlice geometry shader, report the ESGS ring offset ->
+		// export map that the ES store retargeting needs.
+		printf("%s\n", WriteToSlice::RingMapToString(WriteToSlice::AnalyzePassthroughGs(program))
+		                   .c_str());
 	}
 
 	return failures == 0 ? 0 : 1;

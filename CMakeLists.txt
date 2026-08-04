@@ -429,6 +429,7 @@ add_executable(shader_disasm EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/MemoryOps.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ImageOps.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.cpp"
 )
 target_link_libraries(shader_disasm fmt::fmt)
 target_include_directories(shader_disasm PRIVATE ${inc_headers})
