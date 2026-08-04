@@ -436,6 +436,101 @@ discard its rendered contents and re-upload from guest backing. Scene colour mea
 frame, so it is probably landing on the *other* full-res `R11G11B10` surface rather than the live one —
 but the mechanism is capable of destroying a rendered target and deserves its own look.
 
+## Part 3 — root cause found: the DCC clear code carries the colour
+
+A PM4 command-buffer dump (`--command-buffer-dump true`, 2200 frames, `_gta3_logs/pm4`) settled it.
+
+### The surface is bound every frame and never cleared by anything visible
+
+In frame 2199's DCB, `CB_COLOR0_BASE` (offset `0x318`) is written with `0x20452c00`, i.e. surface
+`0x20452c0000` — the separate-translucency target. The same register burst writes `0x31b` (VIEW),
+`0x31c` (INFO = `0x10040730`, DCC bit 28 set), `0x31e` (DCC_CONTROL = `0x00180028`), `0x31f`, `0x321`
+— and **never `0x323`/`0x324` (CLEAR_WORD0/1)**, confirming the probe from the guest side.
+
+The same base appears with a stable 4 hits per frame at frames 300, 600, 900, 1200, 1500, 1800, 2199,
+so the surface is reused every frame at a fixed address. And nothing writes it: no `0x452c0000` (raw
+address, i.e. a `V#` or DMA destination) anywhere in the DCB, the four indirect buffers (`ci`), the
+async compute buffer (`a`), or the `cc` buffer. `find_draws` on the target returns exactly four draws
+— 972, 426, 612 and 12000 indices — all real geometry, so there is no fullscreen clear quad either.
+
+**Consequence: in Kyty the buffer accumulates across frames.** Each frame loads the previous contents,
+then translucency draws blend in — RGB adds up while alpha decays multiplicatively toward zero. That
+is why the world looked acceptable at frame ~1167 (night screenshot) and was destroyed by frame ~9117
+(daylight): alpha had decayed to 0 and RGB had accumulated to the 0.21 grey measured on the ground.
+
+### The clear is a DCC metadata fill, and the code encodes the colour
+
+The DCC address for that surface is `0x20492d0000`. Searching for its raw form `0x492d0000` finds one
+hit, at line 408 of the frame-2199 DCB:
+
+```
+IT_SET_SH_REG (OP:0x76) CNT:9
+  0x00000240      <- user-data register base
+  0x492d0000      <- V# base_lo
+  0x00040020      <- base_hi = 0x0020, stride = 4   => 0x20492d0000
+  0x0000e000      <- num_records = 57344            => 229,376 bytes (0x38000)
+  0x00014204
+IT_DISPATCH_DIRECT (OP:0x15) groups = 896 x 1 x 1, mode = 0x41
+```
+
+In the RenderDoc capture this is **dispatch 12437**, immediately before the separate-translucency pass
+at 12481. Its target buffer `ResourceId::32118` is exactly **229,376 bytes**, matching the `V#`. An
+earlier pass over this investigation dismissed that dispatch for writing a buffer "under 8 MB" while
+hunting a ~50 MB surface fill — that was the mistake: DCC metadata for this surface is only 224 KB.
+
+Reading the buffer after the dispatch, at both offset 0 and offset `0x37FE0`:
+
+```
+00000000: 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40
+00037fe0: 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40 40
+```
+
+Uniform `0x40` across all 229,376 bytes. On GFX9/GFX10 the DCC clear codes are byte-replicated and
+**encode the clear colour directly**:
+
+| DCC code | Meaning |
+| --- | --- |
+| `0x00` | clear to `(0,0,0,0)` |
+| **`0x40`** | **clear to `(0,0,0,1)`** |
+| `0x80` | clear to `(1,1,1,0)` |
+| `0xC0` | clear to `(1,1,1,1)` |
+| `0x20` | clear to the value in `CB_COLOR#_CLEAR_WORD0/1` |
+| `0xFF` | uncompressed — *not* a clear |
+
+So the guest asks for exactly `(0,0,0,1)`, and it does so **without** programming the clear-word
+registers, because for constant-encoded codes the hardware does not consult them. That is precisely
+why `cw0 = cw1 = 0` and why chasing the clear-word registers was a dead end.
+
+### Why each previous state was wrong
+
+- `b38962b` correctly detected the metadata clear and correctly turned it into an attachment clear, but
+  then took the colour from `CB_COLOR#_CLEAR_WORD0/1` **unconditionally** — which for a constant-encoded
+  clear are meaningless zeros. Result: `(0,0,0,0)`, alpha 0, black world.
+- The revert performs no clear at all. Result: cross-frame accumulation, alpha decaying to 0 and RGB
+  building up. Better early in a session, worse the longer you play.
+
+### The fix
+
+Decode the DCC clear code and derive the colour from it, per the table above. This also resolves the
+safety concern recorded earlier in this document: only recognised *clear* codes become attachment
+clears, and `0xFF` (a DCC initialise/decompress) explicitly must not — which was invariant #1.
+
+One implementation question remains: **how Kyty obtains the code.** The fill is a compute dispatch that
+splats a dword read from another buffer (`buffers[0]`), and `TryConsumeComputeMetaClear`
+(`renderCompute.cpp:64-75`) currently *skips* that dispatch, so the value is never observed. Options:
+
+1. **Read the fill source.** The shader computes its value as `buffers[0][(vsharp[8] >> 2) & 63]`, and
+   Kyty already decodes both descriptors plus `resources.user_data` in that function, so it can
+   `TryReadBacking` the source dword. Cheap and synchronous, but keyed to this shader shape — though
+   note `ResolveComputeImageClear` is already shape-specific in exactly this way.
+2. **Let the dispatch execute** and read the DCC byte from guest backing at render-target bind time.
+   More general, but the GPU write has to reach guest backing first, which costs a download per target
+   per frame and introduces a one-frame lag.
+3. **CP DMA path.** `BufferCache::FillBuffer` already receives the value directly, so titles that clear
+   metadata by DMA need no extra work — worth wiring up regardless of which option above is chosen.
+
+Option 1 is the cheapest correct route for this title; option 2 is the more general mechanism.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
