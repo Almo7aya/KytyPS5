@@ -243,15 +243,52 @@ filled value at each `TextureCache::ClearMeta` hit.
 
 ## Still open
 
-The world renders, but the verified frame was at in-game 04:11 (night), so brightness could not be
-judged. Two things to check on a daylight frame before calling this finished:
+### Brightness — probably not a defect
 
-- **Overall exposure.** Scene colour measured mean ≈ 0.004 with the eye-adaptation buffer reading
-  1.2656. If Unreal's auto-exposure is not adapting, night scenes would come out roughly an order of
-  magnitude too dark. Worth confirming against a daytime frame, where the scene should be far brighter
-  before tonemapping.
-- **A hard-edged blue rectangle in the upper sky** in the verified screenshot. Straight-edged sky
-  patches are not a natural cloud/skybox result and may indicate a separate broken draw.
+The verified frame was at in-game 04:11 (night). The evidence available says auto-exposure is
+*working*, and the darkness is expected rather than a bug:
+
+- The eye-adaptation buffer (resource 4451, 1×1 `R32G32B32A32_FLOAT`) reads **1.2656**. That is a
+  non-trivial converged value — a broken or unwired adaptation pass would sit at exactly 1.0 or 0.
+- Unreal's default auto-exposure clamp is `AutoExposureMinBrightness = 0.03`,
+  `AutoExposureMaxBrightness = 2.0`. 1.2656 sits comfortably inside that range, so exposure is not
+  saturated against a limit.
+- With max exposure capped at 2.0, a scene whose average luminance is ≈ 0.004 *cannot* be brought up
+  to mid-grey. A 4 AM scene therefore renders close to black by design, with only street lights,
+  vehicle lights and the sky above the noise floor — which is exactly what the verified screenshot
+  shows.
+
+A daylight frame would confirm this in one step, but this is no longer the leading suspect.
+
+### The sky rectangle — the real loose end
+
+A hard-edged blue rectangle in the upper sky in the verified screenshot. Straight-edged sky patches
+are not a natural cloud/skybox result and may indicate a separate broken draw.
+`Gameface/Content/Common/ProceduralSky/BP_GTA_ProceduralSky` is the natural first suspect.
+
+### Why the config route was abandoned
+
+The title's exposure settings are **not shipped as `.ini` anywhere**:
+
+- The pak contains exactly **10** `.ini` files in total (verified by extracting with `-Filter="*.ini"`):
+  eight under `Engine/Config` or `Engine/Platforms`, plus `Gameface/Config/DefaultInput.ini` (78 bytes)
+  and `OriginalData/GTA3/gta3.ini` (10 bytes). There is no `DefaultEngine.ini`,
+  no `DefaultScalability.ini`, and no cooked `Gameface/Config/PS5/PS5Engine.ini`.
+- Nothing on disk outside the pak either — only `crashreportclient.ini` and a manifest.
+- The config is not baked into `eboot.bin` as ini text: Ghidra finds no `[/Script/...]` section header
+  anywhere, and `RendererSettings` appears only as the `URendererSettings` class name string.
+
+So the intended exposure values are not recoverable from shipped data by any of the three routes
+tried. Measuring a daylight frame is the only cheap way to check exposure behaviour.
+
+### UnrealPak filter caveat
+
+`UnrealPak <pak> -Extract <dir> -Filter="a,b,c"` **only honoured the first comma-separated pattern** in
+this build. A run with `-Filter="*.ini,*GTA3World.umap,*ProceduralSky*,*PostProcess*,*TimeOfDay*,*Weather*"`
+extracted the 10 `.ini` files and nothing else, even though `BP_GTA_ProceduralSky.uexp` is known to be
+present. Run one pattern per invocation. Also note an earlier unfiltered-ish extraction produced 4,992
+`.uexp` against only 5 `.uasset`, so asset headers need to be requested explicitly — and a `.uexp`
+without its `.uasset` header cannot be parsed.
 
 ## What the guest binary can and cannot tell us (Ghidra)
 
