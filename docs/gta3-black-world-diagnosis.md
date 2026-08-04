@@ -374,6 +374,68 @@ candidates:
   *before* the strict shape checks, with format/stride/user-data size. Catches a guest clear shader
   whose shape the matcher does not anticipate.
 
+### Round 2 results — every clear mechanism eliminated
+
+Second instrumented run, `_gta3_logs/probe_round2.stderr.log`:
+
+| Probe | Result |
+| --- | --- |
+| `rejected-nonuniform-image-clear` | **none** |
+| `image-clear-candidate` | **none** |
+| `formatted-write-aliases-image` | `vaddr=0x2032eb0000 size=0x18d8000` (~24.8 MB), 32× |
+| `raw-write-aliases-image` | only 0x48000–0x240000 ranges (288 KB – 2.25 MB) |
+
+Two hypotheses died here:
+
+- **The uniform-dword rejection theory is wrong.** `ResolveComputeImageClear` never rejected a
+  non-uniform 128-bit fill, so the `(0,0,0,1)` → `{0,0x3C000000,0,0x3C000000}` idea — carried for most
+  of this investigation — is simply not what happens.
+- **There is no compute surface clear at all.** `image-clear-candidate` logs *every* single-buffer
+  write-only dispatch ≥ 1 MB before any shape checks, and it never fired.
+
+And inspecting the capture directly kills the last one:
+
+- **There is no clear quad.** Pass 8's draws are all real translucent geometry — event 12481 is 972
+  vertices with BC5 normal maps, volumetric fog volumes and a shadow map; event 12553 is 12,000
+  vertices. Neither is a 3-vertex fullscreen clear. The depth-test failure seen in `pixel_history` at
+  12553 is ordinary geometry occlusion, not a failed clear.
+
+So, exhaustively: no fast-clear colour (`cw0=cw1=0`), no compute image clear, no raw surface-sized
+write, no clear quad. **Kyty observes no guest clear of the separate-translucency surface by any
+mechanism.**
+
+### The composite model is confirmed exactly
+
+At (1600, 1400) in frame 9321:
+
+```
+3419 (separate translucency) = (0.205688, 0.216553, 0.228027, a = 0.0)
+3530 (composite output)      = (0.205078, 0.214844, 0.226562)
+```
+
+The output equals the translucency RGB to within `R11G11B10` quantisation. `out = A*SceneColor*X + C`
+with `A = 0` reduces to `out = C`, so the scene contributes **exactly nothing**. The composite draw
+(event 12578) binds `32099` (scene), `649` (1×1) and `3419` — same structure as the night frame, so
+this is not a per-frame anomaly.
+
+### Where this now stands
+
+The immediate cause is certain and narrow: **the separate-translucency attachment must start at
+`(0,0,0,1)` and Kyty never initialises it.** What is *not* yet known is how the guest expresses that
+initialisation, and every cheap instrument is now exhausted.
+
+The next step is a verbose PM4 run — `--printf-direction File` with graphics debug dump enabled — to
+inspect the command stream immediately before the separate-translucency pass and look for a
+clear-related packet Kyty currently ignores. Kyty already logs a number of "temporary: ignoring …"
+cases, so the packet may already be reported and simply unhandled.
+
+Worth following up separately: the `formatted-write-aliases-image` hit. A ~24.8 MB formatted GPU write
+over the surface at `0x2032eb0000` (a full-res `R11G11B10`, i.e. scene-colour shaped) causes
+`InvalidateMemoryFromGPU` to call `ClearGpuModified` + `MarkBufferModified`, which makes that host image
+discard its rendered contents and re-upload from guest backing. Scene colour measured healthy in this
+frame, so it is probably landing on the *other* full-res `R11G11B10` surface rather than the live one —
+but the mechanism is capable of destroying a rendered target and deserves its own look.
+
 ### The sky rectangle
 
 Still unexplained: a hard-edged blue rectangle in the upper sky, visible in both screenshots.
