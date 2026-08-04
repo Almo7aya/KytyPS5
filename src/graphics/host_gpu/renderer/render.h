@@ -164,8 +164,8 @@ private:
 	static constexpr uint32_t OcclusionQuerySlots = 2048;
 
 	struct PendingZPass {
-		void*   address = nullptr;
-		int32_t slot    = -1;
+		uint64_t address = 0;
+		int32_t  slot    = -1;
 	};
 
 	vk::QueryPool             m_occlusion_pool      = nullptr;

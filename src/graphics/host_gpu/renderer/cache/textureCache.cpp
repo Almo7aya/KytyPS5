@@ -21,8 +21,10 @@
 #include <bit>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -242,6 +244,28 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		EXIT("TextureCache: occupied free image slot\n");
 	}
 	slot.image = std::make_shared<Image>(m_graphics, m_scheduler, info);
+	// TEMPORARY PROBE (GTA III flashing). A host image recreated at an address it already occupied
+	// starts with undefined contents, which is what a per-frame ping-pong pair would look like from
+	// the outside. Report repeat creations at the same guest address, ignoring first sightings.
+	if (!info.data.Empty() && info.extent.width >= 256) {
+		static std::mutex                     probe_mutex;
+		static std::map<uint64_t, uint32_t>   probe_seen;
+		static std::atomic<uint32_t>          probe_reports {0};
+		std::lock_guard                       probe_lock(probe_mutex);
+		// Only repeated recreation matters. An address reused once or twice is ordinary pool churn
+		// and would otherwise consume the whole report budget during level load; a per-frame
+		// ping-pong buffer climbs without bound.
+		const auto count = ++probe_seen[info.data.address];
+		if (count >= 8 && count % 8 == 0 &&
+		    probe_reports.fetch_add(1, std::memory_order_relaxed) < 48) {
+			std::fprintf(stderr,
+			             "[gta3-probe] image-recreated addr=0x%010llx times=%u fmt=%u %ux%u\n",
+			             static_cast<unsigned long long>(info.data.address), count,
+			             static_cast<uint32_t>(info.pixel_format), info.extent.width,
+			             info.extent.height);
+			std::fflush(stderr);
+		}
+	}
 	const ImageId id {index, slot.generation};
 	if (!info.data.Empty()) {
 		RegisterImage(id);

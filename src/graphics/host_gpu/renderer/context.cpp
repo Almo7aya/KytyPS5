@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vma.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "kernel/memory.h"
 
 #include <algorithm>
 #include <atomic>
@@ -165,7 +166,7 @@ bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 			ProbeReportZPass();
 			return false;
 		}
-		m_pending_z_pass.push_back({dst_gpu_addr, slot});
+		m_pending_z_pass.push_back({reinterpret_cast<uint64_t>(dst_gpu_addr), slot});
 		m_occlusion_last_slot = -1;
 		g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
 		ProbeReportZPass();
@@ -181,7 +182,7 @@ bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 	// Begin dump: the guest reads this as the counter value before the draw, so it resolves to zero
 	// and the difference against the end dump is the visible-pixel count. Only arm here; the render
 	// pass does not exist yet.
-	m_pending_z_pass.push_back({dst_gpu_addr, -1});
+	m_pending_z_pass.push_back({reinterpret_cast<uint64_t>(dst_gpu_addr), -1});
 	m_occlusion_armed     = true;
 	m_occlusion_last_slot = -1;
 	g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
@@ -234,7 +235,11 @@ void CommandBuffer::ResolveZPassCounters() {
 			value = results[static_cast<size_t>(pending.slot)];
 			(value == 0 ? g_zpass_occluded : g_zpass_visible).fetch_add(1, std::memory_order_relaxed);
 		}
-		std::memcpy(pending.address, &value, sizeof(value));
+		// This runs from the fence-release path, which can be reached while the buffer cache lock is
+		// held. A raw store into write-watched guest memory would fault there and the handler would
+		// re-enter the cache, tripping its recursive-acquisition guard. Go through the backing store
+		// instead, exactly as BufferCache::PublishDownloads does for GPU readback.
+		Libs::LibKernel::Memory::WriteBacking(pending.address, &value, sizeof(value));
 	}
 	ResetZPassCounters();
 }
