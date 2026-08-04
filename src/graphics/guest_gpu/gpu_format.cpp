@@ -38,6 +38,12 @@ constexpr FormatInfo kFormatInfo[] = {
     {GpuEnumValue(BufferFormat::k16_16SInt), 4, 0, 4, false, false},
     {GpuEnumValue(BufferFormat::k16_16Float), 4, 0, 4, true, false},
     {GpuEnumValue(BufferFormat::k11_11_10Float), 4, 0, 4, true, false},
+    // Same 32-bit 11:11:10 packing as the float variant, so every size/tiling calculation is
+    // identical; without an entry here NumBytesPerElement returns 0 and TileGetTextureSize aborts
+    // with "unknown format". Vulkan has no integer 11:11:10 image format, so the sampled view is
+    // reinterpreted as B10G11R11_UFLOAT (see vulkanCommon.cpp) -- bit-identical, but the numeric
+    // interpretation differs, so it is flagged as a float format rather than an integer one.
+    {GpuEnumValue(BufferFormat::k11_11_10UInt), 4, 0, 4, true, false},
     {GpuEnumValue(BufferFormat::k10_10_10_2UNorm), 4, 0, 4, true, false},
     {GpuEnumValue(BufferFormat::k10_10_10_2UInt), 4, 0, 4, true, true},
     {GpuEnumValue(BufferFormat::k8_8_8_8UNorm), 4, 0, 4, true, false},
