@@ -1400,6 +1400,31 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	TrackImage(id);
 	auto& image = ResolveImage(id);
+	// TEMPORARY PROBE (GTA III flashing/darkness). A 1x1 constant texture sampled by the tonemapper
+	// read (0,0,0,1) on a black frame where working frames read (1,1,1,1). This reports what the
+	// guest backing actually holds alongside the upload state, which separates "Kyty lost the
+	// contents" from "the guest really did write black".
+	if (image.info.extent.width <= 4 && image.info.extent.height <= 4 && !image.info.data.Empty()) {
+		static std::mutex                   probe_mutex;
+		static std::map<uint64_t, uint32_t> probe_seen;
+		static std::atomic<uint32_t>        probe_reports {0};
+		std::lock_guard                     probe_lock(probe_mutex);
+		const auto                          count = ++probe_seen[image.info.data.address];
+		if (count <= 2 && probe_reports.fetch_add(1, std::memory_order_relaxed) < 40) {
+			uint32_t guest = 0;
+			const bool ok  = LibKernel::Memory::TryReadBacking(image.info.data.address, &guest,
+			                                                   sizeof(guest));
+			std::fprintf(stderr,
+			             "[gta3-probe] tiny-refresh addr=0x%010llx %ux%u fmt=%u guest=%s0x%08x "
+			             "cpu_dirty=%d maybe=%d buf_mod=%d gpu_mod=%d\n",
+			             static_cast<unsigned long long>(image.info.data.address),
+			             image.info.extent.width, image.info.extent.height,
+			             static_cast<uint32_t>(image.info.pixel_format), ok ? "" : "unreadable:",
+			             guest, image.IsDefinitelyCpuDirty() ? 1 : 0, image.IsMaybeCpuDirty() ? 1 : 0,
+			             image.IsBufferModified() ? 1 : 0, image.IsGpuModified() ? 1 : 0);
+			std::fflush(stderr);
+		}
+	}
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
