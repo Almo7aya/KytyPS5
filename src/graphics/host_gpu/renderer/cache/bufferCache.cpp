@@ -571,14 +571,21 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	// Restricted to read-only buffers on purpose: force-uploading one the GPU writes would overwrite its
 	// results with whatever guest memory happens to hold. Costs a full re-upload per bind, so it is a
 	// diagnostic, not a candidate default.
+	// Goes through TryReadBacking rather than dereferencing the guest address. Reading tracked guest
+	// memory from here faults, the handler re-enters this cache, and the recursive-acquisition guard
+	// aborts - which is exactly what the first version of this switch did. The normal path below is safe
+	// only because ForEachUploadRange prepares the pages before its callback reads them.
 	static const bool force_upload = std::getenv("KYTY_FORCE_BUFFER_UPLOAD") != nullptr;
-	if (force_upload && is_read && !is_written) {
-		Upload(command, *cached.buffer, cached.buffer->Offset(vaddr),
-		       reinterpret_cast<const void*>(vaddr), size);
-		if (is_formatted) {
-			(void)SynchronizeBufferFromImage(*cached.buffer, vaddr, size);
+	constexpr uint64_t ForceUploadMaxBytes = 32u * 1024u * 1024u;
+	if (force_upload && is_read && !is_written && size <= ForceUploadMaxBytes) {
+		std::vector<uint8_t> staging(static_cast<size_t>(size));
+		if (Libs::LibKernel::Memory::TryReadBacking(vaddr, staging.data(), size)) {
+			Upload(command, *cached.buffer, cached.buffer->Offset(vaddr), staging.data(), size);
+			if (is_formatted) {
+				(void)SynchronizeBufferFromImage(*cached.buffer, vaddr, size);
+			}
+			return {cached.buffer, cached.buffer->Handle(), cached.buffer->Offset(vaddr)};
 		}
-		return {cached.buffer, cached.buffer->Handle(), cached.buffer->Offset(vaddr)};
 	}
 
 	m_memory_tracker.ForEachUploadRange(
