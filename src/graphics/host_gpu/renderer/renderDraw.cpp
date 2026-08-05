@@ -707,24 +707,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				EXIT("failed to consume DCC clear state\n");
 			}
 		}
-
-		// TEMPORARY. Points the metadata-clear trace at the velocity surface.
-		//
-		// Identified by format and extent rather than address, because addresses move between runs but
-		// R16G16B16A16_UNORM at full resolution is unique to it - and every attempt to find it by dumping
-		// all surfaces saturated, since it is allocated after dozens of transient ones.
-		if (target.desc.info.pixel_format == vk::Format::eR16G16B16A16Unorm &&
-		    target.extent.width > 1024 && metadata_address != 0) {
-			TextureCache::ProbeSetMetaFilter(metadata_address);
-			static std::atomic<uint32_t> reported {0};
-			if (reported.fetch_add(1, std::memory_order_relaxed) == 0) {
-				std::fprintf(stderr,
-				             "[surface] velocity base=0x%010" PRIx64 " %ux%u meta=0x%010" PRIx64 "\n",
-				             target.desc.info.data.address, target.extent.width, target.extent.height,
-				             metadata_address);
-				std::fflush(stderr);
-			}
-		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);

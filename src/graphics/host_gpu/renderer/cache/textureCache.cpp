@@ -34,8 +34,6 @@ namespace Libs::Graphics {
 
 namespace {
 
-// TEMPORARY metadata-clear lifecycle probe; defined further down, next to ClearMeta.
-void ProbeMeta(const char* what, uint64_t address, uint32_t code, int flag);
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 constexpr uint32_t ColorGradingLutSize     = 32;
@@ -415,7 +413,6 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	m_download_images.erase(id);
 	if (owner->info.HasMetadata()) {
-		ProbeMeta("erase", owner->info.metadata.range.address, 0, 0);
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
 	EraseImageSlot(id);
@@ -1667,14 +1664,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id, desc);
 	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
 		image.info.metadata = desc.info.metadata;
-		const auto inserted =
-		    m_surface_metas.try_emplace(desc.info.metadata.range.address, MetaDataInfo {}).second;
-		// A fresh entry means any clear recorded before this point is gone: try_emplace starts
-		// clear_mask at zero. If this keeps reporting inserted=1 for the same address the entry is being
-		// erased and rebuilt underneath the clear.
-		if (inserted) {
-			ProbeMeta("register", desc.info.metadata.range.address, 0, 1);
-		}
+		m_surface_metas.try_emplace(desc.info.metadata.range.address, MetaDataInfo {});
 	}
 	CommitGpuWrite(image);
 	image.usage.render_target = true;
@@ -2200,48 +2190,13 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-// TEMPORARY. GTA III's velocity surface is bound thousands of times and never clears, and the previous
-// round guessed at which path was failing instead of measuring it. These three sites are the whole
-// lifecycle of a metadata clear: something asks for one, the entry is registered, the entry is erased.
-// Whichever of them does or does not happen for a given metadata address is the answer.
-namespace {
-std::atomic<uint64_t> g_probe_meta_filter {0};
-
-void ProbeMeta(const char* what, uint64_t address, uint32_t code, int flag) { // NOLINT
-	// Only the one surface being investigated. Every previous version of this dumped all addresses and
-	// saturated: BufferCache::FillBuffer routes every DMA fill through ClearMeta, so unregistered
-	// addresses are the normal case, and the surface of interest is allocated late enough that the window
-	// had always closed before it appeared.
-	const auto filter = g_probe_meta_filter.load(std::memory_order_relaxed);
-	if (filter == 0 || address != filter) {
-		return;
-	}
-	std::fprintf(stderr, "[meta] %s addr=0x%010llx code=0x%02x flag=%d\n", what,
-	             static_cast<unsigned long long>(address), code, flag);
-	std::fflush(stderr);
-}
-} // namespace
-
-void TextureCache::ProbeSetMetaFilter(uint64_t address) {
-	uint64_t expected = 0;
-	if (g_probe_meta_filter.compare_exchange_strong(expected, address,
-	                                                std::memory_order_relaxed)) {
-		std::fprintf(stderr, "[meta] tracing metadata 0x%010llx\n",
-		             static_cast<unsigned long long>(address));
-		std::fflush(stderr);
-	}
-}
-
 bool TextureCache::ClearMeta(uint64_t address, uint32_t clear_code, bool clear_code_valid) {
 	std::lock_guard transaction(m_resource_mutex);
 	CacheLock       lock(*this, m_lock);
 	const auto      found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
-		// Something cleared metadata Kyty never registered, so the clear is dropped on the floor.
-		ProbeMeta("clear-unregistered", address, clear_code & 0xffu, clear_code_valid ? 1 : 0);
-		return false;
+			return false;
 	}
-	ProbeMeta("clear", address, clear_code & 0xffu, clear_code_valid ? 1 : 0);
 	found->second.clear_mask       = UINT32_MAX;
 	found->second.clear_code       = clear_code;
 	found->second.clear_code_valid = clear_code_valid;

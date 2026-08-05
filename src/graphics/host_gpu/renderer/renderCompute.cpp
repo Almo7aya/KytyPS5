@@ -46,6 +46,55 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	return stride == 0 ? records : records * stride;
 }
 
+// Recovers the constant a metadata fill stores when it does not read the value from a companion buffer.
+//
+// A clear to zero needs no companion: the shader just writes an immediate. The read-only-buffer route
+// below cannot see that, so the clear was recorded with no code, MetaClearCode then reported none, and
+// AcquireRenderTargets took neither the constant-encoded branch nor the clear-register branch - it set no
+// clear and consumed the state anyway. GTA III's velocity surface is cleared exactly this way: 456 clears
+// in one session, every one recorded with clear_code_valid false and thrown away, which left the buffer
+// accumulating the previous frames' silhouettes.
+//
+// This reads the value the shader actually writes rather than assuming one, which matters because 0x00
+// (clear to black) and 0xff (uncompressed, i.e. a decompress that must not become a clear) are both
+// plausible constant fills. Ambiguity is rejected: more than one distinct stored immediate returns false
+// and the caller keeps today's behaviour.
+static bool TryRecoverStoredImmediate(const ShaderRecompiler::IR::Program& program, uint32_t& value) {
+	using namespace ShaderRecompiler::IR;
+
+	bool     found  = false;
+	uint32_t result = 0;
+	for (const auto& block: program.blocks) {
+		for (size_t i = 0; i < block.instructions.size(); i++) {
+			const auto& store = block.instructions[i];
+			if (store.op != Opcode::BufferStoreDword ||
+			    store.src[0].kind != OperandKind::Register) {
+				continue;
+			}
+			const auto reg = store.src[0].reg;
+			// Walk back to the register's most recent definition. Only a direct immediate move counts;
+			// anything else means the value is computed and this analysis does not model it.
+			for (size_t j = i; j-- > 0;) {
+				const auto& def = block.instructions[j];
+				if (def.dst.kind != OperandKind::Register || !(def.dst.reg == reg)) {
+					continue;
+				}
+				if ((def.op == Opcode::MoveU32 || def.op == Opcode::MoveF32Bits) &&
+				    def.src[0].kind == OperandKind::ImmediateU32) {
+					if (found && result != def.src[0].imm) {
+						return false;
+					}
+					found  = true;
+					result = def.src[0].imm;
+				}
+				break;
+			}
+		}
+	}
+	value = result;
+	return found;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const RenderCommandBuffer&    buffer) {
 	const auto& program   = *input.stage.program;
@@ -82,6 +131,17 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		if (read_only_count == 1 && source_address != 0) {
 			uint32_t value = 0;
 			if (Libs::LibKernel::Memory::TryReadBacking(source_address, &value, sizeof(value))) {
+				const uint32_t code = value & 0xffu;
+				if (value == (code | (code << 8u) | (code << 16u) | (code << 24u))) {
+					clear_code       = code;
+					clear_code_valid = true;
+				}
+			}
+		}
+		if (!clear_code_valid) {
+			// No companion buffer to read the value from, so the shader writes it as an immediate.
+			uint32_t value = 0;
+			if (TryRecoverStoredImmediate(program, value)) {
 				const uint32_t code = value & 0xffu;
 				if (value == (code | (code << 8u) | (code << 16u) | (code << 24u))) {
 					clear_code       = code;
