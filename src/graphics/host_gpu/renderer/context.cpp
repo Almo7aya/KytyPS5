@@ -137,12 +137,22 @@ void ProbeReportZPass() {
 } // namespace
 
 bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
-	// KYTY_ZPASS_ALWAYS_VISIBLE reports every primitive visible by sending every sample down the
-	// monotonic-counter fallback, so end-minus-begin is always positive. Occlusion culling is off; the
-	// GPU draws everything. Paired with KYTY_NO_PREDICATION this partitions the problem: if models
-	// still blink with either set, the cause is not the occlusion path.
-	static const bool always_visible = std::getenv("KYTY_ZPASS_ALWAYS_VISIBLE") != nullptr;
-	if (always_visible || dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
+	// Occlusion-query results are NOT trusted by default: every sample goes down the
+	// monotonic-counter fallback, so end-minus-begin is always positive and every primitive reports
+	// visible. Culling is lost; nothing that is on screen can be culled.
+	//
+	// Why the safe direction is the default. The query path demonstrably returns "occluded" for
+	// primitives that are plainly visible - roughly 47% of samples in a night scene on an open bridge -
+	// and because Unreal re-tests every frame and reads the results on the CPU, a primitive that is
+	// wrongly occluded on one frame and not the next simply blinks. Street lamps and buildings flashing
+	// in and out was exactly that, and it stops when the results are ignored. What has *not* been
+	// established is why the queries are wrong, so trusting them cannot be justified yet.
+	//
+	// Set KYTY_OCCLUSION_QUERIES=1 to trust them again - the fast, visibly wrong behaviour, and what to
+	// use when investigating this. The remaining cost of the default is over-draw, which is a frame-rate
+	// cost rather than a correctness one.
+	static const bool trust_queries = std::getenv("KYTY_OCCLUSION_QUERIES") != nullptr;
+	if (!trust_queries || dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
 		g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}
