@@ -587,7 +587,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = target.image_view;
 		attachment.image_layout = layout;
 		attachment.clear_value  = target.color_clear_value.uint32;
-		attachment.is_clear     = target.color_clear_enable;
+		const auto metadata_address = target.desc.info.metadata.range.address;
+		const bool metadata_clear = target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		                            cache.IsMetaCleared(metadata_address, view.base_layer);
+		attachment.is_clear = target.color_clear_enable || metadata_clear;
+		if (metadata_clear && !cache.TouchMeta(metadata_address, view.base_layer, false)) {
+			EXIT("failed to consume DCC clear state\n");
+		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);
