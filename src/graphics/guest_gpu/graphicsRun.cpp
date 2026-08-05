@@ -33,6 +33,9 @@
 
 namespace Libs::Graphics {
 
+// Defined further down, next to the indirect-argument paths it reports on.
+static void GraphicsReportIndirectArgs(bool is_draw, bool empty);
+
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_mutex_owned   = false;
@@ -1156,10 +1159,42 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			}
 		}
 
+		// Indirect arguments are read here, on the CPU, at command-parse time. If a preceding GPU pass
+		// produces them this read races it and sees stale or zero values - a draw sized from those
+		// renders the wrong geometry or none, which is what parts of a model appearing and disappearing
+		// looks like. Counted so it is known whether this path is even used before anything is built on
+		// the theory.
+		GraphicsReportIndirectArgs(true, args->index_count_per_instance == 0 ||
+		                                     args->instance_count == 0);
+
 		m_num_instances = args->instance_count;
 		DrawIndex(index_count, index_addr, 0, 1, args->instance_count, nullptr, 0,
 		          static_cast<int32_t>(args->base_vertex_location), args->start_instance_location);
 	}
+}
+
+static void GraphicsReportIndirectArgs(bool is_draw, bool empty) {
+	static std::atomic<uint64_t> draws {0};
+	static std::atomic<uint64_t> draws_empty {0};
+	static std::atomic<uint64_t> dispatches {0};
+	static std::atomic<uint64_t> dispatches_empty {0};
+	static std::atomic<uint32_t> reports {0};
+
+	auto& total = is_draw ? draws : dispatches;
+	if (empty) {
+		(is_draw ? draws_empty : dispatches_empty).fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto count = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (count % 4096 != 0 || reports.fetch_add(1, std::memory_order_relaxed) >= 12) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[indirect] draws=%llu (empty=%llu) dispatches=%llu (empty=%llu)\n",
+	             static_cast<unsigned long long>(draws.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(draws_empty.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(dispatches.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(dispatches_empty.load(std::memory_order_relaxed)));
+	std::fflush(stderr);
 }
 
 void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y,
@@ -1243,6 +1278,12 @@ void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
 
 	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
 	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
+
+	// Same hazard as the indirect draw above: these group counts are read on the CPU here, so a
+	// GPU-produced value is racy. A zero read silently turns into a skipped dispatch, and a skipped
+	// skinning dispatch leaves stale vertices behind.
+	GraphicsReportIndirectArgs(false, args->thread_group_x == 0 || args->thread_group_y == 0 ||
+	                                      args->thread_group_z == 0);
 
 	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
 }
