@@ -340,6 +340,50 @@ field from the other side, pinning every draw to one consistent choice.
 | `IGNORE=1` or `MAX=1` also stabilises it | consistency across draws is what matters, not the specific width |
 | all four behave identically | the two counts never disagree in practice; re-check `ResolveEmbeddedFetchResource` remapping and index-buffer residency next |
 
+### 4.1e Rounds 3-5: instancing, vertex rate, GPU-modified marking
+
+| Switch | Result |
+| --- | --- |
+| `KYTY_FETCH_COMPONENTS_*` (4 variants) | no effect |
+| `KYTY_FORCE_ONE_INSTANCE`, `KYTY_NO_STICKY_INSTANCES` | no effect |
+| `KYTY_ALL_VERTEX_RATE` | **models hugely deformed, covering the screen** |
+| `KYTY_MARK_GPU_WRITES` | no effect |
+| `KYTY_MARK_GPU_WRITES` + `KYTY_NO_STALE_UPLOAD` | **worse - flicker increased and the HUD blinks** |
+
+**`MarkRegionAsGpuModified` has no caller in the tree** (only its definition at `memoryTracker.cpp:107` and
+its declaration). `IsRegionGpuModified` therefore cannot be true for a buffer. Two consequences:
+
+1. **`KYTY_NO_STALE_UPLOAD`'s earlier negative result was invalid** - its guard was `IsRegionGpuModified`, so
+   it was a no-op by construction. §4.1c wrongly counted it as an elimination. Corrected here.
+2. Marking the ranges does work, but **fixes nothing**, so the stale-upload clobber is *not* the cause. And
+   marking plus skipping the upload is actively harmful because `CollectShaderBufferWrites` reports each
+   buffer's whole V# footprint (`stride * num_records`), which covers pages the CPU legitimately owns - the
+   HUD blinking is CPU-written geometry being starved.
+
+The dead ends are now: TAA/velocity, predication, dropped draws, indirect args, metadata clears, buffer
+residency, dispatch→draw ordering, storage clamp, vertex attribute component widths, instance counts, and
+GPU-modified tracking. That is every data-supply and synchronisation layer.
+
+**The one positive signal is `KYTY_ALL_VERTEX_RATE`.** Forcing instance-rate buffers to vertex rate deforms
+the affected meshes enormously, which proves those buffers are real, are bound to these draws, and carry
+transform data. Since `KYTY_FORCE_ONE_INSTANCE` changed nothing, these draws are single-instance, so the
+element index is fixed at `firstInstance + 0` and the only per-draw variable is the V# base address and the
+buffer's contents.
+
+### Next step: measure, do not switch
+
+A/B switching has now cost five rounds with one bit of information. The remaining hypothesis space is the
+recompiled vertex shader's position maths and the per-draw V# base addresses, and both are directly readable
+from a capture instead of guessable:
+
+* `get_post_vs_data` on a flickering character/car draw - are the output positions wrong, and wrong how
+  (scattered, NaN, one bad component, wrong scale)?
+* `get_vertex_inputs` / `get_buffer_data` on the instance-rate binding for that same draw - is the base
+  address plausible and the transform sane?
+* `disassemble_shader` on that VS to compare against what the recompiler produced.
+
+This needs a capture taken on a frame where the character is **visibly scattered**, not a clean frame.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
