@@ -384,6 +384,47 @@ from a capture instead of guessable:
 
 This needs a capture taken on a frame where the character is **visibly scattered**, not a clean frame.
 
+### 4.1f MEASURED: the exported position's `w` is garbage for a subset of vertices
+
+Capture `_RenderDoc/kyty_frame1207.rdc`, taken on a frame where both characters are visibly scattered.
+
+Character meshes appear in the depth prepass (events 513, 643, 1038, 1048) and the base pass (8466, 10449,
+10629, 10647) with matching index counts, so **no draws are being dropped**. Event 643 exports position only
+(16-byte stride), which makes it cheap to scan many vertices.
+
+Post-VS `outPerVertex._child0` for event 643, 64 vertices. `z` is 10.0 for every vertex, as expected for
+reversed-Z infinite-far (`z_clip = near`). `w` should be `z_view`, a smooth function of position. It is not:
+
+| Vertices | x, y | w |
+| --- | --- | --- |
+| 18-21, 30-35 | ~(-111.6, 102.6) | -260 |
+| 54-56 | ~(-111.7, 102.7) | **+38.1** |
+| 60, 62 | ~(-111.0, -268.9) | **+29.4** |
+| 61 | ~(-111.1, -268.9) | -267.7 |
+
+**Vertices with near-identical x and y receive wildly different `w`, including opposite signs.** x and y are
+transformed correctly, so the matrix and the per-draw transform are fine - `w` alone is wrong, for a subset of
+vertices. Vertices 60-62 form a triangle whose `w` spans zero (+29.4, -267.7, +29.4); a triangle straddling
+the `w = 0` plane projects to enormous fragments at arbitrary screen positions, and vertices whose `w` lands
+on the wrong side are clipped away. Scattered parts and missing parts, one cause.
+
+Two things this rules out, both of which I had previously reported as findings and both of which were wrong:
+
+* **Negative `w` is not the anomaly.** Correctly-rendering world geometry (event 2719) has `w = -5712` and the
+  same constant `z = 10.0`. Good and bad geometry share the convention.
+* **`TriangleStrip` is not the anomaly.** Both the character draw and the world draw report it.
+
+Also confirmed: `instance_count = 1` on these draws, consistent with `KYTY_FORCE_ONE_INSTANCE` doing nothing,
+and character positions are byte-identical between the depth prepass and the base pass, so there is no
+per-pass transform divergence.
+
+**Next:** the failure signature - some lanes receiving a value that plausibly belongs to a different vertex -
+points at cross-lane handling in the recompiler rather than at any data-supply path. These shaders declare
+`gl_SubgroupInvocationID` as an input, and `VWritelaneB32` is handled explicitly at `ShaderRecompiler.cpp:366`
+alongside the `ShaderLaneMaskMode` machinery. Disassemble the guest VS for event 643
+(`ResourceId::70990`, vs `ResourceId::71082` for the working world draw), find how `w` reaches the POS0 export,
+and check every cross-lane step on that path. A capture is no longer needed to make progress on this.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
