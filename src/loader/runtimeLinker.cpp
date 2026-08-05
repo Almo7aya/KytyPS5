@@ -805,6 +805,20 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		return true;
 	}
 
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    Common::HostException::IsNestedFault() && Common::HostException::LenientNestedFaults()) {
+		// A fault taken while resolving another one, with leniency requested - a RenderDoc capture
+		// serialising write-tracked guest memory. Nothing that takes a graphics-cache lock is safe to
+		// call from here, because the outer fault may already hold one, so resolve it the only way that
+		// is: make the page accessible and re-execute. The GPU-ownership bookkeeping for this page is
+		// skipped, so it may read stale, which is why this needs KYTY_LENIENT_HOST_FAULTS.
+		if (Common::VirtualMemory::Protect(
+		        info->access_violation_vaddr & ~(static_cast<uint64_t>(0x4000) - 1), 0x4000,
+		        Common::VirtualMemory::Mode::ReadWrite, nullptr)) {
+			return true;
+		}
+	}
+
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
 		using CoreAccess  = Common::HostException::AccessViolationType;
 		using GpuAccess   = Libs::Graphics::PageFaultAccess;

@@ -152,7 +152,7 @@ static std::unordered_map<ShaderStageProgramKey,
                   g_shader_program_cache;
 static std::mutex g_shader_program_cache_mutex;
 
-static constexpr uint32_t ShaderMaxPermutationsPerProgram = 64;
+static constexpr uint32_t ShaderMaxPermutationsPerProgram = 512;
 
 static std::span<const uint32_t> MakeShaderSpirvView(const std::vector<uint32_t>& spirv) {
 	return {spirv.data(), spirv.size()};

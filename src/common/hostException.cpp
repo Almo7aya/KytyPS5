@@ -44,16 +44,41 @@ static_assert(decltype(g_install_state)::is_always_lock_free);
 	std::_Exit(321);
 }
 
+// Depth rather than a flag, so a lenient nested fault can be recognized and still bounded. The cap is
+// small on purpose: genuine recursion here would exhaust the stack, and papering over it indefinitely
+// would turn a crash into silent corruption.
+static thread_local uint32_t g_filter_depth = 0;
+constexpr uint32_t           MaxFilterDepth = 4;
+
+static bool LenientNestedFaultsEnabled() noexcept {
+	static const bool lenient = std::getenv("KYTY_LENIENT_HOST_FAULTS") != nullptr;
+	return lenient;
+}
+
+bool IsNestedFault() noexcept {
+	return g_filter_depth > 1;
+}
+
+bool LenientNestedFaults() noexcept {
+	return LenientNestedFaultsEnabled();
+}
+
 class FilterScope final {
 public:
 	FilterScope() noexcept {
-		if (g_in_exception_filter) {
+		g_in_exception_filter = true;
+		g_filter_depth++;
+		if (g_filter_depth > 1 && (!LenientNestedFaultsEnabled() || g_filter_depth > MaxFilterDepth)) {
 			FailFast("nested exception while resolving a host fault");
 		}
-		g_in_exception_filter = true;
 	}
 
-	~FilterScope() { g_in_exception_filter = false; }
+	~FilterScope() {
+		if (g_filter_depth > 0) {
+			g_filter_depth--;
+		}
+		g_in_exception_filter = g_filter_depth > 0;
+	}
 
 	KYTY_CLASS_NO_COPY(FilterScope);
 };

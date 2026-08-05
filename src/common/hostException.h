@@ -39,6 +39,22 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Whether this fault arrived while another was still being resolved on the same thread.
+//
+// A nested fault normally terminates the process, because the fault handler is not re-entrant - it
+// takes the graphics caches' locks, and those have their own recursive-acquisition guards. The one
+// case where nesting is expected rather than a bug is a RenderDoc capture: RenderDoc serialises all
+// mapped memory from its own thread, which walks straight into Kyty's write-tracked guest pages, and
+// resolving one of those faults can fault again.
+//
+// With KYTY_LENIENT_HOST_FAULTS set, a nested fault is reported here instead of being fatal, so the
+// handler can resolve it the only way that is safe from inside itself: make the page accessible and
+// return, touching no cache. That costs the GPU-ownership bookkeeping for that page, so a capture
+// taken this way can contain stale bytes for it - acceptable for a capture, which is why this is
+// opt-in and not the default.
+[[nodiscard]] bool IsNestedFault() noexcept;
+[[nodiscard]] bool LenientNestedFaults() noexcept;
+
 } // namespace Common::HostException
 
 #endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */
