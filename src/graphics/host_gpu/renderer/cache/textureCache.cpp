@@ -40,9 +40,10 @@ bool IsEmptyColorGradingLut(const ImageInfo& info) {
 	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
 	    info.extent != vk::Extent3D {ColorGradingLutSize, ColorGradingLutSize,
 	                                ColorGradingLutSize} ||
-	    info.resources.levels != 1 ||
-	    static_cast<Prospero::TileMode>(info.tile_mode) != Prospero::TileMode::kRenderTarget ||
-	    info.data.Empty() || info.data.size > std::numeric_limits<size_t>::max()) {
+	    info.type != Prospero::ImageType::kColor3D || info.resources.levels != 1 ||
+	    info.resources.layers != 1 || info.samples != 1 ||
+	    info.bytes_per_block != sizeof(uint32_t) || info.data.Empty() ||
+	    info.data.size > std::numeric_limits<size_t>::max()) {
 		return false;
 	}
 
@@ -1160,7 +1161,7 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	bool       data_imported = false;
 	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		if (desc.type == BindingType::Texture && IsEmptyColorGradingLut(image.info)) {
+		if (IsEmptyColorGradingLut(image.info)) {
 			auto       plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
 			const auto lut  = BuildNeutralColorGradingLut();
 			EXIT_NOT_IMPLEMENTED(!plan.valid || lut.size() * sizeof(uint32_t) !=
@@ -1173,8 +1174,8 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 			image.Upload(plan.regions, source.buffer, source.offset,
 			             lut.size() * sizeof(uint32_t));
 			LOGF("TextureCache: initialized empty 32x32x32 color-grading LUT with neutral "
-			     "log/filmic fallback at 0x%016" PRIx64 "\n",
-			     image.info.data.address);
+			     "log/filmic fallback at 0x%016" PRIx64 " (binding=%u tile=%u)\n",
+			     image.info.data.address, static_cast<uint32_t>(desc.type), image.info.tile_mode);
 			data_imported = true;
 		} else {
 			const auto source =
