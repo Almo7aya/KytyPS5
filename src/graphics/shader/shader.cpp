@@ -737,6 +737,35 @@ static uint32_t ShaderCalcPsSystemInputBase(const HW::ShaderRegisters& regs) {
 	EXIT_NOT_IMPLEMENTED((regs.ps_input_addr & ~supported_ps_input_bits) != 0);
 	EXIT_NOT_IMPLEMENTED(regs.ps_input_ena != regs.ps_input_addr);
 
+	// `supported_ps_input_bits` only says the bit is recognized well enough to size the register block.
+	// It does not say anything is put *in* that register, and a pixel shader reading one that is never
+	// written just gets zero - silently, with no failure anywhere. That is exactly how the ancillary
+	// register hid: it was on this list for the whole investigation while nothing populated it, and the
+	// colour-grading LUT quietly lost its blue axis for it.
+	//
+	// So report the ones still in that state. The interpolation-mode bits are deliberately not listed:
+	// their registers hold barycentrics that only `v_interp` reads, and those lower to SPIR-V input
+	// interpolation, so the register value genuinely does not matter.
+	{
+		constexpr uint32_t unpopulated_ps_input_bits =
+		    ps_input_sample_coverage | ps_input_pos_fixed_pt;
+		const uint32_t unpopulated = regs.ps_input_addr & unpopulated_ps_input_bits;
+		if (unpopulated != 0) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				const auto report = fmt::format(
+				    "[ps-input] enabled but never populated: {}{}(ena=0x{:08x}) - the shader will read"
+				    " zero from it\n",
+				    (unpopulated & ps_input_sample_coverage) != 0 ? "SAMPLE_COVERAGE " : "",
+				    (unpopulated & ps_input_pos_fixed_pt) != 0 ? "POS_FIXED_PT " : "",
+				    regs.ps_input_ena);
+				LOGF("%s", report.c_str());
+				std::fputs(report.c_str(), stderr);
+				std::fflush(stderr);
+			}
+		}
+	}
+
 	const uint32_t inputs = regs.ps_input_addr;
 	uint32_t       reg    = 0;
 	if ((inputs & ps_input_persp_sample) != 0) {

@@ -1,5 +1,13 @@
 # GTA III Definitive Edition — darkness + flashing diagnosis (current findings)
 
+> **Superseded on the darkness (fixed) and corrected on the flashing.** The darkness was the
+> colour-grading LUT, fixed by implementing the WriteToSlice ES+GS lowering plus the pixel-shader
+> ancillary register — see `gta3-black-world-diagnosis.md` Parts 10-11. The world now renders with
+> correct exposure and colour.
+>
+> **§9.2 and §11 below are disproven.** There is no empty velocity buffer. Read §13 before acting on
+> anything in §9-§11.
+
 Status: **hands-off diagnosis; FPS-crash fixed, darkness root-caused but not yet fixed**. The game
 reaches gameplay at 5-10 FPS (was 0.6-1 with the probe-spam crash). Darkness is a two-stage loss
 (TAA 0.358→0.097, tonemap 0.097→0.013); the prime root cause is an empty/unaliased motion buffer
@@ -350,3 +358,85 @@ that the game derives from the query results. 16 addresses flip between visible/
 game's query-result readback is stale (reads the GPU counter before the CPU memcpy is visible, or
 the pair's begin/end are written across frames inconsistently), models flash. Next: verify the
 query result reaches the predication flag deterministically per frame.
+
+## 13. The velocity-buffer theory is disproven (05 Aug, from `kyty_frame1659.rdc`)
+
+Measured directly out of the capture at the TAA dispatch (event 17081). No emulator run needed — the
+TAA is the guest's own shader and the darkness work did not touch it, so an older capture is still
+authoritative about its inputs.
+
+### 13.1 The "empty R32F velocity buffer" is the depth buffer, and it is populated
+
+| Binding | Resource | Format | Size |
+| --- | --- | --- | --- |
+| `sampled_2d[0]` | 4243 | — | 1×1 |
+| **`sampled_2d[1]`** | **3945** | **D32S8** | **3360×1892** |
+| `sampled_2d[2]` | 685 | — | 1×1 |
+| `sampled_2d[3]` | 3536 | R11G11B10 | 3360×1892 |
+| `sampled_2d[4]` | 3588 | R16G16B16A16 | 3360×1892 |
+| **`sampled_uint_2d[0]`** | **3945** | **D32S8** (same resource) | 3360×1892 |
+| `storage_2d[0]` | 3539 | R16G16B16A16 | 3360×1892 |
+
+`3945` measures depth 0→0.0327 and stencil 0→192, i.e. **real content**. It is bound twice: as float
+(depth) and as uint (stencil).
+
+So what §9.2 called "an R32F full-res texture at `20235e0000` that no draw or dispatch ever writes" is
+the depth buffer. The address mismatch in §11 was an artefact of comparing two different sources — the
+*texture descriptor* Kyty decoded for the sampled depth against the *render-target* base reported by
+`rt-bind`/`depth-bind` — under probes rate-limited to 128-256 entries in a frame with thousands of
+binds. "Never written" was never established; it was the cap.
+
+**§11's "decisive next step" — aliasing `20235e0000` to the depth allocation — would have been a no-op
+at best. Do not implement it.**
+
+### 13.2 This TAA has no velocity input at all, so missing motion vectors cannot be the cause
+
+Five sampled inputs: two 1×1, depth (twice), one full-res R11G11B10, one full-res RGBA16F, plus one
+RGBA16F storage output. **None is a two-channel motion/velocity texture.** The guest compiled this TAA
+variant without one, so no amount of emulator work can make it consume velocity. The framing of "the
+velocity pass is missing" is retired.
+
+### 13.3 What that leaves: stencil is how this TAA finds moving geometry
+
+The TAA samples **stencil**. In UE that is how responsive-AA is marked: geometry tagged
+`STENCIL_TEMPORAL_RESPONSIVE_AA` gets a much higher blend weight so it does not ghost, and it is the
+mechanism a velocity-less TAA configuration uses for moving and dithered-opacity geometry. That
+connects directly to Part 4's still-unexplained stipple on the character's shorts and legs, which is
+dithered opacity TAA never resolved.
+
+If the stencil the TAA samples does not match what the depth pass wrote, moving and dithered geometry
+gets the wrong blend weight while static geometry is unaffected — a motion-dependent flicker, which
+matches "flash more if they are moving" in a way TAA ghosting does not. Ghosting smears; it does not
+blink.
+
+Ruled out already by reading the code rather than guessing:
+
+- `TextureCache::SwapDepthAlias` (`146f848`) refuses any surface where either side `HasStencil()`, so
+  depth/colour aliasing cannot be dropping the stencil plane.
+- `ResolveDepthOverlap` does not recreate on a Sampled↔Storage change between two colour bindings, so
+  the history/output ping-pong is not being destroyed and rebuilt by the cache.
+
+### 13.4 Do not trust these resource identifications further than stated
+
+Which of `3536` / `3588` is the colour input versus the history is **not** established. Their maxima do
+not line up with a convex blend (scene 0.108, history 32.25, output 98.0). The likeliest explanation is
+that the maxima come from a small sodium street-lamp region while the bulk of the frame is ~0.0025
+neutral grey — but it is unconfirmed. Identify these from the shader's own use of each descriptor, not
+from brightness.
+
+### 13.5 The measurement that would settle it
+
+Needs a run, or a capture taken while the flashing is visible:
+
+1. **Two consecutive frames**, to see the `{3588, 3539}` ping-pong swap and confirm both sides survive
+   the frame boundary holding what the previous frame wrote.
+2. **The TAA's stencil reads versus the depth pass's stencil writes**, per §13.3.
+
+### 13.6 A trap worth recording, because it cost several rounds
+
+Kyty's `supported_ps_input_bits` says only that a pixel-shader input register is recognized well enough
+to *size* the register block — not that anything is written into it. A shader reading an
+enabled-but-unpopulated register silently gets zero. ANCILLARY sat on that list for the whole
+investigation while nothing populated it, which is exactly why the colour-grading LUT lost its blue
+axis. Kyty now reports the remaining ones (`SAMPLE_COVERAGE`, `POS_FIXED_PT`) to stderr on first use
+rather than failing silently.
