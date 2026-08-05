@@ -2206,9 +2206,22 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 // Whichever of them does or does not happen for a given metadata address is the answer.
 namespace {
 void ProbeMeta(const char* what, uint64_t address, uint32_t code, int flag) { // NOLINT
-
+	// BufferCache::FillBuffer routes *every* DMA fill through ClearMeta, so an unregistered address is
+	// the normal case, not a signal - 361 of them saturated the first version of this probe during
+	// loading before the surface of interest even existed. Surface metadata is 64 KiB-aligned, so that
+	// filter drops the spam exactly and keeps a genuine miss on a surface address.
+	if ((address & 0xffffu) != 0) {
+		static std::atomic<uint64_t> skipped {0};
+		const auto                   n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n % 20000 == 0) {
+			std::fprintf(stderr, "[meta] (unaligned fills so far: %llu)\n",
+			             static_cast<unsigned long long>(n));
+			std::fflush(stderr);
+		}
+		return;
+	}
 	static std::atomic<uint32_t> count {0};
-	if (count.fetch_add(1, std::memory_order_relaxed) >= 400) {
+	if (count.fetch_add(1, std::memory_order_relaxed) >= 3000) {
 		return;
 	}
 	std::fprintf(stderr, "[meta] %s addr=0x%010llx code=0x%02x flag=%d\n", what,
