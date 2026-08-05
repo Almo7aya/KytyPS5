@@ -1494,6 +1494,18 @@ static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
 		return plan;
 	}();
 
+	// Admitting one of these draws makes a recompile failure fatal, where before the draw was simply
+	// skipped. The switch is here so that trade can be undone in a run rather than a rebuild.
+	static const WriteToSlice::EsPlan disabled = [] {
+		WriteToSlice::EsPlan plan {};
+		plan.reject_reason = "disabled by KYTY_NO_WRITETOSLICE";
+		return plan;
+	}();
+	static const bool no_write_to_slice = std::getenv("KYTY_NO_WRITETOSLICE") != nullptr;
+	if (no_write_to_slice) {
+		return disabled;
+	}
+
 	const ShaderWriteToSliceKey key {regs.es_regs.data_addr, regs.gs_regs.data_addr,
 	                                 regs.gs_regs.chksum};
 
