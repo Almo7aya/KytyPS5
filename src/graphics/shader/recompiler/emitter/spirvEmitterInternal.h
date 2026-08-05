@@ -44,6 +44,9 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
+	// CapabilityShaderLayer (69) would be the plain form, but it only exists from SPIR-V 1.5 and these
+	// modules declare 1.3. The EXT capability is the equivalent for earlier versions.
+	CapabilityShaderViewportIndexLayerEXT    = 5254,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,
@@ -71,6 +74,7 @@ enum : uint32_t {
 
 enum : uint32_t {
 	BuiltInPosition                  = 0,
+	BuiltInLayer                     = 9,
 	BuiltInFragCoord                 = 15,
 	BuiltInFrontFacing               = 17,
 	BuiltInSampleMask                = 20,
@@ -322,6 +326,7 @@ struct EmitterState {
 	uint32_t                                         wave_size          = 64;
 	bool                                             exact_subgroup_operations    = false;
 	bool                                             per_invocation_masks         = false;
+	bool                                             write_to_slice_lowered       = false;
 	uint32_t                                         void_type                    = 0;
 	uint32_t                                         bool_type                    = 0;
 	uint32_t                                         uint_type                    = 0;
@@ -407,6 +412,7 @@ struct EmitterState {
 	uint32_t                                         per_vertex_variable                   = 0;
 	uint32_t                                         depth_variable                        = 0;
 	uint32_t                                         sample_mask_variable                  = 0;
+	uint32_t                                         layer_variable                        = 0;
 	bool                                             needs_subgroup_ballot                 = false;
 	bool                                             needs_subgroup_shuffle                = false;
 	bool                                             needs_subgroup_local_invocation_id    = false;

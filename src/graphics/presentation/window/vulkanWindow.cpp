@@ -36,6 +36,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -572,6 +573,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		subgroup_size_control.subgroupSizeControl = VK_TRUE;
 	}
 
+	// Writing the render-target slice index from the vertex stage, which a UE WriteToSlice volume draw
+	// needs once its passthrough geometry shader is folded into the vertex shader.
+	graphics.shader_output_layer_enabled = supported_features12.shaderOutputLayer == VK_TRUE;
+	features12.shaderOutputLayer         = supported_features12.shaderOutputLayer;
+	LOGF("Vulkan layered vertex output: shaderOutputLayer=%s\n",
+	     graphics.shader_output_layer_enabled ? "true" : "false");
+
 	const auto* base_feature_chain = (subgroup_size_control.subgroupSizeControl == VK_TRUE
 	                                      ? static_cast<const void*>(&subgroup_size_control)
 	                                      : static_cast<const void*>(&features12));
@@ -615,6 +623,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		LOGF("vkCreateDevice failed: %s\n", VulkanToString(result).c_str());
 		return nullptr;
 	}
+
+	ShaderSetLayeredVertexOutputSupported(graphics.shader_output_layer_enabled);
 
 	return device;
 }

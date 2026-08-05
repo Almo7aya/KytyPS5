@@ -463,6 +463,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
+	state.write_to_slice_lowered = program.write_to_slice_lowered;
 	state.exact_subgroup_operations =
 	    !state.per_invocation_masks && ProgramRequiresExactSubgroupSize(program);
 	state.registers.reserve(InitialEmitterVectorReserve);

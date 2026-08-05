@@ -451,6 +451,12 @@ struct ExportInfo {
 	bool             done   = false;
 	bool             compr  = false;
 	bool             vm     = false;
+	// Write only the enabled components, leaving the rest of the output alone, instead of assembling
+	// a whole vec4 and filling disabled components with (0, 0, 0, 1). Only for exports synthesized by
+	// a lowering pass that splits one hardware export across several instructions - a real hardware
+	// export delivers all four components at once, and its disabled components are genuinely
+	// undefined rather than carried over.
+	bool component_store = false;
 
 	bool operator==(const ExportInfo& other) const = default;
 };
@@ -653,7 +659,7 @@ enum class StageInputKind {
 	Parameter,
 };
 
-enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask };
+enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask, Layer };
 
 struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
@@ -771,6 +777,11 @@ struct Program {
 	bool                    shader_info_complete       = false;
 	BindingLayout           bindings;
 	bool                    binding_layout_complete = false;
+	// Set when this vertex shader is a PS5 export shader whose ESGS ring stores were retargeted into
+	// exports (see WriteToSliceLowering.h). It changes one thing beyond the stores themselves: the
+	// shader's entry gate reads NGG merged-wave launch state out of s3 that only exists when an ES and
+	// a GS share a wave, so that register has to be supplied.
+	bool                    write_to_slice_lowered = false;
 };
 
 bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,

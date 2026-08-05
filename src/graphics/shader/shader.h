@@ -255,6 +255,19 @@ bool ShaderAddressValid(uint64_t addr);
 // shaders blocking the colour-grading LUT can be disassembled offline.
 void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash);
 
+// Whether the device can write the render-target slice index from the vertex stage. Recorded once,
+// after device creation, because the WriteToSlice lowering depends on it and both the draw path and
+// the shader compile have to agree.
+void ShaderSetLayeredVertexOutputSupported(bool supported);
+
+// Whether this ES+GS pair is a UE "WriteToSlice" volume draw that can run as a plain instanced vertex
+// shader, with the slice index written from the vertex stage (see ir/WriteToSliceLowering.h). Decodes
+// and analyses both shaders once per pair and caches the answer, so the draw path can ask per draw.
+//
+// The draw path and ShaderCompileSpirvVS must reach the same conclusion: admitting the draw without
+// the lowering would bind a vertex shader that exports no position and draw nothing.
+bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_ */

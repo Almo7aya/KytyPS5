@@ -166,6 +166,15 @@ uint32_t InitialRegisterValue(const EmitterState& state, IR::Register reg) {
 		}
 		return state.wave_size == 64u ? 0xffffffffu : 0u;
 	}
+	// s3 is the NGG merged-wave info the hardware hands an export shader that shares its wave with a
+	// geometry shader. A WriteToSlice-lowered shader runs as a plain vertex shader with no such wave,
+	// and its entry gate derives EXEC from the ES vertex count in bits 6:0 - left at zero, EXEC comes
+	// out empty and the shader stores nothing at all. Every lane of a vertex-shader wave is a real
+	// vertex here, so the count is the wave size, and the wave index in bits 27:24 is zero because the
+	// ring slot it addresses no longer exists.
+	if (state.write_to_slice_lowered && reg.file == IR::RegisterFile::Scalar && reg.index == 3) {
+		return state.wave_size & 0x7fu;
+	}
 	return 0;
 }
 

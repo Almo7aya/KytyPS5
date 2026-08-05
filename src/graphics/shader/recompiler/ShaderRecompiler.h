@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.h"
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -33,6 +34,10 @@ struct CompileOptions {
 	const ShaderVertexInputInfo*  vertex_input_info    = nullptr;
 	const ShaderPixelInputInfo*   pixel_input_info     = nullptr;
 	const ShaderComputeInputInfo* compute_input_info   = nullptr;
+	// Set to compile a PS5 export shader as the instanced vertex shader its passthrough geometry
+	// shader makes it equivalent to (see ir/WriteToSliceLowering.h). The plan is derived from both
+	// shaders of the pair, so it has to come from the caller.
+	const WriteToSlice::EsPlan*   write_to_slice       = nullptr;
 };
 
 struct CompileResult {

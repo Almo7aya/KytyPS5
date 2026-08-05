@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/SrtPatcher.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/WriteToSliceLowering.h"
 
 #include <algorithm>
 #include <array>
@@ -664,8 +665,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	Decoder::Program decoded;
-	if (!Decoder::DecodeProgram(code, decoded, error)) {
+	Decoder::Program        decoded;
+	Decoder::DecodeOptions  decode_options {};
+	// An export shader in a real ES+GS pair returns to the merged shader instead of ending, so decoding
+	// it standalone needs that return treated as the program end.
+	decode_options.return_ends_program = options.write_to_slice != nullptr;
+	if (!Decoder::DecodeProgram(code, decoded, error, decode_options)) {
 		return false;
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
@@ -737,6 +742,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	ir.shader_hash     = options.shader_hash;
 	ir.user_data_base  = options.user_data_base;
 	ir.user_data_count = options.user_data_count;
+	// Before anything reads the LDS stores: this replaces them with exports, so resource tracking,
+	// binding layout and info collection all see the finished vertex shader.
+	if (options.write_to_slice != nullptr &&
+	    !IR::LowerWriteToSliceExports(ir, *options.write_to_slice, error)) {
+		return false;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

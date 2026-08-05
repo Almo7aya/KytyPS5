@@ -69,6 +69,7 @@ static std::atomic<uint32_t> g_draw_input_log_count       = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count        = 0;
 static std::atomic<uint32_t> g_shader_stage_log_count     = 0;
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
+static std::atomic<uint32_t> g_write_to_slice_log_count   = 0;
 
 static const char* RenderColorTypeName(RenderColorType type) {
 	switch (type) {
@@ -429,9 +430,9 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 // The emulator has no geometry-shader stage, but this pattern needs none: the GS is a strict 1:1
 // passthrough, so ES+GS together are just an instanced vertex shader that writes gl_Layer.
 //
-// Classification only for now - the draw is still skipped. Letting it through before the ES/GS
-// lowering exists would run a vertex shader that exports no position, because this ES only writes
-// its outputs to the ESGS ring in LDS and the GS owns every export.
+// This classifies the draw from the register state. Whether the shaders can actually be lowered is a
+// separate question that only the pair itself can answer - ShaderWriteToSliceLowerable - and both have
+// to hold before the draw is admitted.
 struct WriteToSliceInfo {
 	bool     matched     = false;
 	uint32_t slice_count = 0;
@@ -456,20 +457,29 @@ static WriteToSliceInfo ClassifyWriteToSliceGs(const RenderCommandBuffer& buffer
 		return {};
 	}
 
-	// The bound colour target must be a volume or layered surface; its slice count is the fan-out.
+	// The bound colour target must be a volume or layered surface, and the bound view has to cover
+	// every one of its slices. The shader writes `MinZ + gl_InstanceIndex` as the slice index, which
+	// indexes the view - so a view over a subset would send instances outside it. Requiring the whole
+	// volume keeps that impossible instead of merely unlikely.
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = ctx.GetRenderTarget(rt_slot);
-	const bool  layered = rt.attrib3.dimension != 1 || rt.attrib3.depth != 0 ||
-	                     rt.view.base_array_slice_index != rt.view.last_array_slice_index;
-	if (!layered) {
+	if (rt.attrib3.dimension != 2 && rt.attrib3.dimension != 1) {
 		return {};
 	}
-	const uint32_t slice_count = rt.attrib3.depth + 1u;
-	if (slice_count <= 1u) {
+	const uint32_t slice_count = rt.attrib3.dimension == 2 ? rt.attrib3.depth + 1u : 0u;
+	const auto     view = ResolveTargetViewInfo(rt.view.base_array_slice_index,
+	                                            rt.view.last_array_slice_index);
+	if (view.type != TargetViewType::Image2DArray || view.base_layer != 0 ||
+	    view.layer_count <= 1u) {
+		return {};
+	}
+	// A 3D target fans across its depth; a 2D array target fans across its layers.
+	const uint32_t fan_out = slice_count != 0 ? slice_count : view.layer_count;
+	if (view.layer_count != fan_out) {
 		return {};
 	}
 
-	return {true, slice_count, rt_slot};
+	return {true, fan_out, rt_slot};
 }
 
 static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
@@ -510,9 +520,35 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+		// A UE WriteToSlice volume draw needs no geometry stage: its GS is a strict passthrough that
+		// only adds a slice index, so the pair runs as an instanced vertex shader instead. Dropping it
+		// is what leaves GTA III sampling a neutral colour-grading LUT.
+		const auto wts        = ClassifyWriteToSliceGs(buffer);
+		const bool lowerable  = wts.matched && ShaderWriteToSliceLowerable(vertex_info);
+		const auto wts_log_id = g_write_to_slice_log_count.fetch_add(1);
+		if (wts_log_id < 8) {
+			// Deliberately stderr: the standard repro runs with --printf-direction Silent, which
+			// suppresses LOGF entirely, and whether this draw was admitted is the one thing worth
+			// knowing from such a run.
+			const auto  rt_slot = render_target_first_bound_slot(buffer);
+			const auto& rt      = ctx.GetRenderTarget(rt_slot);
+			std::fprintf(stderr,
+			             "[writetoslice] classified=%d lowerable=%d es=0x%010" PRIx64
+			             " gs=0x%010" PRIx64 " RT=0x%010" PRIx64 " %ux%u dim=%u depth=%u"
+			             " slices=[%u..%u] fan_out=%u\n",
+			             wts.matched ? 1 : 0, lowerable ? 1 : 0, vertex_info.es_regs.data_addr,
+			             vertex_info.gs_regs.data_addr, rt.base.addr, rt.attrib2.width + 1,
+			             rt.attrib2.height + 1, rt.attrib3.dimension, rt.attrib3.depth,
+			             rt.view.base_array_slice_index, rt.view.last_array_slice_index,
+			             wts.slice_count);
+			std::fflush(stderr);
+		}
+		if (lowerable) {
+			return false;
+		}
+
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
-			const auto  wts     = ClassifyWriteToSliceGs(buffer);
 			const auto  rt_slot = render_target_first_bound_slot(buffer);
 			const auto& rt      = ctx.GetRenderTarget(rt_slot);
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32

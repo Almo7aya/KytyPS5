@@ -218,6 +218,9 @@ void AllocateOutputVariables(EmitterState& state) {
 				binding.variable_id =
 				    AllocateSharedOutputVariable(state, state.sample_mask_variable);
 				break;
+			case IR::StageOutputKind::Layer:
+				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
+				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt:
 				binding.variable_id = AllocateInterfaceVariable(state);
@@ -293,6 +296,11 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(state.sample_mask_variable, "gl_SampleMask");
 		state.builder.AddAnnotation(
 		    {OpDecorate, state.sample_mask_variable, DecorationBuiltIn, BuiltInSampleMask});
+	}
+	if (state.layer_variable != 0) {
+		state.builder.AddName(state.layer_variable, "gl_Layer");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.layer_variable, DecorationBuiltIn, BuiltInLayer});
 	}
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
@@ -504,6 +512,13 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");
 	}
+	if (state.layer_variable != 0 && state.stage == ShaderType::Vertex) {
+		// Writing the render-target slice index from the vertex stage. Needs the device's
+		// `shaderOutputLayer` (Vulkan 1.2) or VK_EXT_shader_viewport_index_layer, which is why the
+		// draw paths that produce such a shader check for it first.
+		state.builder.AddCapability({CapabilityShaderViewportIndexLayerEXT});
+		state.builder.AddExtension("SPV_EXT_shader_viewport_index_layer");
+	}
 	state.builder.AddExtInstImport(state.glsl_std450, "GLSL.std.450");
 	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
@@ -659,6 +674,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		                       StorageClassOutput, state.sample_mask_array_type});
 		state.builder.AddType({OpVariable, state.ptr_output_sample_mask_array,
 		                       state.sample_mask_variable, StorageClassOutput});
+	}
+	if (state.layer_variable != 0) {
+		state.builder.AddType(
+		    {OpVariable, state.ptr_output_int, state.layer_variable, StorageClassOutput});
 	}
 	state.builder.AddType({OpTypeRuntimeArray, state.storage_runtime_array_type, state.uint_type});
 	state.builder.AddType(

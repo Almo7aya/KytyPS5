@@ -1451,6 +1451,122 @@ void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash
 	dump_one("gs", gs_addr);
 }
 
+// Whether the device can write the render-target slice index from the vertex stage. Written once
+// during device setup and only read afterwards.
+static std::atomic<bool> g_layered_vertex_output_supported {false};
+
+void ShaderSetLayeredVertexOutputSupported(bool supported) {
+	g_layered_vertex_output_supported.store(supported, std::memory_order_relaxed);
+}
+
+// Analysing the pair means decoding both shaders, so the answer is cached. Keyed on the pair, not on
+// either shader alone: the same export shader paired with a different geometry shader is a different
+// question.
+struct ShaderWriteToSliceKey {
+	uint64_t es_addr = 0;
+	uint64_t gs_addr = 0;
+	uint64_t gs_hash = 0;
+
+	bool operator==(const ShaderWriteToSliceKey& other) const = default;
+};
+
+struct ShaderWriteToSliceKeyHash {
+	size_t operator()(const ShaderWriteToSliceKey& key) const {
+		return static_cast<size_t>(key.es_addr * 0x9e3779b97f4a7c15ull + key.gs_addr * 0x100000001b3ull +
+		                           key.gs_hash);
+	}
+};
+
+static std::unordered_map<ShaderWriteToSliceKey, ShaderRecompiler::WriteToSlice::EsPlan,
+                          ShaderWriteToSliceKeyHash>
+                  g_write_to_slice_plans;
+static std::mutex g_write_to_slice_plans_mutex;
+
+// Derives the plan for a pair, or returns a non-matching one. Both the draw path and the VS compile
+// go through here, so they cannot disagree.
+static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
+    const HW::VertexShaderInfo& regs) {
+	using namespace ShaderRecompiler;
+
+	static const WriteToSlice::EsPlan unsupported = [] {
+		WriteToSlice::EsPlan plan {};
+		plan.reject_reason = "the device cannot write the slice index from the vertex stage";
+		return plan;
+	}();
+
+	const ShaderWriteToSliceKey key {regs.es_regs.data_addr, regs.gs_regs.data_addr,
+	                                 regs.gs_regs.chksum};
+
+	std::scoped_lock lock(g_write_to_slice_plans_mutex);
+	if (const auto it = g_write_to_slice_plans.find(key); it != g_write_to_slice_plans.end()) {
+		return it->second;
+	}
+
+	WriteToSlice::EsPlan plan {};
+	const auto           set = [&key, &plan]() -> const WriteToSlice::EsPlan& {
+		return g_write_to_slice_plans.emplace(key, std::move(plan)).first->second;
+	};
+
+	if (!g_layered_vertex_output_supported.load(std::memory_order_relaxed)) {
+		return unsupported;
+	}
+	if (!ShaderAddressValid(key.es_addr) || !ShaderAddressValid(key.gs_addr) ||
+	    key.es_addr == key.gs_addr) {
+		plan.reject_reason = "not a distinct ES+GS pair";
+		return set();
+	}
+
+	ShaderMappedData es_data {};
+	ShaderMappedData gs_data {};
+	if (!ShaderGetMappedData(key.es_addr, es_data) || !ShaderGetMappedData(key.gs_addr, gs_data) ||
+	    es_data.code_size_bytes == 0 || gs_data.code_size_bytes == 0 ||
+	    es_data.code_size_bytes % sizeof(uint32_t) != 0 ||
+	    gs_data.code_size_bytes % sizeof(uint32_t) != 0) {
+		plan.reject_reason = "the pair has no usable mapped code";
+		return set();
+	}
+
+	Decoder::Program gs {};
+	std::string      error;
+	if (!Decoder::DecodeProgram({reinterpret_cast<const uint32_t*>(key.gs_addr),
+	                             gs_data.code_size_bytes / sizeof(uint32_t)},
+	                            gs, &error)) {
+		plan.reject_reason = fmt::format("geometry shader decode failed: {}", error);
+		return set();
+	}
+	const auto map = WriteToSlice::AnalyzePassthroughGs(gs);
+	if (!map.matched) {
+		plan.reject_reason = map.reject_reason;
+		return set();
+	}
+
+	// The export shader returns to the merged shader instead of ending, so its return has to be taken
+	// as the program end.
+	Decoder::Program es {};
+	if (!Decoder::DecodeProgram({reinterpret_cast<const uint32_t*>(key.es_addr),
+	                             es_data.code_size_bytes / sizeof(uint32_t)},
+	                            es, &error, {.return_ends_program = true})) {
+		plan.reject_reason = fmt::format("export shader decode failed: {}", error);
+		return set();
+	}
+	plan = WriteToSlice::PlanEsExports(es, map);
+
+	// Once per pair, and to stderr as well as the log: the standard repro runs with
+	// --printf-direction Silent, which suppresses LOGF, and the derived map is what says whether the
+	// lowering understood the shaders.
+	const auto report = fmt::format(
+	    "[writetoslice] es=0x{:010x} gs=0x{:010x} hash=0x{:016x}\n{}{}", key.es_addr, key.gs_addr,
+	    key.gs_hash, WriteToSlice::RingMapToString(map), WriteToSlice::EsPlanToString(plan));
+	LOGF("%s", report.c_str());
+	std::fputs(report.c_str(), stderr);
+	std::fflush(stderr);
+	return set();
+}
+
+bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs) {
+	return ShaderWriteToSlicePlan(regs).matched;
+}
+
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                           std::vector<uint32_t>& spirv) {
@@ -1475,6 +1591,12 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
+
+	// A WriteToSlice export shader has to be lowered rather than compiled as-is: it exports nothing on
+	// its own. The draw path only lets such a draw through when this plan matches, so the two agree.
+	if (const auto& plan = ShaderWriteToSlicePlan(regs); plan.matched) {
+		options.write_to_slice = &plan;
+	}
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
