@@ -541,6 +541,51 @@ Noticed while checking: `kRenderTargetFormats` has **no `k16_16_16_16 + kSNorm` 
 `k16_16` and `k8_8_8_8` both do. Any title binding that combination hits the `EXIT` in
 `TextureGetRenderTargetFormat`. Latent, unrelated to this bug, worth filling in.
 
+### 14.7 ROOT CAUSE: the velocity buffer is never cleared and accumulates across frames
+
+Proven, not inferred. In `kyty_frame951.rdc`, target `47008` at pixel (1125, 1360):
+
+	sample_pixel_region -> b = 0.771481   (clearly non-zero)
+	pixel_history       -> 0 modifications in the entire frame
+
+No draw in this frame wrote that pixel, yet it holds data. The buffer is not cleared, so it retains
+everything written into it by previous frames.
+
+Saved out and viewed at full resolution, the buffer contains **five or six overlapping copies of the
+character**, several of the car, and several lamp posts, at different positions and scales along the
+road - while the velocity pass has only **7 draws**, and velocity rasterises each object once. They are
+successive frames' silhouettes stacked on top of each other.
+
+This is the same failure mode Part 3 of `gta3-black-world-diagnosis.md` documented for the
+separate-translucency surface - *"in Kyty the buffer accumulates across frames"* - on a different target.
+
+### 14.8 Why this explains every observation
+
+| Observation | Explained |
+| --- | --- |
+| Car and character flicker, static geometry does not | only dynamic objects write velocity; static geometry is reprojected from depth |
+| Identical standing still or walking | the buffer accumulates either way |
+| Unaffected by occlusion culling being disabled | nothing to do with visibility |
+| Parts of a model missing, others present | a pixel's velocity comes from whichever stale silhouette last covered it, so reprojection lands somewhere arbitrary per-region |
+| Renderer drops no draws | correct - the draws all happen, the buffer they write into is dirty |
+
+It also explains the R=0/G=0 measurement in §14.6 without any exotic encoding: those pixels were never
+written this frame, so they hold an older frame's values rather than this frame's motion.
+
+### 14.9 Leading candidate for *why* it is not cleared
+
+Already recorded as an open risk at the end of `gta3-black-world-diagnosis.md` Part 3, and never
+addressed:
+
+> `m_surface_metas` is still keyed on the metadata address alone, and two full-res `R11G11B10` surfaces
+> were observed sharing DCC address `0x2034eb0000`. A clear recorded for one can therefore be consumed by
+> the other.
+
+If the velocity target's clear is consumed by another surface sharing its metadata address, this target
+never sees its clear. That is consistent with the symptom and with a known defect, but it is **not yet
+verified for this target** - the next step is to check whether `47008` has DCC, what its metadata address
+is, and whether another surface shares it.
+
 ### 14.4 What is NOT established
 
 - Whether the cone's transform is wrong or the cone is correctly placed and wrongly shaded. Only 8 of
