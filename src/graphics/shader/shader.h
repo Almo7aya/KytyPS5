@@ -259,11 +259,6 @@ bool ShaderAddressValid(uint64_t addr);
 // shaders blocking the colour-grading LUT can be disassembled offline.
 void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash);
 
-// Temporary: writes the raw guest words of the pixel shader bound to a WriteToSlice volume draw, plus
-// its input-register state. The LUT's blue axis is the slice index, which that shader reads as
-// SV_RenderTargetArrayIndex, so how it unpacks the register decides how to supply it.
-void ShaderDumpWriteToSlicePs(uint64_t ps_addr, uint64_t hash, const HW::ShaderRegisters& sh);
-
 // Whether the device can write the render-target slice index from the vertex stage. Recorded once,
 // after device creation, because the WriteToSlice lowering depends on it and both the draw path and
 // the shader compile have to agree.
