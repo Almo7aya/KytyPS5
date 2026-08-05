@@ -686,8 +686,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout     = layout;
 		attachment.clear_value      = target.color_clear_value.uint32;
 		attachment.is_clear         = target.color_clear_enable;
-		const auto metadata_address = target.desc.info.metadata.range.address;
-		uint32_t   clear_code       = 0;
+		const auto metadata_address        = target.desc.info.metadata.range.address;
+		uint32_t   clear_code              = 0;
+		bool       metadata_clear_without_code = false;
 		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
 		    cache.IsMetaCleared(metadata_address, view.base_layer)) {
 			// A recorded DCC clear code decides the colour. Constant-encoded codes carry it
@@ -702,10 +703,47 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				} else if ((clear_code & 0xffu) == DCC_CLEAR_CODE_REGISTER) {
 					attachment.is_clear = true;
 				}
+			} else {
+				// A clear was recorded but carries no code to decode, so nothing below acts on it and the
+				// state is consumed regardless. This is the state GTA III's velocity surface is in.
+				metadata_clear_without_code = true;
 			}
 			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
 				EXIT("failed to consume DCC clear state\n");
 			}
+		}
+
+		// A/B switches for the car/character flicker. Both default off; see
+		// docs/gta3-status-and-next-steps.md §4.
+		//
+		// KYTY_FORCE_VELOCITY_CLEAR clears any full-resolution R16G16B16A16_UNORM attachment
+		// unconditionally. Crude and title-shaped, but decisive: GTA III's velocity buffer provably
+		// accumulates the previous frames' silhouettes (a non-zero pixel with zero modifications in the
+		// frame), and TAA reprojecting from those stale vectors is what scatters a model across the
+		// screen. If the flicker stops with this on, accumulation is the whole cause and the only
+		// remaining work is clearing it through the proper path. If it does not, the velocity buffer is
+		// not the whole story.
+		static const bool force_velocity_clear = std::getenv("KYTY_FORCE_VELOCITY_CLEAR") != nullptr;
+		if (force_velocity_clear && !attachment.is_clear &&
+		    target.desc.info.pixel_format == vk::Format::eR16G16B16A16Unorm &&
+		    target.extent.width > 1024) {
+			attachment.clear_value = vk::ClearColorValue {std::array<float, 4> {0.0F, 0.0F, 0.0F, 0.0F}}
+			                             .uint32;
+			attachment.is_clear = true;
+		}
+
+		// KYTY_META_CLEAR_ASSUME_ZERO treats a recorded metadata clear that carries no decodable code as
+		// a clear to zero. That is the general form of the same theory: the clear arrives (456 times for
+		// the velocity surface, all with clear_code_valid false), finds no code, and is discarded and
+		// consumed. Off by default because at this point a DCC initialise or decompress is
+		// indistinguishable from a clear, and treating one as the other is exactly what made the world
+		// black in b38962b.
+		static const bool assume_zero = std::getenv("KYTY_META_CLEAR_ASSUME_ZERO") != nullptr;
+		if (assume_zero && !attachment.is_clear &&
+		    target.desc.info.metadata.kind == ImageMetadataKind::Dcc && metadata_clear_without_code) {
+			attachment.clear_value = vk::ClearColorValue {std::array<float, 4> {0.0F, 0.0F, 0.0F, 0.0F}}
+			                             .uint32;
+			attachment.is_clear = true;
 		}
 	}
 	if (depth.image_id) {
