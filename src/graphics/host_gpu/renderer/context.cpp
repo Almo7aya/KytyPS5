@@ -137,7 +137,12 @@ void ProbeReportZPass() {
 } // namespace
 
 bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
-	if (dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
+	// KYTY_ZPASS_ALWAYS_VISIBLE reports every primitive visible by sending every sample down the
+	// monotonic-counter fallback, so end-minus-begin is always positive. Occlusion culling is off; the
+	// GPU draws everything. Paired with KYTY_NO_PREDICATION this partitions the problem: if models
+	// still blink with either set, the cause is not the occlusion path.
+	static const bool always_visible = std::getenv("KYTY_ZPASS_ALWAYS_VISIBLE") != nullptr;
+	if (always_visible || dst_gpu_addr == nullptr || IsInvalid() || m_execute) {
 		g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
 		return false;
 	}

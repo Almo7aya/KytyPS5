@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -121,7 +122,14 @@ public:
 	             uint8_t wait_for_previous, uint8_t write_confirm, uint8_t block_engine);
 	void SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
 	                    const volatile void* address, uint32_t count_in_dwords);
-	[[nodiscard]] bool ShouldSkipPredicatedPackets() const { return m_predicate_skip; }
+	// KYTY_NO_PREDICATION forces every predicated packet to execute. Predication is how the guest turns
+	// its occlusion-query results into culling, so this is the switch that says whether a rendering
+	// problem is culling at all - if models still blink with it set, nothing the query path does can be
+	// responsible.
+	[[nodiscard]] bool ShouldSkipPredicatedPackets() const {
+		static const bool disabled = std::getenv("KYTY_NO_PREDICATION") != nullptr;
+		return !disabled && m_predicate_skip;
+	}
 
 	Pm4ProcessResult Process(Pm4Execution& execution, uint32_t* buffer, uint32_t size_dw);
 	void             ProcessIndirectBuffer(uint32_t* buffer, uint32_t size_dw);

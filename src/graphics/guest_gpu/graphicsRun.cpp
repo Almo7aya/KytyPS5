@@ -797,6 +797,20 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
+			// How much is actually being culled, on stderr so it survives --printf-direction Silent.
+			// A draw-opcode skip is a primitive the guest decided is invisible; if the flashing is
+			// culling, this is the number that has to be moving.
+			if (opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_AUTO ||
+			    opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 || opcode == Pm4::IT_DRAW_INDEX_INDIRECT) {
+				static std::atomic<uint64_t> skipped_draws {0};
+				static std::atomic<uint32_t> reports {0};
+				const auto count = skipped_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (count % 2048 == 0 && reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+					std::fprintf(stderr, "[predication] draws skipped=%llu\n",
+					             static_cast<unsigned long long>(count));
+					std::fflush(stderr);
+				}
+			}
 			static std::atomic<uint32_t> skip_log_count {0};
 			if (skip_log_count.fetch_add(1) < 2048) {
 				LOGF("\t predicated skip: op=0x%02" PRIx32 ", r=0x%02" PRIx32 ", len=%" PRIu32
