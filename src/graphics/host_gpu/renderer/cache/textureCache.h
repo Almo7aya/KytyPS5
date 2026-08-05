@@ -70,6 +70,11 @@ public:
 	                                           bool formatted_buffer_write = false);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
+	// TEMPORARY. Restricts the metadata-clear trace to one surface's metadata address. Dumping every
+	// address saturated the log three times over - the interesting surface is allocated late and the
+	// window always closed before it appeared - so the trace is pointed at it directly instead.
+	static void ProbeSetMetaFilter(uint64_t address);
+
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address, uint32_t clear_code = 0,

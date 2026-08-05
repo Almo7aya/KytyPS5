@@ -2205,23 +2205,15 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 // lifecycle of a metadata clear: something asks for one, the entry is registered, the entry is erased.
 // Whichever of them does or does not happen for a given metadata address is the answer.
 namespace {
+std::atomic<uint64_t> g_probe_meta_filter {0};
+
 void ProbeMeta(const char* what, uint64_t address, uint32_t code, int flag) { // NOLINT
-	// BufferCache::FillBuffer routes *every* DMA fill through ClearMeta, so an unregistered address is
-	// the normal case, not a signal - 361 of them saturated the first version of this probe during
-	// loading before the surface of interest even existed. Surface metadata is 64 KiB-aligned, so that
-	// filter drops the spam exactly and keeps a genuine miss on a surface address.
-	if ((address & 0xffffu) != 0) {
-		static std::atomic<uint64_t> skipped {0};
-		const auto                   n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (n % 20000 == 0) {
-			std::fprintf(stderr, "[meta] (unaligned fills so far: %llu)\n",
-			             static_cast<unsigned long long>(n));
-			std::fflush(stderr);
-		}
-		return;
-	}
-	static std::atomic<uint32_t> count {0};
-	if (count.fetch_add(1, std::memory_order_relaxed) >= 3000) {
+	// Only the one surface being investigated. Every previous version of this dumped all addresses and
+	// saturated: BufferCache::FillBuffer routes every DMA fill through ClearMeta, so unregistered
+	// addresses are the normal case, and the surface of interest is allocated late enough that the window
+	// had always closed before it appeared.
+	const auto filter = g_probe_meta_filter.load(std::memory_order_relaxed);
+	if (filter == 0 || address != filter) {
 		return;
 	}
 	std::fprintf(stderr, "[meta] %s addr=0x%010llx code=0x%02x flag=%d\n", what,
@@ -2229,6 +2221,16 @@ void ProbeMeta(const char* what, uint64_t address, uint32_t code, int flag) { //
 	std::fflush(stderr);
 }
 } // namespace
+
+void TextureCache::ProbeSetMetaFilter(uint64_t address) {
+	uint64_t expected = 0;
+	if (g_probe_meta_filter.compare_exchange_strong(expected, address,
+	                                                std::memory_order_relaxed)) {
+		std::fprintf(stderr, "[meta] tracing metadata 0x%010llx\n",
+		             static_cast<unsigned long long>(address));
+		std::fflush(stderr);
+	}
+}
 
 bool TextureCache::ClearMeta(uint64_t address, uint32_t clear_code, bool clear_code_valid) {
 	std::lock_guard transaction(m_resource_mutex);

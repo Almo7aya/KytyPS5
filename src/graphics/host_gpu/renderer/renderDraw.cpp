@@ -708,20 +708,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 
-		// TEMPORARY. Identifies each colour surface once, so the [meta] clear trace - which only has
-		// addresses - can be correlated with it. Surface allocations move between runs, so the two have
-		// to be captured in the same build; keeping them apart is what made the previous run unreadable.
-		{
-			static std::mutex         seen_mutex;
-			static std::set<uint64_t> seen;
-			const auto                base = target.desc.info.data.address;
-			std::unique_lock          lock(seen_mutex);
-			if (seen.size() < 96 && seen.insert(base).second) {
-				lock.unlock();
+		// TEMPORARY. Points the metadata-clear trace at the velocity surface.
+		//
+		// Identified by format and extent rather than address, because addresses move between runs but
+		// R16G16B16A16_UNORM at full resolution is unique to it - and every attempt to find it by dumping
+		// all surfaces saturated, since it is allocated after dozens of transient ones.
+		if (target.desc.info.pixel_format == vk::Format::eR16G16B16A16Unorm &&
+		    target.extent.width > 1024 && metadata_address != 0) {
+			TextureCache::ProbeSetMetaFilter(metadata_address);
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) == 0) {
 				std::fprintf(stderr,
-				             "[surface] base=0x%010" PRIx64 " %ux%u vkfmt=%d meta=0x%010" PRIx64 "\n",
-				             base, target.extent.width, target.extent.height,
-				             static_cast<int>(target.desc.info.pixel_format), metadata_address);
+				             "[surface] velocity base=0x%010" PRIx64 " %ux%u meta=0x%010" PRIx64 "\n",
+				             target.desc.info.data.address, target.extent.width, target.extent.height,
+				             metadata_address);
 				std::fflush(stderr);
 			}
 		}
