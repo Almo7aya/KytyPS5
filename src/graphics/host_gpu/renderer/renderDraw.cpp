@@ -688,8 +688,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.is_clear         = target.color_clear_enable;
 		const auto metadata_address = target.desc.info.metadata.range.address;
 		uint32_t   clear_code       = 0;
-		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
-		    cache.IsMetaCleared(metadata_address, view.base_layer)) {
+		const bool has_dcc          = target.desc.info.metadata.kind == ImageMetadataKind::Dcc;
+		// Sampled before the clear state is consumed below, so the report reflects the decision inputs
+		// rather than the post-consume state.
+		const bool meta_was_cleared = has_dcc && cache.IsMetaCleared(metadata_address, view.base_layer);
+		uint32_t   recorded_code    = 0;
+		const bool has_recorded_code =
+		    meta_was_cleared && cache.MetaClearCode(metadata_address, recorded_code);
+		if (has_dcc && meta_was_cleared) {
 			// A recorded DCC clear code decides the colour. Constant-encoded codes carry it
 			// directly; DCC_CLEAR_CODE_REGISTER falls back to CB_COLOR#_CLEAR_WORD. Anything else,
 			// notably DCC_CODE_UNCOMPRESSED, is a decompress rather than a clear and is ignored so
@@ -705,6 +711,34 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
 				EXIT("failed to consume DCC clear state\n");
+			}
+		}
+
+		// Why a colour target does or does not get cleared, once per distinct surface.
+		//
+		// GTA III's velocity buffer is never cleared and accumulates the previous frames' silhouettes,
+		// which is what makes the car and the character flicker: a pixel's motion vector comes from
+		// whichever stale silhouette last covered it. Exactly one colour clear happens in the whole
+		// frame - the separate-translucency surface - so the DCC clear-code path from 0db97ca fires for
+		// that target and not this one. These are the inputs to that decision, so the next run says which
+		// of them differs instead of it being guessed at.
+		{
+			static std::mutex         reported_mutex;
+			static std::set<uint64_t> reported;
+			const auto                base = target.desc.info.data.address;
+			std::unique_lock          lock(reported_mutex);
+			if (reported.size() < 24 && reported.insert(base).second) {
+				lock.unlock();
+				std::fprintf(stderr,
+				             "[rt-clear] base=0x%010" PRIx64 " %ux%u vkfmt=%d dcc=%d"
+				             " meta_addr=0x%010" PRIx64 " meta_cleared=%d code=0x%02x reg_clear=%d"
+				             " -> is_clear=%d\n",
+				             base, target.extent.width, target.extent.height,
+				             static_cast<int>(target.desc.info.pixel_format), has_dcc ? 1 : 0,
+				             metadata_address, meta_was_cleared ? 1 : 0,
+				             has_recorded_code ? (recorded_code & 0xffu) : 0u,
+				             target.color_clear_enable ? 1 : 0, attachment.is_clear ? 1 : 0);
+				std::fflush(stderr);
 			}
 		}
 	}
