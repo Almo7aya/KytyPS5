@@ -1954,13 +1954,26 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
-	CacheLock  lock(*this, m_lock);
-	const auto found = m_surface_metas.find(address);
+bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
+	std::lock_guard transaction(m_resource_mutex);
+	CacheLock       lock(*this, m_lock);
+	const auto      found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask       = UINT32_MAX;
+	found->second.clear_code       = clear_code;
+	found->second.clear_code_valid = clear_code != DCC_CODE_UNCOMPRESSED;
+	return true;
+}
+
+bool TextureCache::MetaClearCode(uint64_t address, uint8_t& clear_code) {
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || !found->second.clear_code_valid) {
+		return false;
+	}
+	clear_code = found->second.clear_code;
 	return true;
 }
 

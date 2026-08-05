@@ -23,12 +23,14 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <span>
@@ -62,12 +64,32 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	}
 
 	if (!program.info.has_bitwise_xor) {
+		// A metadata fill splats a dword sourced from a companion read-only buffer. The guest value
+		// lives at that descriptor's base address (the host index is only an alignment adjustment).
+		// A DCC clear code is byte-replicated; anything else is not a clear code.
+		uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const auto& resource = program.info.buffers[i];
+			if (resource.written) {
+				continue;
+			}
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+			uint32_t   value      = 0;
+			if (!LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value))) {
+				continue;
+			}
+			const auto byte = static_cast<uint8_t>(value);
+			if (value == byte * 0x01010101u) {
+				clear_code = byte;
+				break;
+			}
+		}
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
+				if (cache.ClearMeta(descriptor.Base48(), clear_code)) {
 					return true;
 				}
 			}

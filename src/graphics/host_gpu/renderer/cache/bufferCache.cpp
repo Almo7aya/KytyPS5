@@ -739,7 +739,14 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	// A DCC clear is a byte-replicated fill; only a replicated value encodes a clear code.
+	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+	if ((value & 0xFFu) == ((value >> 8u) & 0xFFu) &&
+	    (value & 0xFFu) == ((value >> 16u) & 0xFFu) &&
+	    (value & 0xFFu) == ((value >> 24u) & 0xFFu)) {
+		clear_code = static_cast<uint8_t>(value);
+	}
+	(void)m_texture_cache.ClearMeta(vaddr, clear_code);
 	{
 		const auto region = m_texture_cache.QueryRegion(vaddr, size);
 		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {

@@ -72,7 +72,8 @@ public:
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address, uint8_t clear_code = DCC_CODE_UNCOMPRESSED);
+	[[nodiscard]] bool MetaClearCode(uint64_t address, uint8_t& clear_code);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -90,7 +91,9 @@ private:
 	};
 
 	struct MetaDataInfo {
-		uint32_t clear_mask = 0;
+		uint32_t clear_mask       = 0;
+		uint8_t  clear_code       = DCC_CODE_UNCOMPRESSED;
+		bool     clear_code_valid = false;
 	};
 
 	struct OverlapResult {

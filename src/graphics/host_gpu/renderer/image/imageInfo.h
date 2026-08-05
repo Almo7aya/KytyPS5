@@ -31,6 +31,30 @@ enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
+// GFX9/GFX10 DCC metadata clear codes. DCC clear metadata is written as a byte-replicated
+// value that encodes the clear colour directly (constant codes) or selects the
+// CB_COLOR#_CLEAR_WORD0/1 registers. 0xff means the surface is uncompressed, not a clear.
+constexpr uint8_t DCC_CLEAR_CODE_REGISTER = 0x20;
+constexpr uint8_t DCC_CODE_UNCOMPRESSED   = 0xFF;
+
+// Maps a constant-encoded DCC clear code to a colour. Returns false for anything that is not
+// a constant-encoded clear, including DCC_CLEAR_CODE_REGISTER and DCC_CODE_UNCOMPRESSED.
+[[nodiscard]] inline bool DecodeDccConstantClear(uint8_t code, vk::ClearColorValue& color) {
+	const auto set = [&](float rgb, float alpha) {
+		color.float32[0] = rgb;
+		color.float32[1] = rgb;
+		color.float32[2] = rgb;
+		color.float32[3] = alpha;
+	};
+	switch (code) {
+		case 0x00: set(0.0f, 0.0f); return true; // clear to (0,0,0,0)
+		case 0x40: set(0.0f, 1.0f); return true; // clear to (0,0,0,1)
+		case 0x80: set(1.0f, 0.0f); return true; // clear to (1,1,1,0)
+		case 0xC0: set(1.0f, 1.0f); return true; // clear to (1,1,1,1)
+		default: return false;
+	}
+}
+
 struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind               = ImageMetadataKind::None;

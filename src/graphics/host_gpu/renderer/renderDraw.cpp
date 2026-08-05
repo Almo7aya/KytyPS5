@@ -590,9 +590,27 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto metadata_address = target.desc.info.metadata.range.address;
 		const bool metadata_clear = target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
 		                            cache.IsMetaCleared(metadata_address, view.base_layer);
-		attachment.is_clear = target.color_clear_enable || metadata_clear;
-		if (metadata_clear && !cache.TouchMeta(metadata_address, view.base_layer, false)) {
-			EXIT("failed to consume DCC clear state\n");
+		if (metadata_clear) {
+			// The recorded DCC clear code decides the clear: constant-encoded codes carry their
+			// colour directly, 0x20 falls back to the clear-word registers, and anything else
+			// (notably 0xff, an uncompressed/decompress fill) is not a clear so the attachment
+			// keeps its contents.
+			uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+			if (cache.MetaClearCode(metadata_address, clear_code)) {
+				vk::ClearColorValue dcc_clear {};
+				if (DecodeDccConstantClear(clear_code, dcc_clear)) {
+					attachment.clear_value = dcc_clear.uint32;
+					attachment.is_clear    = true;
+				} else if (clear_code == DCC_CLEAR_CODE_REGISTER) {
+					attachment.clear_value = target.color_clear_value.uint32;
+					attachment.is_clear    = true;
+				}
+			}
+			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
+				EXIT("failed to consume DCC clear state\n");
+			}
+		} else {
+			attachment.is_clear = target.color_clear_enable;
 		}
 	}
 	if (depth.image_id) {

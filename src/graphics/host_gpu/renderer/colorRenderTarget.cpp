@@ -326,12 +326,18 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
-	if (rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0 &&
-	    DecodeColorClear(rt, target_format.format, r.color_clear_value)) {
+	if (rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0) {
 		// Host images are decompressed. Preserve the DCC allocation only as logical fast-clear
 		// state so the metadata-clear compute dispatch can become a Vulkan attachment clear.
 		desc.info.metadata.range = {rt.dcc_addr.addr, 0};
 		desc.info.metadata.kind  = ImageMetadataKind::Dcc;
+		// The clear-word registers are only meaningful when the recorded DCC clear code selects
+		// the register path; constant-encoded codes carry their colour in the metadata fill.
+		uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+		if (m_context.GetTextureCache().MetaClearCode(rt.dcc_addr.addr, clear_code) &&
+		    clear_code == DCC_CLEAR_CODE_REGISTER) {
+			(void)DecodeColorClear(rt, target_format.format, r.color_clear_value);
+		}
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
