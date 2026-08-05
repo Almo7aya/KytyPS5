@@ -425,6 +425,44 @@ alongside the `ShaderLaneMaskMode` machinery. Disassemble the guest VS for event
 (`ResourceId::70990`, vs `ResourceId::71082` for the working world draw), find how `w` reaches the POS0 export,
 and check every cross-lane step on that path. A capture is no longer needed to make progress on this.
 
+### 4.1g Traced: `w` comes from `v5`; the lane-mask emitter is NOT at fault
+
+Disassembling the character VS for event 643 (`ResourceId::70990`, 2220 lines of SPIR-V):
+
+The position export is a single store at the end of the shader:
+
+	if (_2065) {                                  // _2065 = (exec_lo | exec_hi) != 0
+	  float4 _2076 = CompositeConstruct({v9, v2, v6, v5});   // x=v9 y=v2 z=v6 w=v5
+	  outPerVertex._child0 = _2076;
+	}
+
+So **`w` is whatever `v5` holds at the end of the shader**. `v5` is written repeatedly - lines 156, 182
+(`v5 = gl_VertexIndex`), 1089, 1561 (inside a conditional), 1865, 1949, 2053, and last at 2128 - each time as
+`Select(exec_active, new_value, old_value)`.
+
+**A hypothesis I formed and then disproved before acting on it.** Every one of those guards reads
+`(exec_lo | exec_hi) != 0`, which looks like an "is *any* lane active" test where RDNA requires a per-lane
+one. `EmitLaneMaskOperandActiveBool` (`spirvEmitterValues.cpp:612`) does emit that form when
+`per_invocation_masks` is set, and the per-lane bit test in the other branch - which reads as inverted, since
+graphics always requests `PerInvocation` (`SelectGraphicsLaneMaskMode(64u)` is hardcoded at
+`renderDraw.cpp:1065`).
+
+It is not inverted. `EmitPerInvocationMask` (`spirvEmitterAluOps.cpp:5`) stores **1 or 0** into the low dword
+and 0 into the high dword: in per-invocation mode a lane mask is a *per-invocation flag*, not a bitmask. For
+that representation `(low | high) != 0` is exactly right, and `EmitLogicalBinary` mapping bitwise ops onto
+logical ops confirms the design is deliberate. The guards and the position store are correct.
+
+**Where to look next.** Per-invocation masks only hold 0 or 1, so any instruction that treats a lane mask as a
+*bitmask* is wrong under this representation - bit counts (`s_bcnt1_i32_b64`), find-first
+(`s_ff1_i32_b64`/`s_flbit`), cross-lane reads (`v_readlane`, `v_readfirstlane`), or a mask used as arithmetic
+data. Those would silently produce a value from the wrong lane, which is precisely the measured signature of
+`w` in §4.1f: vertices at the same x,y receiving another vertex's `w`.
+
+The concrete task: walk `v5`'s definition chain in the event-643 disassembly backwards from line 2128 and find
+the first operation on that chain that consumes a mask register as data rather than as a condition. Compare
+against the world VS (`ResourceId::71082`), which renders correctly and should either not contain that
+operation or reach `w` by a different route.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
