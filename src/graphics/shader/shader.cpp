@@ -946,13 +946,20 @@ static bool LogPermutationMismatch(const ShaderProgramPermutation& permutation, 
 	return false;
 }
 
+// Defined with the rest of the WriteToSlice handling, further down.
+static uint32_t ShaderVsUserDataCount(const HW::VertexShaderInfo& regs,
+                                      const HW::ShaderRegisters&  sh);
+
+// `user_data_count` has to be the same window the permutation was compiled with. If the runtime span
+// were the shorter one, materialisation would fail for every permutation, so nothing would ever hit the
+// cache and the program would be recompiled until the per-shader permutation limit aborted the run.
 static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
-                                    const HW::VertexShaderInfo& regs, ShaderVertexInputInfo& info,
-                                    uint64_t shader_hash) {
+                                    const HW::VertexShaderInfo& regs, uint32_t user_data_count,
+                                    ShaderVertexInputInfo& info, uint64_t shader_hash) {
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
-	        std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
+	        std::span<const uint32_t>(regs.gs_user_sgpr.value, user_data_count),
 	        regs.es_regs.data_addr, info.stage, &error)) {
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
@@ -1107,8 +1114,9 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 	if (!ShaderGetStaticInputInfoVS(regs, sh, info)) {
 		return false;
 	}
-	const auto shader_hash = regs.gs_regs.chksum;
-	const auto program_id  = ShaderGetIdVS(regs, info, false);
+	const auto shader_hash     = regs.gs_regs.chksum;
+	const auto program_id      = ShaderGetIdVS(regs, info, false);
+	const auto user_data_count = ShaderVsUserDataCount(regs, sh);
 	const auto key =
 	    MakeShaderStageProgramKey(ShaderType::Vertex, shader_hash, program_id, lane_mask_mode);
 
@@ -1116,7 +1124,8 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 		std::scoped_lock lock(g_shader_program_cache_mutex);
 		if (auto iter = g_shader_program_cache.find(key); iter != g_shader_program_cache.end()) {
 			for (const auto& permutation: iter->second) {
-				if (TryUseVertexPermutation(*permutation, regs, info, shader_hash)) {
+				if (TryUseVertexPermutation(*permutation, regs, user_data_count, info,
+				                            shader_hash)) {
 					spirv = MakeShaderSpirvView(permutation->spirv);
 					LogShaderProgramCacheHit("VS", shader_hash,
 					                         static_cast<uint64_t>(spirv.size()));
@@ -1582,9 +1591,14 @@ static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
 	// Once per pair, and to stderr as well as the log: the standard repro runs with
 	// --printf-direction Silent, which suppresses LOGF, and the derived map is what says whether the
 	// lowering understood the shaders.
+	// rsrc2_user_sgpr vs written_user_sgpr says whether the user-data window the hardware declared
+	// actually covers what the shader reads - see ShaderVsUserDataCount.
 	const auto report = fmt::format(
-	    "[writetoslice] es=0x{:010x} gs=0x{:010x} hash=0x{:016x}\n{}{}", key.es_addr, key.gs_addr,
-	    key.gs_hash, WriteToSlice::RingMapToString(map), WriteToSlice::EsPlanToString(plan));
+	    "[writetoslice] es=0x{:010x} gs=0x{:010x} hash=0x{:016x} rsrc2_user_sgpr={} "
+	    "written_user_sgpr={}\n{}{}",
+	    key.es_addr, key.gs_addr, key.gs_hash, static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr),
+	    regs.gs_user_sgpr.count, WriteToSlice::RingMapToString(map),
+	    WriteToSlice::EsPlanToString(plan));
 	LOGF("%s", report.c_str());
 	std::fputs(report.c_str(), stderr);
 	std::fflush(stderr);
@@ -1594,6 +1608,29 @@ static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
 bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs,
                                  const HW::ShaderRegisters&  sh) {
 	return ShaderWriteToSlicePlan(regs, sh).matched;
+}
+
+// How many SGPRs to treat as user data for a vertex shader.
+//
+// Normally this is exactly what the hardware was told: SPI_SHADER_PGM_RSRC2_GS.USER_SGPR. But the
+// export shader of a real ES+GS pair has no captured count of its own - EsStageRegisters holds only a
+// code address, and that RSRC2 field describes the geometry half of the merged pair. GTA III's LUT
+// shader reads a buffer descriptor out of s8 and the tracker rejected it as unknown, which is what an
+// undersized window looks like:
+//
+//   shader resource tracking: pc=0x00000030 descriptor source 2 dword 0 contains an unknown value
+//
+// So for that path only, fall back to how many user SGPRs the guest actually wrote. That is a fact
+// rather than an inference, and it stays scoped: widening the window for ordinary vertex shaders could
+// let a read past the real user data resolve to a stale descriptor instead of being caught.
+static uint32_t ShaderVsUserDataCount(const HW::VertexShaderInfo& regs,
+                                      const HW::ShaderRegisters&  sh) {
+	const uint32_t declared = regs.gs_regs.rsrc2.user_sgpr;
+	if (!ShaderWriteToSlicePlan(regs, sh).matched) {
+		return declared;
+	}
+	return std::min<uint32_t>(std::max<uint32_t>(declared, regs.gs_user_sgpr.count),
+	                          HW::UserSgprInfo::SGPRS_MAX);
 }
 
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
@@ -1612,7 +1649,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.shader_hash          = regs.gs_regs.chksum;
 	options.shader_base          = shader_addr;
 	options.user_data_base       = 8;
-	options.user_data_count      = regs.gs_regs.rsrc2.user_sgpr;
+	options.user_data_count      = ShaderVsUserDataCount(regs, sh);
 	options.user_data            = regs.gs_user_sgpr.value;
 	options.descriptor_set       = 0;
 	options.push_constant_offset = 0;
