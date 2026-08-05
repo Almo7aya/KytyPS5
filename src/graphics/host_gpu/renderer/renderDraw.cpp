@@ -1175,6 +1175,21 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	g_draw_skips.submitted.fetch_add(1, std::memory_order_relaxed);
 	ReportDrawSkips();
 
+	// A/B: KYTY_BARRIER_EVERY_DRAW makes every draw wait on all prior shader writes.
+	//
+	// Unreal's per-object transforms live in a GPU-written buffer (KYTY_FORCE_BUFFER_UPLOAD made the models
+	// *worse*, which proves guest memory is the stale copy and the GPU is the producer). If the pass that
+	// produces them is not ordered against the draws that read them, a draw can read partially written
+	// transforms - garbage for some objects, on some frames, which is the symptom. This over-synchronises
+	// brutally; if the misplacement stops, the defect is a missing dependency.
+	static const bool barrier_every_draw = std::getenv("KYTY_BARRIER_EVERY_DRAW") != nullptr;
+	if (barrier_every_draw) {
+		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader |
+		                                  vk::PipelineStageFlagBits::eVertexShader |
+		                                  vk::PipelineStageFlagBits::eFragmentShader |
+		                                  vk::PipelineStageFlagBits::eTransfer);
+	}
+
 	switch (static_cast<Prospero::PrimitiveType>(ucfg.GetPrimType())) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:

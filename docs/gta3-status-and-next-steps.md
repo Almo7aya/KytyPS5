@@ -215,7 +215,33 @@ Rules that make this work:
 | `KYTY_LENIENT_HOST_FAULTS=1` | survive nested faults so F1 capture works | captures may hold stale bytes |
 | `KYTY_FORCE_VELOCITY_CLEAR=1` | clear full-res R16G16B16A16_UNORM attachments | **tested: no effect on the flicker** |
 | `KYTY_META_CLEAR_ASSUME_ZERO=1` | codeless metadata clear ⇒ clear to zero | **tested: no effect on the flicker** |
-| `KYTY_FORCE_BUFFER_UPLOAD=1` | re-upload read-only buffers in full every use | a full upload per bind; diagnostic only |
+| `KYTY_FORCE_BUFFER_UPLOAD=1` | re-upload read-only buffers in full every use | **tested: models got much WORSE** — see §4.1b |
+| `KYTY_NO_STALE_UPLOAD=1` | never upload over a GPU-modified read-only range | may serve genuinely stale data if the tracker is right |
+| `KYTY_BARRIER_EVERY_DRAW=1` | every draw waits on all prior shader writes | heavy over-synchronisation, slow |
+| `KYTY_NO_STORAGE_CLAMP=1` | bind the descriptor's nominal size, not the mapped extent | may bind unmapped memory; relies on robust access |
+
+### 4.1b `KYTY_FORCE_BUFFER_UPLOAD` made it worse — which is the most useful result yet
+
+Forcing read-only buffers to be re-uploaded from guest memory made the models **markedly worse**
+(misshapen, wrongly positioned). That is a strong positive signal, not a dead end:
+
+**Guest memory is the stale copy for these buffers, and the GPU is the producer.** Overwriting Kyty's copy
+with guest bytes destroys correct data. So Unreal's per-object transforms are written by a GPU pass, not by
+the CPU.
+
+That inverts the hypothesis. The bug is not a *missed* CPU write; it is one of:
+
+1. **A stale upload over GPU-produced data.** If the memory tracker ever believes such a range is CPU-dirty,
+   the normal `ForEachUploadRange` path overwrites good GPU data with stale guest bytes — for whichever
+   objects live in that range, on whichever frames the tracker gets it wrong. That is precisely "some parts
+   of some models, some frames". → `KYTY_NO_STALE_UPLOAD`
+2. **A missing dependency** between the GPU pass that produces the transforms and the draws that read them,
+   so a draw reads partially written data. → `KYTY_BARRIER_EVERY_DRAW`
+3. **The storage-buffer clamp** cutting into indexed data, where robust access returns zero. →
+   `KYTY_NO_STORAGE_CLAMP`
+
+Test them one at a time. Note 2 and 3 are expected to be slow / wasteful when on — only whether the
+misplacement changes matters.
 
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 

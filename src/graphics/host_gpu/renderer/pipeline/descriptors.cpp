@@ -100,7 +100,22 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	// UINT32_MAX) so the shader can perform its own bounds checks. Bind only the contiguous
 	// guest-mapped portion instead of treating the descriptor's nominal multi-gigabyte footprint as
 	// a Vulkan buffer range. Robust buffer access supplies zero for reads beyond the bound range.
-	const auto bound_size = context.GetGpuResources().MappedExtent(address, size);
+	// A/B: KYTY_NO_STORAGE_CLAMP binds the descriptor's nominal size instead of the contiguous mapped
+	// extent.
+	//
+	// Robust buffer access returns **zero** past the bound range, so if the clamp cuts into data the shader
+	// actually indexes, a per-object transform read from beyond it comes back as zeros - which collapses
+	// geometry, or relocates it if only part of the matrix is lost. That matches parts of a model appearing
+	// in the wrong place. Off by default because the clamp exists for a reason: GNM descriptors are
+	// routinely over-provisioned toward UINT32_MAX, so the nominal size can be multi-gigabyte and is capped
+	// here to the device limit to keep the binding legal.
+	static const bool no_storage_clamp = std::getenv("KYTY_NO_STORAGE_CLAMP") != nullptr;
+	auto bound_size = context.GetGpuResources().MappedExtent(address, size);
+	if (no_storage_clamp) {
+		const auto limit = static_cast<uint64_t>(
+		    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+		bound_size = std::min(size, limit);
+	}
 	if (bound_size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;

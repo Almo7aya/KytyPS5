@@ -588,6 +588,22 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 		}
 	}
 
+	// A/B: KYTY_NO_STALE_UPLOAD suppresses uploading a read-only range the GPU has written.
+	//
+	// The inverse of KYTY_FORCE_BUFFER_UPLOAD, and the direction its result points to. That switch made the
+	// models worse, so guest memory is the stale copy for these buffers and the GPU is the producer. If the
+	// tracker ever believes such a range is CPU-dirty, the upload below overwrites good GPU data with stale
+	// guest bytes - garbage transforms for whichever objects live in that range, on whichever frames the
+	// tracker gets it wrong.
+	static const bool no_stale_upload = std::getenv("KYTY_NO_STALE_UPLOAD") != nullptr;
+	if (no_stale_upload && is_read && !is_written &&
+	    m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		if (is_formatted) {
+			(void)SynchronizeBufferFromImage(*cached.buffer, vaddr, size);
+		}
+		return {cached.buffer, cached.buffer->Handle(), cached.buffer->Offset(vaddr)};
+	}
+
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },
