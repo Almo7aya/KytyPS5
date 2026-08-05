@@ -219,8 +219,11 @@ Rules that make this work:
 | `KYTY_NO_STALE_UPLOAD=1` | never upload over a GPU-modified read-only range | **tested: no effect** |
 | `KYTY_BARRIER_EVERY_DRAW=1` | every draw waits on all prior shader writes | **tested: no effect — but the test was INVALID, see §4.1c** |
 | `KYTY_NO_STORAGE_CLAMP=1` | bind the descriptor's nominal size, not the mapped extent | **tested: no effect** |
-| `KYTY_BARRIER_AFTER_DISPATCH=1` | barrier after *every* dispatch, not just detected writers | slow; over-synchronises compute |
-| `KYTY_FULL_BARRIER_AFTER_DISPATCH=1` | as above plus an `eAllCommands` / `eMemoryWrite→eMemoryRead` barrier | slowest; masks any mis-specified access bit |
+| `KYTY_BARRIER_AFTER_DISPATCH=1` | barrier after *every* dispatch, not just detected writers | **tested: no effect** |
+| `KYTY_FULL_BARRIER_AFTER_DISPATCH=1` | `eAllCommands` / `eMemoryWrite→eMemoryRead` after every dispatch | **tested: no effect** |
+| `KYTY_NO_FETCH_COMPONENTS_FIX=1` | revert the cache-hit replay of `resource_fetch_components` | restores the §4.1d bug |
+| `KYTY_FETCH_COMPONENTS_IGNORE=1` | always size vertex attributes from `registers_num` | ignores real fetch widths |
+| `KYTY_FETCH_COMPONENTS_MAX=1` | always fetch four components per attribute | may read past small attributes |
 
 ### 4.1b `KYTY_FORCE_BUFFER_UPLOAD` made it worse — which is the most useful result yet
 
@@ -287,6 +290,55 @@ How to read the outcome:
 | `BARRIER_AFTER_DISPATCH` fixes it | write detection (`HasShaderBufferWrites` / the image scan) misses real producers — fix the classifier |
 | only `FULL_BARRIER_AFTER_DISPATCH` fixes it | a write escapes the `eShaderWrite` access bucket — widen `MakeShaderWriteDependency`'s src mask |
 | neither changes anything | dispatch→draw ordering is fully eliminated; move to vertex/index buffer residency and the embedded vertex-fetch rewrite |
+
+**Both were tested: no effect.** Dispatch→draw ordering is eliminated, and with it every memory-residency and
+synchronisation hypothesis. The defect is in how the vertex layout itself is built.
+
+### 4.1d The permutation cache loses `resource_fetch_components` — a real, specific defect
+
+`MakeVertexInputState` in `pipeline/shaders.cpp` chooses each attribute's Vulkan format from the number of
+components the shader actually fetches, falling back to the destination register span when that is unknown:
+
+```cpp
+auto registers_num   = vs_input_info.resources_dst[index].registers_num;
+auto used_components = (vs_input_info.resource_fetch_components[index] > 0
+                            ? vs_input_info.resource_fetch_components[index]
+                            : registers_num);
+GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size, used_components);
+```
+
+`resource_fetch_components` has exactly one writer in the whole tree - `RewriteEmbeddedVertexFetches` in
+`ShaderRecompiler.cpp:629`, which fills it in through a `const_cast` **as a side effect of recompiling**:
+
+```cpp
+mutable_input_info->resource_fetch_components[resource_id] =
+    std::max(mutable_input_info->resource_fetch_components[resource_id], inst.input_info.chan + 1u);
+```
+
+A permutation cache hit skips the recompile, so nothing ever writes those counts on that path and they stay
+at their `= {}` default of zero. The attribute format then comes from `registers_num` instead.
+
+So two draws sharing one shader can build **different vertex layouts**: the draw that compiled the
+permutation uses the true fetch widths, and every later draw that hits the cache uses the register span.
+Wherever those disagree - a shader fetching two components into a four-register destination - the attribute
+format is wrong and the vertex buffer is decoded at the wrong widths. Wrong widths mean positions read from
+the wrong bytes, which is geometry landing at arbitrary places.
+
+This matches every property of the bug: it affects only shaders where the two counts differ (so *some*
+models), only some attributes within those (so *parts* of a model), it is independent of motion, it is
+frame-to-frame unstable because it depends on which draw won the compile, and it is invisible to every
+memory-residency and barrier switch tested above.
+
+The fix carries the counts in `ShaderProgramPermutation::vertex_fetch_components` and replays them in
+`TryUseVertexPermutation`. It is **on by default**; `KYTY_NO_FETCH_COMPONENTS_FIX=1` restores the old
+behaviour for comparison. `KYTY_FETCH_COMPONENTS_IGNORE=1` and `KYTY_FETCH_COMPONENTS_MAX=1` bracket the
+field from the other side, pinning every draw to one consistent choice.
+
+| Result | Conclusion |
+| --- | --- |
+| default build is fixed, `NO_FETCH_COMPONENTS_FIX=1` flickers | confirmed - this was the bug |
+| `IGNORE=1` or `MAX=1` also stabilises it | consistency across draws is what matters, not the specific width |
+| all four behave identically | the two counts never disagree in practice; re-check `ResolveEmbeddedFetchResource` remapping and index-buffer residency next |
 
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 

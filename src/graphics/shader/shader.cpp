@@ -144,6 +144,13 @@ struct ShaderStageProgramKeyHash {
 struct ShaderProgramPermutation {
 	std::vector<uint32_t>                                spirv;
 	std::shared_ptr<const ShaderRecompiler::IR::Program> program;
+
+	// RewriteEmbeddedVertexFetches populates ShaderVertexInputInfo::resource_fetch_components as a
+	// side effect of recompiling, and MakeVertexInputState turns those counts into the Vulkan attribute
+	// formats. A permutation cache hit skips the recompile, so the counts have to be replayed from here or
+	// the attribute formats silently fall back to registers_num.
+	int  vertex_fetch_components[ShaderVertexInputInfo::RES_MAX] = {};
+	bool has_vertex_fetch_components                            = false;
 };
 
 static std::unordered_map<ShaderStageProgramKey,
@@ -994,6 +1001,20 @@ static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
 	ApplyVertexOutputs(info, *permutation.program);
+
+	// A/B: KYTY_NO_FETCH_COMPONENTS_FIX reverts to the old behaviour, where a cache hit left these at zero.
+	//
+	// GetInputFormat derives each attribute's Vulkan format from resource_fetch_components when it is set and
+	// from resources_dst[].registers_num when it is not. Those two disagree whenever a shader fetches fewer
+	// components than its destination register span covers, so before this replay a cache-hit draw could build
+	// a different vertex layout from the identical draw that compiled the permutation - wrong component count,
+	// wrong attribute format, geometry read at the wrong offsets.
+	static const bool no_fix = std::getenv("KYTY_NO_FETCH_COMPONENTS_FIX") != nullptr;
+	if (!no_fix && permutation.has_vertex_fetch_components) {
+		std::copy(std::begin(permutation.vertex_fetch_components),
+		          std::end(permutation.vertex_fetch_components),
+		          std::begin(info.resource_fetch_components));
+	}
 	return true;
 }
 
@@ -1173,6 +1194,10 @@ bool ShaderCompileInfoVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegis
 	ShaderProgramPermutation permutation {};
 	permutation.spirv   = std::move(compiled_spirv);
 	permutation.program = info.stage.program;
+	// Snapshot the counts the recompile just derived, so later cache hits can replay them.
+	std::copy(std::begin(info.resource_fetch_components), std::end(info.resource_fetch_components),
+	          std::begin(permutation.vertex_fetch_components));
+	permutation.has_vertex_fetch_components = true;
 	spirv = AddShaderProgramPermutation("VS", shader_hash, key, std::move(permutation));
 	return true;
 }

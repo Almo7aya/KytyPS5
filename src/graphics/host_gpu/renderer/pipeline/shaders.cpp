@@ -594,11 +594,24 @@ void CreatePipelineInternal(
 			input_attr[index].location = index;
 			input_attr[index].offset   = b.attr_offsets[ai];
 
-			uint32_t attr_size       = 4;
-			auto     registers_num   = vs_input_info.resources_dst[index].registers_num;
-			auto     used_components = (vs_input_info.resource_fetch_components[index] > 0
-			                                ? vs_input_info.resource_fetch_components[index]
-			                                : registers_num);
+			// A/B: two ways to stop trusting resource_fetch_components, which only a recompile populates.
+			//   KYTY_FETCH_COMPONENTS_IGNORE=1 - always size attributes from the destination register span.
+			//   KYTY_FETCH_COMPONENTS_MAX=1    - always fetch all four components.
+			// Between them and KYTY_NO_FETCH_COMPONENTS_FIX these bracket the field: if the flicker responds
+			// to any of the three, the attribute formats were being built inconsistently across draws that
+			// share a shader.
+			static const bool ignore_fetched = std::getenv("KYTY_FETCH_COMPONENTS_IGNORE") != nullptr;
+			static const bool max_fetched    = std::getenv("KYTY_FETCH_COMPONENTS_MAX") != nullptr;
+
+			uint32_t attr_size     = 4;
+			auto     registers_num = vs_input_info.resources_dst[index].registers_num;
+			auto     used_components =
+			    (vs_input_info.resource_fetch_components[index] > 0 && !ignore_fetched
+			             ? vs_input_info.resource_fetch_components[index]
+			             : registers_num);
+			if (max_fetched) {
+				used_components = 4;
+			}
 			GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
 			               static_cast<uint32_t>(used_components));
 
