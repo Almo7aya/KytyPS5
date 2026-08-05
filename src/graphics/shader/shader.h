@@ -266,7 +266,7 @@ void ShaderSetLayeredVertexOutputSupported(bool supported);
 //
 // The draw path and ShaderCompileSpirvVS must reach the same conclusion: admitting the draw without
 // the lowering would bind a vertex shader that exports no position and draw nothing.
-bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs);
+bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh);
 
 } // namespace Libs::Graphics
 

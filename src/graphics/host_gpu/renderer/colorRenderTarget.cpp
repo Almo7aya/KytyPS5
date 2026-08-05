@@ -21,7 +21,8 @@
 
 namespace Libs::Graphics {
 
-static std::atomic<uint32_t> g_render_color_log_count = 0;
+static std::atomic<uint32_t> g_render_color_log_count            = 0;
+static std::atomic<uint32_t> g_render_color_view_clamp_log_count = 0;
 
 static float ColorClearF16(uint32_t value) {
 	const uint32_t sign     = (value >> 15u) & 0x1u;
@@ -293,10 +294,25 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
 	const uint32_t     view_depth  = std::max(depth >> rt.view.current_mip_level, 1u);
-	if (volume &&
-	    (view.base_layer >= view_depth || view.layer_count > view_depth - view.base_layer)) {
-		EXIT("3D render-target view exceeds mip depth: base=%u count=%u depth=%u mip=%u\n",
-		     view.base_layer, view.layer_count, view_depth, rt.view.current_mip_level);
+	uint32_t           view_layers = view.layer_count;
+	if (volume) {
+		if (view.base_layer >= view_depth) {
+			EXIT("3D render-target view starts past the mip depth: base=%u depth=%u mip=%u\n",
+			     view.base_layer, view_depth, rt.view.current_mip_level);
+		}
+		// The view can legitimately overrun the volume: GTA III's colour-grading LUT target reports 32
+		// slices and programs CB_COLOR_VIEW slices [0..32], one past the last. Slices that do not exist
+		// cannot be rendered to, so the view is clamped to the ones that do rather than rejected - Vulkan
+		// would fail view creation on the unclamped count.
+		if (view_layers > view_depth - view.base_layer) {
+			const auto clamped = view_depth - view.base_layer;
+			if (g_render_color_view_clamp_log_count.fetch_add(1) < 8) {
+				LOGF("RenderColorTarget: clamping 3D view to the mip depth: base=%u count=%u -> %u"
+				     " depth=%u mip=%u\n",
+				     view.base_layer, view_layers, clamped, view_depth, rt.view.current_mip_level);
+			}
+			view_layers = clamped;
+		}
 	}
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
@@ -354,13 +370,12 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		};
 	}
 	desc.view_info.format = target_format.format;
-	desc.view_info.type =
-	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.type = view_layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
 	desc.view_info.aspect      = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.base_level  = rt.view.current_mip_level;
 	desc.view_info.level_count = 1;
 	desc.view_info.base_layer  = view.base_layer;
-	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.layer_count = view_layers;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 	auto& texture_cache        = m_context.GetTextureCache();
 	r.desc                     = std::move(desc);

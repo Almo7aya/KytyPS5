@@ -459,8 +459,7 @@ static WriteToSliceInfo ClassifyWriteToSliceGs(const RenderCommandBuffer& buffer
 
 	// The bound colour target must be a volume or layered surface, and the bound view has to cover
 	// every one of its slices. The shader writes `MinZ + gl_InstanceIndex` as the slice index, which
-	// indexes the view - so a view over a subset would send instances outside it. Requiring the whole
-	// volume keeps that impossible instead of merely unlikely.
+	// indexes the view - so a view over a subset would send instances outside it.
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = ctx.GetRenderTarget(rt_slot);
 	if (rt.attrib3.dimension != 2 && rt.attrib3.dimension != 1) {
@@ -474,8 +473,13 @@ static WriteToSliceInfo ClassifyWriteToSliceGs(const RenderCommandBuffer& buffer
 		return {};
 	}
 	// A 3D target fans across its depth; a 2D array target fans across its layers.
+	//
+	// The view may be *wider* than the volume: GTA III's LUT target reports depth=31, i.e. 32 slices,
+	// with CB_COLOR_VIEW slices [0..32] - one past the last slice. So this asks the view to cover the
+	// volume rather than to match it exactly, and the target resolve clamps the view to the slices that
+	// exist. An exact-match test rejected the one draw this was written for.
 	const uint32_t fan_out = slice_count != 0 ? slice_count : view.layer_count;
-	if (view.layer_count != fan_out) {
+	if (view.layer_count < fan_out) {
 		return {};
 	}
 
@@ -524,7 +528,7 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 		// only adds a slice index, so the pair runs as an instanced vertex shader instead. Dropping it
 		// is what leaves GTA III sampling a neutral colour-grading LUT.
 		const auto wts        = ClassifyWriteToSliceGs(buffer);
-		const bool lowerable  = wts.matched && ShaderWriteToSliceLowerable(vertex_info);
+		const bool lowerable  = wts.matched && ShaderWriteToSliceLowerable(vertex_info, sh_regs);
 		const auto wts_log_id = g_write_to_slice_log_count.fetch_add(1);
 		if (wts_log_id < 8) {
 			// Deliberately stderr: the standard repro runs with --printf-direction Silent, which

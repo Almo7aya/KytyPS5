@@ -1485,8 +1485,24 @@ static std::mutex g_write_to_slice_plans_mutex;
 // Derives the plan for a pair, or returns a non-matching one. Both the draw path and the VS compile
 // go through here, so they cannot disagree.
 static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
-    const HW::VertexShaderInfo& regs) {
+    const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh) {
 	using namespace ShaderRecompiler;
+
+	// `gs_regs.data_addr` is not cleared when a draw stops using a real geometry shader, so on an NGG
+	// passthrough draw it still holds whatever pair ran last. Without this gate every ordinary vertex
+	// shader in the title got analysed against that stale address - 138 pairs in one run, all rejected
+	// because the shader exports directly, but all of it wasted and all of it in the log. These two
+	// registers are what says a real geometry shader is bound: one triangle in, one triangle out.
+	static const WriteToSlice::EsPlan not_a_gs_draw = [] {
+		WriteToSlice::EsPlan plan {};
+		plan.reject_reason = "no real geometry shader is bound";
+		return plan;
+	}();
+	if (sh.m_vgtGsMaxVertOut != 3u ||
+	    static_cast<Prospero::GsOutputPrimitiveType>(sh.m_vgtGsOutPrimType) !=
+	        Prospero::GsOutputPrimitiveType::kTriangles) {
+		return not_a_gs_draw;
+	}
 
 	static const WriteToSlice::EsPlan unsupported = [] {
 		WriteToSlice::EsPlan plan {};
@@ -1575,8 +1591,9 @@ static const ShaderRecompiler::WriteToSlice::EsPlan& ShaderWriteToSlicePlan(
 	return set();
 }
 
-bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs) {
-	return ShaderWriteToSlicePlan(regs).matched;
+bool ShaderWriteToSliceLowerable(const HW::VertexShaderInfo& regs,
+                                 const HW::ShaderRegisters&  sh) {
+	return ShaderWriteToSlicePlan(regs, sh).matched;
 }
 
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
@@ -1606,7 +1623,7 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 
 	// A WriteToSlice export shader has to be lowered rather than compiled as-is: it exports nothing on
 	// its own. The draw path only lets such a draw through when this plan matches, so the two agree.
-	if (const auto& plan = ShaderWriteToSlicePlan(regs); plan.matched) {
+	if (const auto& plan = ShaderWriteToSlicePlan(regs, sh); plan.matched) {
 		options.write_to_slice = &plan;
 	}
 
