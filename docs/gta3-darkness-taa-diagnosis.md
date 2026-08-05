@@ -432,6 +432,85 @@ Needs a run, or a capture taken while the flashing is visible:
    the frame boundary holding what the previous frame wrote.
 2. **The TAA's stencil reads versus the depth pass's stencil writes**, per §13.3.
 
+## 14. The flashing, bisected and partly fixed (06 Aug)
+
+### 14.1 Captures work again
+
+`KYTY_LENIENT_HOST_FAULTS=1` makes F1 capture survive. RenderDoc serialises all mapped memory from its
+own thread, that walks into write-tracked guest pages, and resolving one of those faults can fault
+again - which the filter treated as unconditionally fatal. With the switch set a nested fault is
+resolved by making the page accessible and re-executing, touching no cache (the handler is not
+re-entrant; the graphics caches have their own recursive-acquisition guards). Depth is capped at 4 so
+real recursion still fails fast.
+
+Cost: that page's GPU-ownership bookkeeping is skipped, so such a capture can hold stale bytes. Fine for
+diagnosis, not acceptable as a default - hence opt-in. `_RenderDoc/kyty_frame951.rdc` was taken this way.
+
+**This unblocks the whole class of work.** Every prior round on the flashing was reasoning without
+data, and three hypotheses in a row were wrong.
+
+### 14.2 Two different defects, separated by experiment
+
+Bisection switches (`KYTY_ZPASS_ALWAYS_VISIBLE`, `KYTY_NO_PREDICATION`) established:
+
+| Symptom | Cause | Status |
+| --- | --- | --- |
+| Street lamps, buildings blinking | occlusion-query results | mitigated: results no longer trusted |
+| Car, character parts blinking | **not** occlusion - persists with culling fully off | open |
+
+Predication is **not** the culling mechanism: zero draw packets skipped in any run. Unreal reads query
+results on the CPU and drops primitives from the next frame's list. The queries reported ~47% occluded on
+an open bridge at night, which is not credible, so they are now ignored (`KYTY_OCCLUSION_QUERIES=1`
+restores them). Why they are wrong is still unknown - this is a measured trade, not a root-cause fix.
+
+A draw-skip histogram then cleared the renderer for the remaining defect: `empty=0 no_vertex=0
+ge_skip=0` across 240k submitted draws. Kyty drops nothing. The indirect-argument paths are also unused
+(`DrawIndexIndirectMulti`, `DispatchIndirect` never called), so the CPU-reads-GPU-produced-args hazard -
+real, and still latent - is not this.
+
+So the remaining draws execute and produce wrong geometry.
+
+### 14.3 The blue cone is a volumetric light beam, and constant z is not the bug
+
+From `kyty_frame951.rdc`, the cone in the sky is **event 12290**:
+
+- 786 indices, **TriangleStrip**, 1 instance
+- target `3423` = the **separate-translucency** buffer; depth `3979` bound
+- samples the depth buffer as a texture, plus 3D textures `3375`/`3379` (32×32, written by the
+  alternating passes at events 10208-11512) and `52456` (210×119) - **volumetric fog froxel grids**
+- VS inputs are only `in_attr_0`, `in_attr_1`, so its transform comes from a uniform/storage buffer,
+  not the vertex stream
+
+That is a volumetric light-beam/light-shaft cone belonging to the street lamp. In the image it is
+**inverted** - apex at the bottom, wide end at the top - and centred in the sky rather than at the lamp,
+which is left of centre.
+
+**Retire the constant-z suspicion.** Post-VS position is `z = 10.0` for every vertex with `w ≈ 1027.8`.
+That is correct: UE's reversed-Z infinite-far projection sets `z_clip = near` (10 uu) and `w_clip =
+z_view`, so NDC z = near/z_view. Part 4 already cautioned about this after being misled by it; it is now
+settled, and `w ≈ 1027` puts the cone ~10 m away, i.e. at the lamp's distance.
+
+The cone also carries the **dither/checkerboard pattern** that Part 4 saw on the character's clothing.
+UE dithers volumetric and masked material sampling and relies on TAA to resolve it, which needs a dither
+offset that *changes every frame*. A constant offset produces a permanent stipple. Worth checking whether
+the frame index or `View.TemporalAAParams` Kyty supplies is static.
+
+### 14.4 What is NOT established
+
+- Whether the cone's transform is wrong or the cone is correctly placed and wrongly shaded. Only 8 of
+  786 vertices were inspected; they cluster tightly, which is normal for a strip, so the spread was
+  never measured.
+- Whether the character's missing sections share the cone's cause.
+- Why the occlusion queries return "occluded" for half the frame.
+
+### 14.5 Next steps, in order
+
+1. Measure the cone draw's full NDC extent (`get_post_vs_data` over all 786 vertices) and compare
+   against the lamp's position. That decides transform-vs-shading in one step.
+2. Read the cone VS's uniform buffer and check the light transform it contains.
+3. Check whether the dither offset / frame index Kyty feeds the volumetric and masked material shaders
+   changes per frame. A static one explains the permanent stipple, and possibly the character too.
+
 ### 13.6 A trap worth recording, because it cost several rounds
 
 Kyty's `supported_ps_input_bits` says only that a pixel-shader input register is recognized well enough
