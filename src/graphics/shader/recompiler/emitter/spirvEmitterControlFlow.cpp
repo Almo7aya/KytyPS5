@@ -389,14 +389,31 @@ void EmitVertexInputRegisters(EmitterState& state) {
 		return;
 	}
 
+	// A/B: this seeds v5 and v8 unconditionally, on the assumption that the PS5 VS ABI hands the vertex index
+	// in v5 and the instance index in v8. Nothing checks whether the guest shader actually treats them that
+	// way.
+	//
+	// Measured in _RenderDoc/kyty_frame1207.rdc (docs section 4.1f): the character VS exports position as
+	// float4(v9, v2, v6, v5), so v5 becomes clip-space w, and it reaches that value through an accumulate
+	// chain - v5 = Fma(s23, v0, v5). v8 is accumulated the same way. For a shader like this the seeding writes
+	// over the initial value of an accumulator, and w is exactly the component measured to be wrong.
+	//
+	//   KYTY_NO_VERTEX_INDEX_SEED=1   - seed neither register.
+	//   KYTY_NO_INSTANCE_INDEX_SEED=1 - seed v5 but not v8, to tell the two apart.
+	//
+	// A shader that genuinely needs the ABI values will fetch from vertex 0 / instance 0 for every vertex,
+	// which usually collapses a mesh to a point rather than scattering it - a distinguishable failure.
+	static const bool no_vertex_seed   = std::getenv("KYTY_NO_VERTEX_INDEX_SEED") != nullptr;
+	static const bool no_instance_seed = std::getenv("KYTY_NO_INSTANCE_INDEX_SEED") != nullptr;
+
 	const auto vertex_index = PointerForRegister(state, {IR::RegisterFile::Vector, 5});
-	if (vertex_index != 0) {
+	if (vertex_index != 0 && !no_vertex_seed) {
 		state.builder.AddFunction(
 		    {OpStore, vertex_index, EmitInputScalarU32(state, IR::StageInputKind::VertexIndex)});
 	}
 
 	const auto instance_index = PointerForRegister(state, {IR::RegisterFile::Vector, 8});
-	if (instance_index != 0) {
+	if (instance_index != 0 && !no_vertex_seed && !no_instance_seed) {
 		state.builder.AddFunction({OpStore, instance_index,
 		                           EmitInputScalarU32(state, IR::StageInputKind::InstanceIndex)});
 	}

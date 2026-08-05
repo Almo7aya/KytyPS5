@@ -596,7 +596,16 @@ uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputIn
 	uint32_t rewritten          = 0;
 	for (auto& block: ir.blocks) {
 		for (auto& inst: block.instructions) {
-			if (IsIrFetchPrologLoad(inst) && EmbeddedFetchPcInList(prolog_pcs, inst.pc)) {
+			// A/B: KYTY_KEEP_FETCH_PROLOG=1 leaves the fetch prolog loads in place instead of erasing them.
+			//
+			// These loads are deleted because the fetch they fed has been replaced by a Vulkan vertex input.
+			// But if a prolog load also initialised a register the shader body goes on to use for something
+			// else - v5 becomes clip-space w in the character shaders, see docs 4.1f - erasing it leaves that
+			// register holding whatever the prologue put there.
+			static const bool keep_fetch_prolog = std::getenv("KYTY_KEEP_FETCH_PROLOG") != nullptr;
+
+			if (!keep_fetch_prolog && IsIrFetchPrologLoad(inst) &&
+			    EmbeddedFetchPcInList(prolog_pcs, inst.pc)) {
 				auto pc = inst.pc;
 				inst    = {};
 				inst.pc = pc;
