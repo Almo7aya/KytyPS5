@@ -924,6 +924,81 @@ This is a genuine recompiler pass — a GS export-mapping analysis plus an ES st
 transform — not the ~133-line port Part 8 estimated. The layer plumbing and classifier from the branch
 still drop in underneath it.
 
+## Part 10 — WriteToSlice implemented (05 Aug, later)
+
+The design above is implemented. Built, not yet run. Three things came out of doing it that change what
+Part 9 recorded.
+
+### 10.1 The hand-read export map in Part 9 is wrong: POS0 and PARAM0 are swapped
+
+The map is now derived by `WriteToSlice::AnalyzePassthroughGs` and it does not agree with the table in
+Part 9. The correct map:
+
+| ring offset | export | what the ES puts there |
+|---|---|---|
+| 0, 4 | **`PARAM0.x`, `PARAM0.y`** | `v_mad_f32` scale-biased pair |
+| 8, 12 | **`POS0.x`, `POS0.y`** | raw `buffer_load_format_xy` result |
+| 16, 20 | `POS0.z`, `POS0.w` | constants `0.0`, `1.0` |
+| 24 | `POS1.z` → `gl_Layer` | `MinZ + InstanceID` |
+| — | `PARAM0.z`, `PARAM0.w` | `0` (GS materializes these) |
+
+Cross-checked against UE4's `WriteToSliceMainVS`, which scale-biases the **UV**, not the position:
+
+	Output.Vertex.Position = float4(InPosition, 0, 1);
+	Output.Vertex.UV       = InUV * UVScaleBias.xy + UVScaleBias.zw;
+
+so the mad'ed pair at offsets 0/4 is the UV and belongs to `PARAM0`, and the raw pair at 8/12 is the
+position. Part 9 read the mad as the position remap and got the two backwards. This is exactly the
+failure mode the commit messages warned about, and it is why the map is derived rather than assumed.
+
+### 10.2 The reason the analysis rejected PARAM0 was not control flow
+
+`504708c` recorded the rejection as needing "real dataflow over the CFG". It did not. The decoder fills
+`Instruction::dst` from the vdst field unconditionally, and a DS store has no vdst — those bits read as
+register 0 — so every `ds_write` looked like it defined `v0` and cleared its provenance. The GS carries
+ring[0] in v0 across the bookkeeping stores of the NGG vertex-compaction pass, so PARAM0 lost its
+origin there and nowhere else. Stores and exports no longer clobber `dst`.
+
+The linear scan is kept and is sound for this pattern, because conflicting LDS stores poison their slot
+instead of overwriting it: a value survives only if every path that wrote it agreed, so a staging copy
+that is not uniform across the emitted vertices rejects.
+
+### 10.3 A blocker Part 9 did not see: the ES's entry gate needs NGG launch state
+
+The ES opens with
+
+	s_lshl_b32 vcc_lo, s3, 16
+	s_bfe_u64  exec_lo, -1, vcc_lo
+	s_cbranch_execz <end>
+
+`s3` is the NGG merged-wave info the hardware supplies when an ES and a GS share a wave; bits 6:0 are
+the ES vertex count, and EXEC is derived from them. Kyty's VS user data starts at s8, so s0–s7
+initialise to zero — EXEC would come out **empty** and the shader would store nothing at all. Lowered
+shaders now get `s3 = wave_size`: every lane of a vertex-shader wave is a real vertex here, and the
+wave index in bits 27:24 is zero because the ring slot it addressed no longer exists.
+
+This is the kind of thing that would have looked like "the fix did nothing" from a screenshot.
+
+### 10.4 What the next run should show
+
+Both decisions report to **stderr**, so they survive `--printf-direction Silent`:
+
+- once per ES/GS pair: `[writetoslice] es=… gs=…` followed by the derived ring map and the ES store
+  plan, or a reject reason;
+- per skipped/admitted draw (first 8): `[writetoslice] classified=… lowerable=… RT=… dim=… depth=…
+  slices=[a..b] fan_out=…`.
+
+`classified=0` with `dim=2` would mean the guest binds the volume through a view that does not cover
+every slice — the classifier requires the full volume, because the shader's slice index indexes the
+view and a partial view would send instances outside it. That is the most likely remaining reason for
+the draw to stay skipped, and the `slices=[a..b]` field says so directly.
+
+`lowerable=0` with `classified=1` means the device lacks Vulkan 1.2 `shaderOutputLayer`, or the pair
+analysis rejected; the per-pair line carries the reason.
+
+If the LUT is produced, the tonemap stops applying the neutral curve and the shadows should lift. The
+flashing is a separate defect (see `gta3-darkness-taa-diagnosis.md`) and is not expected to change.
+
 ### Tooling note
 
 The RenderDoc MCP server is not required. `C:\Program Files\RenderDoc` ships a Python module
