@@ -707,6 +707,24 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				EXIT("failed to consume DCC clear state\n");
 			}
 		}
+
+		// TEMPORARY. Identifies each colour surface once, so the [meta] clear trace - which only has
+		// addresses - can be correlated with it. Surface allocations move between runs, so the two have
+		// to be captured in the same build; keeping them apart is what made the previous run unreadable.
+		{
+			static std::mutex         seen_mutex;
+			static std::set<uint64_t> seen;
+			const auto                base = target.desc.info.data.address;
+			std::unique_lock          lock(seen_mutex);
+			if (seen.size() < 96 && seen.insert(base).second) {
+				lock.unlock();
+				std::fprintf(stderr,
+				             "[surface] base=0x%010" PRIx64 " %ux%u vkfmt=%d meta=0x%010" PRIx64 "\n",
+				             base, target.extent.width, target.extent.height,
+				             static_cast<int>(target.desc.info.pixel_format), metadata_address);
+				std::fflush(stderr);
+			}
+		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);
