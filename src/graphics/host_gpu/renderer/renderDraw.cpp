@@ -548,6 +548,10 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 			std::fflush(stderr);
 		}
 		if (lowerable) {
+			// Temporary: the LUT is produced but its blue axis is the slice index, which this pixel
+			// shader reads as SV_RenderTargetArrayIndex out of a register Kyty does not supply.
+			ShaderDumpWriteToSlicePs(sh_ctx.GetPs().ps_regs.data_addr,
+			                         vertex_info.gs_regs.chksum, sh_regs);
 			return false;
 		}
 

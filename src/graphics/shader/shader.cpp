@@ -1460,6 +1460,46 @@ void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr, uint64_t hash
 	dump_one("gs", gs_addr);
 }
 
+void ShaderDumpWriteToSlicePs(uint64_t ps_addr, uint64_t hash, const HW::ShaderRegisters& sh) {
+	// TEMPORARY (GTA III colour-grading LUT). The LUT is produced now but its blue axis is wrong, and
+	// in UE's CombineLUTs that axis is the slice index, which the pixel shader reads as
+	// SV_RenderTargetArrayIndex - the hardware "ancillary" VGPR, which Kyty does not supply. Dump the
+	// shader so how it unpacks that register can be read rather than guessed.
+	static std::atomic<uint32_t> dumped {0};
+	if (dumped.fetch_add(1, std::memory_order_relaxed) != 0) {
+		return;
+	}
+
+	auto report = fmt::format(
+	    "[writetoslice] ps=0x{:010x} hash=0x{:016x} input_ena=0x{:08x} input_addr=0x{:08x}"
+	    " in_control=0x{:08x} baryc=0x{:08x} ancillary={}\n",
+	    ps_addr, hash, sh.ps_input_ena, sh.ps_input_addr, sh.ps_in_control, sh.baryc_cntl,
+	    (sh.ps_input_ena & 0x00002000u) != 0 ? "enabled" : "absent");
+
+	ShaderMappedData data {};
+	if (ps_addr == 0 || !ShaderAddressValid(ps_addr) || !ShaderGetMappedData(ps_addr, data) ||
+	    data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
+		report += "[writetoslice] ps has no usable mapped code\n";
+	} else {
+		auto name = Config::GetShaderLogFolder() / "skipped_ge" /
+		            fmt::format("ps_{:016x}_{:010x}.bin", hash, ps_addr);
+		Common::File::CreateDirectories(name.parent_path());
+		Common::File file;
+		file.Create(name);
+		if (file.IsInvalid()) {
+			report += "[writetoslice] cannot create the ps dump\n";
+		} else {
+			file.Write(reinterpret_cast<const void*>(ps_addr), data.code_size_bytes);
+			file.Close();
+			report += fmt::format("[writetoslice] dumped ps bytes=0x{:08x}\n", data.code_size_bytes);
+		}
+	}
+
+	LOGF("%s", report.c_str());
+	std::fputs(report.c_str(), stderr);
+	std::fflush(stderr);
+}
+
 // Whether the device can write the render-target slice index from the vertex stage. Written once
 // during device setup and only read afterwards.
 static std::atomic<bool> g_layered_vertex_output_supported {false};
