@@ -559,6 +559,28 @@ BufferBinding BufferCache::ObtainBuffer(CommandBuffer& command, uint64_t vaddr, 
 	FaultSafeCacheLock                         lock(this, m_mutex);
 	auto&                                      cached = GetOrCreateBuffer(command, vaddr, size);
 	std::vector<std::pair<uint64_t, uint64_t>> uploads;
+
+	// A/B: KYTY_FORCE_BUFFER_UPLOAD re-uploads a read-only buffer in full on every use, bypassing the
+	// memory tracker's CPU-dirty ranges. See docs/gta3-status-and-next-steps.md §4.
+	//
+	// Unreal reads per-object transforms out of a storage buffer (GPU Scene), so a guest CPU write the
+	// tracker misses leaves an object rendering with a stale or wrong transform - which is what parts of a
+	// model appearing at the wrong place, in some frames only, looks like. If the flicker stops with this
+	// on, the defect is dirty-range tracking on those buffers rather than anything in the draw path.
+	//
+	// Restricted to read-only buffers on purpose: force-uploading one the GPU writes would overwrite its
+	// results with whatever guest memory happens to hold. Costs a full re-upload per bind, so it is a
+	// diagnostic, not a candidate default.
+	static const bool force_upload = std::getenv("KYTY_FORCE_BUFFER_UPLOAD") != nullptr;
+	if (force_upload && is_read && !is_written) {
+		Upload(command, *cached.buffer, cached.buffer->Offset(vaddr),
+		       reinterpret_cast<const void*>(vaddr), size);
+		if (is_formatted) {
+			(void)SynchronizeBufferFromImage(*cached.buffer, vaddr, size);
+		}
+		return {cached.buffer, cached.buffer->Handle(), cached.buffer->Offset(vaddr)};
+	}
+
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept { uploads.emplace_back(address, bytes); },

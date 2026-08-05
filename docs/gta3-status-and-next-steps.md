@@ -213,6 +213,36 @@ Rules that make this work:
 | `KYTY_ZPASS_ALWAYS_VISIBLE=1` | legacy alias of the current default | none |
 | `KYTY_NO_WRITETOSLICE=1` | disable the LUT lowering | world goes dark again |
 | `KYTY_LENIENT_HOST_FAULTS=1` | survive nested faults so F1 capture works | captures may hold stale bytes |
+| `KYTY_FORCE_VELOCITY_CLEAR=1` | clear full-res R16G16B16A16_UNORM attachments | **tested: no effect on the flicker** |
+| `KYTY_META_CLEAR_ASSUME_ZERO=1` | codeless metadata clear ⇒ clear to zero | **tested: no effect on the flicker** |
+| `KYTY_FORCE_BUFFER_UPLOAD=1` | re-upload read-only buffers in full every use | a full upload per bind; diagnostic only |
+
+### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
+
+`KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
+flicker is unchanged with the velocity buffer force-cleared every frame.
+
+So although the accumulation in §3.1 is real and proven, it is **not what the maintainer is seeing**. That
+retires §3 as the root cause, and two rounds of switching achieved what many rounds of probing did not.
+
+The maintainer's description is the load-bearing evidence now: *"parts of the models look like they are
+rendering not in their correct position in some frames and all over the screen."* Recognisable model parts
+at wrong positions is **geometry transformed wrongly**. Stale velocity would ghost or smear colour; it
+cannot relocate a wheel. So the defect is in what the vertex shader computes, not in post-processing.
+
+That points back at per-draw transform data, which was raised early, dropped on a bad inference
+(motion-independence — wrong, the character has an idle animation so his bones update every frame), and
+never actually tested. Unreal reads per-object transforms from a storage buffer (GPU Scene: position at
+stride 12 plus a per-instance `R32_UINT` id, per Part 4), so the candidates are:
+
+1. **Dirty-range tracking misses a guest CPU write** to that buffer, leaving a stale transform.
+   → `KYTY_FORCE_BUFFER_UPLOAD=1` (implemented) re-uploads read-only buffers in full on every use.
+2. **The storage-buffer range clamp truncates it.** `NativeStorageBuffer` binds only
+   `MappedExtent(address, size)`, and robust buffer access returns **zero** past the bound range — a zero
+   transform collapses geometry, a partial one relocates it. Worth a switch that binds the full nominal
+   size, or at least logs when a vertex-stage storage buffer is truncated.
+3. **Per-draw descriptor staleness** — the permutation cache serving a program with the wrong resource
+   snapshot.
 
 ### 4.2 Switches to add next, in priority order
 
