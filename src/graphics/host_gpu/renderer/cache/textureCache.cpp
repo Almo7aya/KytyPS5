@@ -1955,9 +1955,8 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 }
 
 bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
-	std::lock_guard transaction(m_resource_mutex);
-	CacheLock       lock(*this, m_lock);
-	const auto      found = m_surface_metas.find(address);
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}

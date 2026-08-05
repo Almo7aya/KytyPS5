@@ -1585,10 +1585,18 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			break;
 		case 0x00000039: // PIXEL_PIPE_STAT_DUMP - occlusion query result
 			// Unreal computes visible pixels as `end - begin` of a 64-bit counter pair. There is no
-			// real Z-pass counting on the host, so write a monotonically increasing value to the
-			// destination; any `end - begin` is then positive and the primitive reports visible.
+			// real Z-pass counting on the host, so any value whose end is greater than begin makes
+			// the primitive report visible.
+			//
+			// The pair occupies two 8-byte slots (`begin` at the lower address, `end` 8 bytes
+			// above). Derive the value from the slot address instead of a shared monotonic counter:
+			// a shared counter grows forever, so an asynchronous guest readback that samples the
+			// pair across a frame boundary can see a begin value *larger* than the end value,
+			// yielding a negative delta and a spuriously culled (flashing) model. An address-derived
+			// value is stable frame to frame, so the lower slot always holds the smaller number and
+			// `end - begin` is always positive.
 			if (dst_gpu_addr != 0) {
-				const auto value = m_occlusion_counter++;
+				const auto value = dst_gpu_addr >> 3u;
 				std::memcpy(reinterpret_cast<void*>(dst_gpu_addr), &value, sizeof(value));
 			}
 			break;

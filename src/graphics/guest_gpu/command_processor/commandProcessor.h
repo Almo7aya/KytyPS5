@@ -179,10 +179,6 @@ private:
 	FlipInfo m_flip;
 	uint64_t m_submit_id      = 0;
 	bool     m_predicate_skip = false;
-	// Guest occlusion queries (PIXEL_PIPE_STAT_DUMP) are 64-bit counter pairs: the guest takes
-	// `end - begin` as the visible-pixel count. No real Z-pass counting exists, so every dump
-	// writes a monotonically increasing value, making every delta positive -> always visible.
-	uint64_t m_occlusion_counter = 0;
 };
 
 } // namespace Libs::Graphics
