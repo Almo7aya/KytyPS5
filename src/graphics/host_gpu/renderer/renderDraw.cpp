@@ -71,6 +71,44 @@ static std::atomic<uint32_t> g_shader_stage_log_count     = 0;
 static std::atomic<uint32_t> g_framebuffer_skip_log_count = 0;
 static std::atomic<uint32_t> g_write_to_slice_log_count   = 0;
 
+// Where draws go when they do not reach the GPU. The car and the character keep blinking with occlusion
+// culling switched off entirely, so the first thing to establish is whether Kyty is dropping their draws
+// at all or whether the guest is not submitting them - those are different investigations and guessing
+// between them has already cost several rounds.
+namespace {
+struct DrawSkipCounters {
+	std::atomic<uint64_t> submitted {0};
+	std::atomic<uint64_t> empty {0};       // zero indices or zero instances
+	std::atomic<uint64_t> metadata {0};    // consumed as a metadata clear
+	std::atomic<uint64_t> no_vertex {0};   // no usable vertex shader
+	std::atomic<uint64_t> ge_skip {0};     // unsupported geometry pipeline
+	std::atomic<uint64_t> no_target {0};   // neither colour nor depth attachment
+	std::atomic<uint32_t> reports {0};
+};
+DrawSkipCounters g_draw_skips;
+
+void ReportDrawSkips() {
+	const auto submitted = g_draw_skips.submitted.load(std::memory_order_relaxed);
+	if (submitted == 0 || submitted % 20000 != 0) {
+		return;
+	}
+	if (g_draw_skips.reports.fetch_add(1, std::memory_order_relaxed) >= 12) {
+		return;
+	}
+	std::fprintf(stderr,
+	             "[draw-skip] submitted=%llu empty=%llu metadata=%llu no_vertex=%llu ge_skip=%llu"
+	             " no_target=%llu\n",
+	             static_cast<unsigned long long>(submitted),
+	             static_cast<unsigned long long>(g_draw_skips.empty.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(g_draw_skips.metadata.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(g_draw_skips.no_vertex.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(g_draw_skips.ge_skip.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(
+	                 g_draw_skips.no_target.load(std::memory_order_relaxed)));
+	std::fflush(stderr);
+}
+} // namespace
+
 static const char* RenderColorTypeName(RenderColorType type) {
 	switch (type) {
 		case RenderColorType::NoColorOutput: return "NoColorOutput";
@@ -958,6 +996,7 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count == 0 && !with_depth) {
+		g_draw_skips.no_target.fetch_add(1, std::memory_order_relaxed);
 		LogFramebufferSkip(draw.name, state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, draw.flags);
 		return false;
@@ -1094,6 +1133,9 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
                                const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
                                const DrawEmitInfo& emit) {
 	EXIT_IF(draw.name == nullptr);
+
+	g_draw_skips.submitted.fetch_add(1, std::memory_order_relaxed);
+	ReportDrawSkips();
 
 	switch (static_cast<Prospero::PrimitiveType>(ucfg.GetPrimType())) {
 		case Prospero::PrimitiveType::kPointList:
@@ -1240,19 +1282,23 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (index_count == 0 || instance_count == 0) {
+		g_draw_skips.empty.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer)) {
+		g_draw_skips.metadata.fetch_add(1, std::memory_order_relaxed);
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_draw_skips.no_vertex.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		g_draw_skips.ge_skip.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
@@ -1369,19 +1415,23 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (index_count == 0 || instance_count == 0) {
+		g_draw_skips.empty.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer)) {
+		g_draw_skips.metadata.fetch_add(1, std::memory_order_relaxed);
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_draw_skips.no_vertex.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		g_draw_skips.ge_skip.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 
