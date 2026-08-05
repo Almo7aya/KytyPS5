@@ -922,6 +922,10 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
 }
 
+void BufferCache::MarkRegionGpuModified(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.MarkRegionAsGpuModified(vaddr, size);
+}
+
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	FaultSafeCacheLock lock(this, m_mutex);
 	return !m_gpu_modified_ranges.Intersections(vaddr, size).empty();

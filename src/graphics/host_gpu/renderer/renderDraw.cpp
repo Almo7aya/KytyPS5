@@ -1308,6 +1308,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
 	}
+	// A/B: KYTY_MARK_GPU_WRITES=1 - see the note in renderCompute.cpp. Draws can produce buffer contents too,
+	// so the VS and PS written ranges have to be recorded as GPU-modified for the same reason.
+	static const bool mark_gpu_writes = std::getenv("KYTY_MARK_GPU_WRITES") != nullptr;
+	if (mark_gpu_writes) {
+		auto mark = [this](const ShaderStageRuntime& runtime) {
+			if (!runtime) {
+				return;
+			}
+			for (const auto& range: CollectShaderBufferWrites(*runtime.program, *runtime.resources)) {
+				m_context.GetBufferCache().MarkRegionGpuModified(range.address, range.size);
+			}
+		};
+		mark(state.vs_input_info.stage);
+		if (state.ps_active) {
+			mark(state.ps_input_info.stage);
+		}
+	}
+
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);

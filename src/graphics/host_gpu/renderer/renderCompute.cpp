@@ -444,6 +444,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 		                        image.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint);
 	                }) ||
 	    has_storage_writes;
+	// A/B: KYTY_MARK_GPU_WRITES=1 records the ranges this dispatch wrote as GPU-modified.
+	//
+	// MemoryTracker::MarkRegionAsGpuModified has no caller anywhere in the tree, so IsRegionGpuModified is
+	// always false for buffers. The buffer cache therefore never learns that a shader produced a buffer's
+	// contents, and happily uploads stale guest bytes over it whenever the CPU-dirty check passes. That also
+	// explains why KYTY_NO_STALE_UPLOAD did nothing: its guard was IsRegionGpuModified, so it never fired.
+	//
+	// KYTY_FORCE_BUFFER_UPLOAD making the models worse is the same mechanism turned up to full - it forced the
+	// clobber that normally happens only sometimes.
+	static const bool mark_gpu_writes = std::getenv("KYTY_MARK_GPU_WRITES") != nullptr;
+	if (mark_gpu_writes) {
+		for (const auto& range: CollectShaderBufferWrites(program, *input_info.stage.resources)) {
+			m_context.GetBufferCache().MarkRegionGpuModified(range.address, range.size);
+		}
+	}
+
 	if (has_storage_writes || barrier_after_dispatch || full_barrier_after_dispatch) {
 		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
