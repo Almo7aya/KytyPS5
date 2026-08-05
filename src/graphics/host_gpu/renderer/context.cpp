@@ -156,7 +156,21 @@ bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 		Handle().resetQueryPool(m_occlusion_pool, 0, OcclusionQuerySlots);
 	}
 
-	if (m_occlusion_armed) {
+	// Which half of the pair this is has to be decided from the guest's own addressing, not from
+	// whether Kyty managed to service the previous sample. The guest brackets a draw with two dumps
+	// into consecutive 64-bit slots and takes end-minus-begin, so the end is the dump landing exactly
+	// one 64-bit slot above the begin it is armed for.
+	//
+	// Deciding it from a bare `armed` flag - as this did - desynchronises permanently the first time a
+	// begin dump is not serviced: the flag stays clear, the guest's *end* is then taken for a begin,
+	// and from there every pair in the recording is mismatched. Kyty writes zero where the guest
+	// expects the post-draw count and a query result where it expects the pre-draw count, so
+	// end-minus-begin is meaningless and primitives blink in and out for the rest of the frame. The
+	// measured fallback rate (13306 of 49152 samples) meant that was happening constantly, and
+	// ResetZPassCounters clearing the flag each fence is what made it come and go per frame rather
+	// than latch - which is exactly what "models hide and show randomly" looks like.
+	const auto address = reinterpret_cast<uint64_t>(dst_gpu_addr);
+	if (m_occlusion_armed && address == m_occlusion_armed_address + sizeof(uint64_t)) {
 		// End dump: the draw path has already bracketed the query, so bind its slot to this address.
 		// If the draw never ran, m_occlusion_last_slot is -1 and the caller falls back.
 		const auto slot   = m_occlusion_last_slot;
@@ -166,25 +180,25 @@ bool CommandBuffer::SampleZPassCounter(void* dst_gpu_addr) {
 			ProbeReportZPass();
 			return false;
 		}
-		m_pending_z_pass.push_back({reinterpret_cast<uint64_t>(dst_gpu_addr), slot});
+		m_pending_z_pass.push_back({address, slot});
 		m_occlusion_last_slot = -1;
 		g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
 		ProbeReportZPass();
 		return true;
 	}
 
-	if (m_occlusion_next_slot >= OcclusionQuerySlots) {
-		g_zpass_fallback.fetch_add(1, std::memory_order_relaxed);
-		ProbeReportZPass();
-		return false;
-	}
-
 	// Begin dump: the guest reads this as the counter value before the draw, so it resolves to zero
 	// and the difference against the end dump is the visible-pixel count. Only arm here; the render
 	// pass does not exist yet.
-	m_pending_z_pass.push_back({reinterpret_cast<uint64_t>(dst_gpu_addr), -1});
-	m_occlusion_armed     = true;
-	m_occlusion_last_slot = -1;
+	//
+	// Arming happens even with the pool exhausted. BeginArmedZPassQuery will decline to allocate a
+	// slot, so the end dump finds none and falls back to always-visible - which costs culling for that
+	// primitive but keeps the pairing aligned with the guest, instead of trading one unculled
+	// primitive for a whole recording of mismatched pairs.
+	m_pending_z_pass.push_back({address, -1});
+	m_occlusion_armed         = true;
+	m_occlusion_armed_address = address;
+	m_occlusion_last_slot     = -1;
 	g_zpass_serviced.fetch_add(1, std::memory_order_relaxed);
 	ProbeReportZPass();
 	return true;
@@ -246,9 +260,10 @@ void CommandBuffer::ResolveZPassCounters() {
 
 void CommandBuffer::ResetZPassCounters() {
 	m_pending_z_pass.clear();
-	m_occlusion_open_slot = -1;
-	m_occlusion_armed     = false;
-	m_occlusion_last_slot = -1;
+	m_occlusion_open_slot     = -1;
+	m_occlusion_armed         = false;
+	m_occlusion_armed_address = 0;
+	m_occlusion_last_slot     = -1;
 	if (m_occlusion_next_slot != 0 && m_occlusion_pool != nullptr && !IsInvalid()) {
 		m_occlusion_next_slot = 0;
 	}

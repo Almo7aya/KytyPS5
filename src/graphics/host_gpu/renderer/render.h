@@ -168,11 +168,15 @@ private:
 		int32_t  slot    = -1;
 	};
 
-	vk::QueryPool             m_occlusion_pool      = nullptr;
-	uint32_t                  m_occlusion_next_slot = 0;
-	mutable int32_t           m_occlusion_open_slot = -1;
-	bool                      m_occlusion_armed     = false;
-	int32_t                   m_occlusion_last_slot = -1;
+	vk::QueryPool   m_occlusion_pool      = nullptr;
+	uint32_t        m_occlusion_next_slot = 0;
+	mutable int32_t m_occlusion_open_slot = -1;
+	bool            m_occlusion_armed     = false;
+	// Address of the begin dump this query is armed for. The guest writes the pair to consecutive
+	// 64-bit slots, so the end dump is identifiable by its address rather than by Kyty's own state -
+	// which is what keeps a skipped sample from inverting the pairing for the rest of the recording.
+	uint64_t                  m_occlusion_armed_address = 0;
+	int32_t                   m_occlusion_last_slot     = -1;
 	std::vector<PendingZPass> m_pending_z_pass;
 };
 
