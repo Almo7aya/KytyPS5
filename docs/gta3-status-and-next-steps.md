@@ -494,6 +494,36 @@ scattered pixels.** Use `pixel_history` on a pixel where scattered geometry is v
 image, which names the exact event. Every draw examined so far was chosen by index count and assumed to be a
 character. Get the right event first, then read its inputs.
 
+### 4.1i First pixel_history results — a target bound 1044 times and never written
+
+Capture `kyty_frame1207.rdc`, scattering reported as covering the whole screen.
+
+| Query | Result |
+| --- | --- |
+| `pixel_history(3149, 1680, 200)` | **0 modifications** |
+| `pixel_history(3149, 1680, 946)` | **0 modifications** |
+| `pixel_history(3282, 1680, 946, event 4643)` | 1 modification, event 3991, pre = post = (0,0,0,0), `pixel_changed: false` |
+
+`ResourceId::3149` is `R10G10B10A2_UNORM` at full resolution and the frame overview attributes **1044 draws**
+to it, yet **not one pixel modification is recorded at either of two probed pixels**. A GBuffer attachment bound
+across a thousand draws that never receives a write is an anomaly in its own right, and a much stronger lead
+than anything in rounds 3-7: candidates are a colour write mask that disables the attachment, every draw failing
+the depth or stencil test, or Kyty binding the attachment in the wrong slot so the shader's exports land
+elsewhere. A GBuffer channel that is silently never written would leave whatever consumes it reading undefined
+data - a plausible route to geometry-looking artefacts spread across the screen.
+
+`ResourceId::3282` receiving a single all-zero, `pixel_changed: false` write at screen centre points the same
+way and needs confirming against a pixel known to be covered by solid geometry.
+
+**Next, in order:**
+
+1. Confirm 3149 is genuinely never written - probe several more pixels, and check `get_resource_usage` for it.
+   If it truly is never written, find which slot the base-pass PS actually exports to and compare against the
+   attachment Kyty binds. `renderDraw.cpp` builds `target_export_mapping` from
+   `state.color_info[i].export_mapping`; a wrong mapping here would misroute exports.
+2. Only then read the offending draw's inputs. Do not pick draws by index count again - that assumption is what
+   invalidated §4.1f.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
