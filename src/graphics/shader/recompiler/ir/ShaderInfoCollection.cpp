@@ -124,6 +124,11 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	if (pixel->ps_ancillary) {
+		// The ancillary register's render-target array index is gl_Layer. Reading Layer in a fragment
+		// shader is core, unlike writing it from the vertex stage.
+		AddInput(info, StageInputKind::Layer, 0, 1, "gl_Layer");
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
 	}

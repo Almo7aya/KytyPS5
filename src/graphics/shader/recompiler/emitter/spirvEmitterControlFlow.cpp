@@ -312,6 +312,31 @@ void EmitPixelFrontFacingRegister(EmitterState& state, uint32_t vgpr) {
 	state.builder.AddFunction({OpStore, dst, bits});
 }
 
+// The ancillary VGPR: launch state the hardware hands a pixel shader, of which the render-target array
+// index at bits 26:16 is the field shaders actually read - it is how SV_RenderTargetArrayIndex reaches
+// the pixel stage. UE's CombineLUTs pixel shader unpacks exactly that (`v_bfe_u32 v3, v2, 16, 11`) and
+// scales it by 1/31 to get the blue axis of the colour-grading volume, so leaving this register at zero
+// crushed blue out of the whole image.
+//
+// The remaining fields are left zero: the sample number at bits 11:8 is zero for the single-sampled
+// targets this is reached from, and nothing observed reads the rest.
+void EmitPixelAncillaryRegister(EmitterState& state, uint32_t vgpr) {
+	const auto input = InputVariableForKind(state, IR::StageInputKind::Layer);
+	const auto dst   = PointerForRegister(state, {IR::RegisterFile::Vector, vgpr});
+	if (input == 0 || dst == 0) {
+		return;
+	}
+
+	const auto value  = state.builder.AllocateId();
+	const auto bits   = state.builder.AllocateId();
+	const auto packed = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, state.int_type, value, input});
+	state.builder.AddFunction({OpBitcast, state.uint_type, bits, value});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, packed, bits, ConstantU32(state, 16)});
+	state.builder.AddFunction({OpStore, dst, packed});
+}
+
 void EmitPixelInputRegisters(EmitterState& state) {
 	if (state.stage != ShaderType::Pixel || state.pixel_input_info == nullptr) {
 		return;
@@ -337,8 +362,13 @@ void EmitPixelInputRegisters(EmitterState& state) {
 			reg++;
 		}
 	}
+	// Hardware order: front face, then ancillary. Both come after the position registers.
 	if (ps->ps_front_face) {
 		EmitPixelFrontFacingRegister(state, reg);
+		reg++;
+	}
+	if (ps->ps_ancillary) {
+		EmitPixelAncillaryRegister(state, reg);
 	}
 }
 

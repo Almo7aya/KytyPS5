@@ -652,6 +652,7 @@ enum class StageInputKind {
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	Layer,
 	WorkgroupId,
 	LocalInvocationId,
 	LocalInvocationIndex,

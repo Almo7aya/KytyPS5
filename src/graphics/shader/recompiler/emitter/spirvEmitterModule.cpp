@@ -235,6 +235,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
+		case IR::StageInputKind::Layer: return BuiltInLayer;
 		case IR::StageInputKind::WorkgroupId: return BuiltInWorkgroupId;
 		case IR::StageInputKind::LocalInvocationId: return BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return BuiltInLocalInvocationIndex;
@@ -616,7 +617,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		uint32_t ptr_type = state.ptr_input_uint;
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
-			case IR::StageInputKind::InstanceIndex: ptr_type = state.ptr_input_int; break;
+			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer: ptr_type = state.ptr_input_int; break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::LocalInvocationId:
 			case IR::StageInputKind::GlobalInvocationId:

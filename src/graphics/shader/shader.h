@@ -110,6 +110,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
+	// SPI_PS_INPUT_ENA.ANCILLARY. One VGPR of launch state, of which the render-target array index at
+	// bits 26:16 is the part any shader seen so far reads - it is how a pixel shader gets
+	// SV_RenderTargetArrayIndex.
+	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
