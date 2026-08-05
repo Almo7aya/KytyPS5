@@ -580,6 +580,35 @@ int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo* input_info,
 	return -1;
 }
 
+// Is `vgpr` read before anything writes it? Only then does the PS5 VS ABI value in it actually matter.
+//
+// A shader that defines the register first is using it as scratch - the character shaders accumulate
+// clip-space w into v5 - and seeding it in the prologue overwrites a value the shader meant to keep.
+//
+// The scan follows blocks in order and stops at the first definition, so a register first written inside a
+// loop body that an earlier iteration reads is reported as live-in. That errs towards seeding, which is the
+// existing behaviour, so a wrong answer here can only fail to remove a seed - never remove one that is needed.
+bool VgprIsLiveIn(const IR::Program& ir, uint32_t vgpr) {
+	const auto is_target = [vgpr](const IR::Operand& operand) {
+		return operand.kind == IR::OperandKind::Register &&
+		       operand.reg.file == IR::RegisterFile::Vector && operand.reg.index == vgpr;
+	};
+
+	for (const auto& block: ir.blocks) {
+		for (const auto& inst: block.instructions) {
+			for (uint32_t i = 0; i < inst.src_count && i < std::size(inst.src); i++) {
+				if (is_target(inst.src[i])) {
+					return true;
+				}
+			}
+			if (is_target(inst.dst)) {
+				return false;
+			}
+		}
+	}
+	return false;
+}
+
 uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputInfo* input_info,
                                       const std::vector<EmbeddedFetchLoad>& loads) {
 	if (input_info == nullptr || loads.empty()) {
@@ -751,6 +780,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	ir.shader_hash     = options.shader_hash;
 	ir.user_data_base  = options.user_data_base;
 	ir.user_data_count = options.user_data_count;
+	if (options.stage == ShaderType::Vertex) {
+		ir.info.reads_abi_vertex_index   = VgprIsLiveIn(ir, 5);
+		ir.info.reads_abi_instance_index = VgprIsLiveIn(ir, 8);
+	}
 	// Before anything reads the LDS stores: this replaces them with exports, so resource tracking,
 	// binding layout and info collection all see the finished vertex shader.
 	if (options.write_to_slice != nullptr &&

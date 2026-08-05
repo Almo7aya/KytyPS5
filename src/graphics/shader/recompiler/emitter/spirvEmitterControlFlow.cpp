@@ -398,22 +398,28 @@ void EmitVertexInputRegisters(EmitterState& state) {
 	// chain - v5 = Fma(s23, v0, v5). v8 is accumulated the same way. For a shader like this the seeding writes
 	// over the initial value of an accumulator, and w is exactly the component measured to be wrong.
 	//
-	//   KYTY_NO_VERTEX_INDEX_SEED=1   - seed neither register.
-	//   KYTY_NO_INSTANCE_INDEX_SEED=1 - seed v5 but not v8, to tell the two apart.
+	// Seeding both unconditionally made the world dark under KYTY_NO_VERTEX_INDEX_SEED, because shaders that
+	// genuinely read the ABI value - the WriteToSlice LUT shader among them - need v5 to hold the vertex index.
+	// So the seed is now conditional on the liveness result computed in ShaderRecompiler.cpp: seed only where
+	// the shader reads the register before defining it.
 	//
-	// A shader that genuinely needs the ABI values will fetch from vertex 0 / instance 0 for every vertex,
-	// which usually collapses a mesh to a point rather than scattering it - a distinguishable failure.
-	static const bool no_vertex_seed   = std::getenv("KYTY_NO_VERTEX_INDEX_SEED") != nullptr;
-	static const bool no_instance_seed = std::getenv("KYTY_NO_INSTANCE_INDEX_SEED") != nullptr;
+	//   KYTY_NO_VERTEX_INDEX_SEED=1     - never seed either (the previous blunt test; goes dark).
+	//   KYTY_ALWAYS_SEED_VERTEX_INDEX=1 - seed both unconditionally, the behaviour before this change.
+	static const bool no_vertex_seed = std::getenv("KYTY_NO_VERTEX_INDEX_SEED") != nullptr;
+	static const bool always_seed    = std::getenv("KYTY_ALWAYS_SEED_VERTEX_INDEX") != nullptr;
+
+	const auto seed_vertex = !no_vertex_seed && (always_seed || state.program.info.reads_abi_vertex_index);
+	const auto seed_instance =
+	    !no_vertex_seed && (always_seed || state.program.info.reads_abi_instance_index);
 
 	const auto vertex_index = PointerForRegister(state, {IR::RegisterFile::Vector, 5});
-	if (vertex_index != 0 && !no_vertex_seed) {
+	if (vertex_index != 0 && seed_vertex) {
 		state.builder.AddFunction(
 		    {OpStore, vertex_index, EmitInputScalarU32(state, IR::StageInputKind::VertexIndex)});
 	}
 
 	const auto instance_index = PointerForRegister(state, {IR::RegisterFile::Vector, 8});
-	if (instance_index != 0 && !no_vertex_seed && !no_instance_seed) {
+	if (instance_index != 0 && seed_instance) {
 		state.builder.AddFunction({OpStore, instance_index,
 		                           EmitInputScalarU32(state, IR::StageInputKind::InstanceIndex)});
 	}

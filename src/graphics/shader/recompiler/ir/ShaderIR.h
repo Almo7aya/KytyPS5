@@ -755,6 +755,13 @@ struct ShaderInfo {
 	int32_t                          vertex_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 
+	// Whether the shader actually consumes the PS5 VS ABI registers - v5 for the vertex index, v8 for the
+	// instance index - before defining them. A shader that writes them first is using them as ordinary
+	// scratch, and seeding them there destroys a value it meant to keep. See docs section 4.1f: the character
+	// shaders accumulate clip-space w into v5.
+	bool                             reads_abi_vertex_index   = true;
+	bool                             reads_abi_instance_index = true;
+
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
