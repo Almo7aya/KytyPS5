@@ -463,6 +463,37 @@ the first operation on that chain that consumes a mask register as data rather t
 against the world VS (`ResourceId::71082`), which renders correctly and should either not contain that
 operation or reach `w` by a different route.
 
+### 4.1h CORRECTION to 4.1f, and the seeding is cleared
+
+**The §4.1f inference was not sound.** It argued that vertices with near-identical `x` and `y` receiving very
+different `w` proved corruption. It does not: `x_clip` and `y_clip` are already projected, so two vertices
+sharing them share `x_view`/`y_view` and can legitimately sit at different depths. Differing `w` at the same
+projected x,y is ordinary geometry. That table is not evidence of a bug and must not be cited as such.
+
+What is still unexplained is the **spread and the sign mix**: event 643's `w` ranges from -454 to +214, while
+correctly-rendering world geometry (2719) is uniformly negative (~-5700). If negative `w` means in front of the
+eye here, the positive-`w` vertices are behind it and get clipped. A physically small object cannot span 660
+units of depth - but this has *not* been confirmed to be a character mesh. It was selected by index count, not
+by checking what it draws on screen. That inference gap is how §4.1f went wrong.
+
+**The v5/v8 ABI seeding is cleared.** With seeding made conditional on liveness (`VgprIsLiveIn`), the default
+build and `KYTY_ALWAYS_SEED_VERTEX_INDEX=1` are indistinguishable - both correctly lit, both still scattering.
+The reason is visible in the disassembly: `v5` is written at line 1089 and then read at 1090-1091 as
+`v5 = v5 + 1`, i.e. index arithmetic. The seeded vertex index *is* genuinely consumed early, and the compiler
+then reuses the same register as the `w` accumulator later in the shader. So `v5` is correctly live-in, the
+liveness scan classifies it as such, the seed stays, and nothing changed. Seeding was never the defect.
+
+The conditional-seeding change is kept because it is correct on its own terms - it stops seeding registers no
+shader reads - but it is not the fix, and `KYTY_NO_INSTANCE_INDEX_SEED` was inconclusive rather than negative:
+`v8` is initialised to 0 at line 157 anyway, so skipping the instance seed produces the same 0.
+
+**Do not send more speculative switches.** Rounds 3-7 produced two signals (`KYTY_ALL_VERTEX_RATE` deforms
+meshes, `KYTY_FORCE_BUFFER_UPLOAD` worsens them) and no fix, because each round guessed at a mechanism and then
+asked for a run. The missing step is cheap and has never been done: **identify which draw actually produces the
+scattered pixels.** Use `pixel_history` on a pixel where scattered geometry is visible in the capture's final
+image, which names the exact event. Every draw examined so far was chosen by index count and assumed to be a
+character. Get the right event first, then read its inputs.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
