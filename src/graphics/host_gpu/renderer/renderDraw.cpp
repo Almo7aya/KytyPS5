@@ -688,14 +688,8 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.is_clear         = target.color_clear_enable;
 		const auto metadata_address = target.desc.info.metadata.range.address;
 		uint32_t   clear_code       = 0;
-		const bool has_dcc          = target.desc.info.metadata.kind == ImageMetadataKind::Dcc;
-		// Sampled before the clear state is consumed below, so the report reflects the decision inputs
-		// rather than the post-consume state.
-		const bool meta_was_cleared = has_dcc && cache.IsMetaCleared(metadata_address, view.base_layer);
-		uint32_t   recorded_code    = 0;
-		const bool has_recorded_code =
-		    meta_was_cleared && cache.MetaClearCode(metadata_address, recorded_code);
-		if (has_dcc && meta_was_cleared) {
+		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		    cache.IsMetaCleared(metadata_address, view.base_layer)) {
 			// A recorded DCC clear code decides the colour. Constant-encoded codes carry it
 			// directly; DCC_CLEAR_CODE_REGISTER falls back to CB_COLOR#_CLEAR_WORD. Anything else,
 			// notably DCC_CODE_UNCOMPRESSED, is a decompress rather than a clear and is ignored so
@@ -711,65 +705,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
 				EXIT("failed to consume DCC clear state\n");
-			}
-		}
-
-		// How often each colour surface is bound versus actually cleared.
-		//
-		// GTA III's velocity buffer is never cleared and accumulates the previous frames' silhouettes,
-		// which is what makes the car and the character flicker: a pixel's motion vector comes from
-		// whichever stale silhouette last covered it. The capture shows exactly one colour clear in a
-		// whole frame - the separate-translucency surface - so the DCC clear-code path from 0db97ca fires
-		// for that target and not the rest.
-		//
-		// Counted per surface rather than sampled on first sight, because first sight happens during
-		// loading before any clear has been recorded, which said nothing. A surface with many binds and
-		// zero clears is one the guest expects to be cleared by a mechanism Kyty is missing.
-		{
-			struct ClearStats {
-				uint64_t binds       = 0;
-				uint64_t clears      = 0;
-				uint32_t width       = 0;
-				uint32_t height      = 0;
-				int      format      = 0;
-				bool     dcc         = false;
-				uint64_t meta        = 0;
-				uint32_t last_code   = 0;
-			};
-			static std::mutex                             stats_mutex;
-			static std::map<uint64_t, ClearStats>         stats;
-			static uint64_t                              total_binds = 0;
-			static uint32_t                              reports     = 0;
-
-			const auto       base = target.desc.info.data.address;
-			std::scoped_lock lock(stats_mutex);
-			if (stats.size() < 96 || stats.contains(base)) {
-				auto& entry  = stats[base];
-				entry.width  = target.extent.width;
-				entry.height = target.extent.height;
-				entry.format = static_cast<int>(target.desc.info.pixel_format);
-				entry.dcc    = has_dcc;
-				entry.meta   = metadata_address;
-				entry.binds++;
-				if (attachment.is_clear) {
-					entry.clears++;
-					if (has_recorded_code) {
-						entry.last_code = recorded_code & 0xffu;
-					}
-				}
-			}
-			if (++total_binds % 40000 == 0 && reports++ < 6) {
-				for (const auto& [addr, s]: stats) {
-					std::fprintf(stderr,
-					             "[rt-clear] base=0x%010" PRIx64 " %ux%u vkfmt=%d dcc=%d"
-					             " meta=0x%010" PRIx64 " binds=%llu clears=%llu code=0x%02x\n",
-					             addr, s.width, s.height, s.format, s.dcc ? 1 : 0, s.meta,
-					             static_cast<unsigned long long>(s.binds),
-					             static_cast<unsigned long long>(s.clears), s.last_code);
-				}
-				std::fprintf(stderr, "[rt-clear] ---- %llu surfaces ----\n",
-				             static_cast<unsigned long long>(stats.size()));
-				std::fflush(stderr);
 			}
 		}
 	}

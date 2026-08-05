@@ -748,7 +748,24 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	// A DMA fill of a surface's metadata is a fast clear, and for DCC the filled byte *is* the clear
+	// colour, so the value has to be carried through. Recording the clear without it - which is what
+	// this did - left AcquireRenderTargets with a cleared surface and no code to decode: it took neither
+	// the constant-encoded branch nor the CB_COLOR_CLEAR_WORD branch, set no clear, and then consumed
+	// the state anyway. The clear was swallowed, and the surface silently accumulated across frames.
+	//
+	// GTA III clears its velocity buffer this way. Never clearing it is what made the car and the
+	// character flicker: the buffer kept every previous frame's silhouette, so a pixel's motion vector
+	// came from whichever stale one last covered it.
+	//
+	// Byte-replication is required, exactly as the compute path requires it (see
+	// TryConsumeComputeMetaClear). DCC clear codes are byte-replicated, so a fill that is not cannot be
+	// one, and treating it as a clear would invent a colour the guest never asked for.
+	{
+		const uint32_t code       = value & 0xffu;
+		const bool     replicated = value == (code | (code << 8u) | (code << 16u) | (code << 24u));
+		(void)m_texture_cache.ClearMeta(vaddr, code, replicated);
+	}
 	{
 		std::lock_guard transaction(m_resource_mutex);
 		const auto      region = m_texture_cache.QueryRegion(vaddr, size);
