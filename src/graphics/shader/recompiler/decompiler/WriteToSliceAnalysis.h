@@ -26,15 +26,15 @@ namespace Libs::Graphics::ShaderRecompiler::WriteToSlice {
 // This is a recognizer, not a general GS compiler. Anything that does not fit the passthrough shape
 // exactly is rejected, so unrelated geometry shaders keep being skipped as before.
 //
-// INCOMPLETE. The register tracking below is a linear, control-flow-insensitive scan. That is enough
-// to follow the ring -> staging-area copy for POS0 and POS1, but GTA III's GS performs that copy
-// three times - once per emitted vertex, on separate branch paths - and a linear scan conflates them,
-// so PARAM0 currently loses provenance and the analysis rejects. Finishing this needs real dataflow
-// over the CFG, in the style of IR::EliminateReadLane (ir/ReadLaneElimination.cpp).
-//
 // Rejecting is the safe outcome: callers keep skipping the draw, which is today's behaviour. The one
 // thing this must never do is return a map it is not sure of - a wrong offset silently produces a
 // wrong position or a wrong slice index.
+//
+// The register tracking is a linear, control-flow-insensitive scan, which is sound here for one
+// reason: every value the analysis reports has to have been agreed on by *all* the paths that
+// produced it. The GS stages its outputs in a second LDS region once per emitted vertex on separate
+// branch paths, and a conflicting store poisons its slot rather than overwriting it, so a
+// disagreement between vertices - i.e. anything that is not a uniform passthrough - rejects.
 
 enum class SourceKind : uint8_t {
 	Unknown,    // not tracked - forces a reject if an enabled export component depends on it

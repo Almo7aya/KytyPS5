@@ -61,7 +61,20 @@ public:
 	// Store-to-load forwarding across LDS, keyed by byte address within the vertex slot. This is
 	// what lets the analysis see through the GS's own ring -> staging-area copy: a value written to
 	// the staging area still remembers the ESGS offset it originally came from.
-	void StoreLds(uint32_t key, Provenance prov) { m_lds[key] = prov; }
+	//
+	// The scan is control-flow-insensitive, and the GS performs that copy once per emitted vertex on
+	// separate branch paths, so one key is written repeatedly. Disagreement between those writes is
+	// the signal that the copy is *not* uniform across vertices, i.e. not a passthrough - so a
+	// conflicting store poisons the key rather than overwriting it. A key therefore keeps a
+	// provenance only if every store to it agreed, which is what makes the linear scan sound here.
+	void StoreLds(uint32_t key, Provenance prov) {
+		const auto it = m_lds.find(key);
+		if (it == m_lds.end()) {
+			m_lds.emplace(key, prov);
+		} else if (it->second.kind != prov.kind || it->second.value != prov.value) {
+			it->second = Provenance {};
+		}
+	}
 
 	[[nodiscard]] Provenance LoadLds(uint32_t key, uint32_t stride) const {
 		const auto it = m_lds.find(key);
@@ -101,6 +114,55 @@ private:
 		case 1: return inst.src1;
 		case 2: return inst.src2;
 		default: return inst.src3;
+	}
+}
+
+// Whether an instruction defines its `dst` operand at all.
+//
+// The decoder fills `dst` from the instruction's vdst field unconditionally, and stores have no
+// vdst - the bits read as register 0. So a store appears to define `v0`, and letting that clobber
+// v0's provenance breaks the analysis outright: GTA III's GS carries ring[0] in v0 across the
+// bookkeeping `ds_write`s of the NGG vertex-compaction pass.
+//
+// Only clearly-not-defining opcodes are listed. Anything unrecognized keeps clobbering, so a new
+// store form costs a reject rather than a wrong map.
+[[nodiscard]] bool DefinesDst(const Decoder::Instruction& inst) {
+	switch (inst.opcode) {
+		case Decoder::Opcode::DsWriteByte:
+		case Decoder::Opcode::DsWriteShort:
+		case Decoder::Opcode::DsWriteB32:
+		case Decoder::Opcode::DsWriteB64:
+		case Decoder::Opcode::DsWriteB96:
+		case Decoder::Opcode::DsWriteB128:
+		case Decoder::Opcode::DsWrite2B32:
+		case Decoder::Opcode::DsWrite2St64B32:
+		case Decoder::Opcode::DsWrite2B64:
+		case Decoder::Opcode::DsWrite2St64B64:
+		case Decoder::Opcode::DsWriteAddtidB32:
+		case Decoder::Opcode::BufferStoreFormatX:
+		case Decoder::Opcode::BufferStoreFormatXy:
+		case Decoder::Opcode::BufferStoreFormatXyz:
+		case Decoder::Opcode::BufferStoreFormatXyzw:
+		case Decoder::Opcode::BufferStoreByte:
+		case Decoder::Opcode::BufferStoreShort:
+		case Decoder::Opcode::BufferStoreDword:
+		case Decoder::Opcode::BufferStoreDwordx2:
+		case Decoder::Opcode::BufferStoreDwordx3:
+		case Decoder::Opcode::BufferStoreDwordx4:
+		case Decoder::Opcode::TBufferStoreFormatX:
+		case Decoder::Opcode::TBufferStoreFormatXy:
+		case Decoder::Opcode::TBufferStoreFormatXyz:
+		case Decoder::Opcode::TBufferStoreFormatXyzw:
+		case Decoder::Opcode::FlatStoreByte:
+		case Decoder::Opcode::FlatStoreShort:
+		case Decoder::Opcode::FlatStoreDword:
+		case Decoder::Opcode::FlatStoreDwordx2:
+		case Decoder::Opcode::FlatStoreDwordx3:
+		case Decoder::Opcode::FlatStoreDwordx4:
+		case Decoder::Opcode::ImageStore:
+		case Decoder::Opcode::ImageStoreMip:
+		case Decoder::Opcode::Exp: return false;
+		default: return true;
 	}
 }
 
@@ -313,7 +375,7 @@ RingMap AnalyzePassthroughGs(const Decoder::Program& gs) {
 		}
 
 		// Anything else destroys what we knew about the registers it defines.
-		if (IsVgpr(inst.dst)) {
+		if (IsVgpr(inst.dst) && DefinesDst(inst)) {
 			const auto count = DefinedRegisterCount(inst);
 			for (uint32_t i = 0; i < count; i++) {
 				tracker.Clear(inst.dst.reg + i);
@@ -356,17 +418,15 @@ std::string RingMapToString(const RingMap& map) {
 
 	std::string out = fmt::format("WriteToSlice: matched, ESGS stride {} bytes\n", map.stride);
 	for (const auto& c: map.components) {
-		const char* target_name = c.target == 0x0cu   ? "POS0"
-		                          : c.target == 0x0du ? "POS1"
-		                          : c.target >= 0x20u ? "PARAM"
-		                                              : "?";
-		const char  swizzle     = "xyzw"[c.component & 3u];
+		const std::string target_name = c.target == 0x0cu   ? "POS0"
+		                                : c.target == 0x0du ? "POS1"
+		                                : c.target >= 0x20u ? fmt::format("PARAM{}", c.target - 0x20u)
+		                                                    : fmt::format("?{:#04x}", c.target);
+		const char        swizzle     = "xyzw"[c.component & 3u];
 		if (c.kind == SourceKind::RingOffset) {
-			out += fmt::format("  ring[{:2}] -> {}{}.{}\n", c.value, target_name,
-			                   c.target >= 0x20u ? static_cast<int>(c.target - 0x20u) : 0, swizzle);
+			out += fmt::format("  ring[{:2}] -> {}.{}\n", c.value, target_name, swizzle);
 		} else {
-			out += fmt::format("  const 0x{:08x} -> {}{}.{}\n", c.value, target_name,
-			                   c.target >= 0x20u ? static_cast<int>(c.target - 0x20u) : 0, swizzle);
+			out += fmt::format("  const 0x{:08x} -> {}.{}\n", c.value, target_name, swizzle);
 		}
 	}
 	return out;
