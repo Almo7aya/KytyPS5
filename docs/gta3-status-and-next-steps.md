@@ -453,6 +453,25 @@ Recorded because each of these was believed and acted upon:
 `--printf-direction Silent` suppresses `LOGF` entirely, so **anything that must survive the standard repro
 has to go to stderr**.
 
+### Run one A/B switch
+
+Every switch is read once through a function-local `static`, so it has to be set **before** launch - setting
+it while the emulator is running has no effect. This form sets it, runs, and removes it again, so the
+variable never leaks into the next run:
+
+	$env:KYTY_SWITCH_NAME = "1"
+	_Build\v3\kyty_emulator.exe --printf-direction Silent `
+	  --game Z:\projects\PS5\games\Grand.Theft.Auto.III.The.Definitive.Edition\eboot.bin
+	Remove-Item Env:\KYTY_SWITCH_NAME
+
+`Remove-Item` throws if the variable is already gone, which matters when the run is interrupted before it is
+reached. To clear every switch regardless of what an earlier run left behind:
+
+	Get-ChildItem Env:KYTY_* | Remove-Item
+
+Run that before an A/B round to guarantee a clean baseline - a stale `$env:KYTY_*` from a previous test is
+the easiest way to mis-attribute a result.
+
 ### Capture
 
 	$env:KYTY_LENIENT_HOST_FAULTS = '1'
