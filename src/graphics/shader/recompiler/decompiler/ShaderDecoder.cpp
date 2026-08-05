@@ -331,7 +331,8 @@ void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const 
 	inst.unsupported_reason = reason;
 }
 
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error) {
+bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error,
+                   const DecodeOptions& options) {
 	if (code.empty() || code.size() > UINT32_MAX / sizeof(uint32_t)) {
 		SetError(error, "invalid shader decoder input");
 		return false;
@@ -384,6 +385,20 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 
 		if (!ok) {
 			return false;
+		}
+
+		if (options.return_ends_program && inst.opcode == Opcode::SSetpcB64) {
+			// Present it as the program end the standalone shader does not have, so the CFG, the IR
+			// and every dump downstream see an ordinary terminator instead of a subroutine return.
+			Instruction end;
+			end.pc        = inst.pc;
+			end.word      = inst.word;
+			end.family    = Family::SOPP;
+			end.opcode_id = 0x01u;
+			end.opcode    = Opcode::SEndpgm;
+			SetRawWords(end, code, word_index, inst.word_count);
+			program.instructions.push_back(end);
+			return true;
 		}
 
 		program.instructions.push_back(inst);

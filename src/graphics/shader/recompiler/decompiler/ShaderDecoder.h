@@ -660,7 +660,16 @@ struct Program {
 	std::vector<Instruction>  instructions;
 };
 
-bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error);
+struct DecodeOptions {
+	// A PS5 export shader in a real ES+GS pair is a subroutine of the merged shader: it ends by
+	// returning to its caller with `s_setpc_b64`, never with `s_endpgm`. Decoding one standalone
+	// therefore runs off the end of the program and into the `s_code_end` padding LLVM emits after it.
+	// With this set, the first `s_setpc_b64` is decoded as a program end instead.
+	bool return_ends_program = false;
+};
+
+bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string* error,
+                   const DecodeOptions& options = {});
 
 bool DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand, std::string* error);
 bool DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand, std::string* error);

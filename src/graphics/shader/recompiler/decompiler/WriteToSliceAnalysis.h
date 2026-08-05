@@ -62,8 +62,35 @@ struct RingMap {
 // from the pattern the result has `matched == false` and `reject_reason` set.
 RingMap AnalyzePassthroughGs(const Decoder::Program& gs);
 
-// Human-readable dump, for the offline shader_disasm tool and for diagnostics.
+// One ESGS ring dword the export shader stores, and the export component it is forwarded to. The
+// store is identified the way it survives into the IR: `LowerDsWrite`/`LowerDsWrite2` split every DS
+// store into one `DsWriteB32` per dword, each keeping the original pc and carrying its own byte
+// offset, so (pc, offset) names exactly one IR instruction.
+struct RingStore {
+	uint32_t pc        = 0;
+	uint32_t offset    = 0; // byte offset within the ESGS vertex slot
+	uint32_t target    = 0; // export target the GS forwards it to
+	uint32_t component = 0;
+};
+
+// How to run the ES as a plain vertex shader: every ring store becomes a single-component export,
+// and the components the GS materialized itself become constant exports.
+struct EsPlan {
+	bool                         matched = false;
+	uint32_t                     stride  = 0;
+	std::vector<RingStore>       stores;
+	std::vector<ExportComponent> constants;
+	std::string                  reject_reason;
+};
+
+// Pairs a passthrough GS's export map with the ES that feeds it. Rejects unless the ES uses LDS for
+// nothing but the ring, and every ring dword the GS forwards is written exactly once - a component
+// left unwritten would export an undefined position or slice index.
+EsPlan PlanEsExports(const Decoder::Program& es, const RingMap& map);
+
+// Human-readable dumps, for the offline shader_disasm tool and for diagnostics.
 std::string RingMapToString(const RingMap& map);
+std::string EsPlanToString(const EsPlan& plan);
 
 } // namespace Libs::Graphics::ShaderRecompiler::WriteToSlice
 

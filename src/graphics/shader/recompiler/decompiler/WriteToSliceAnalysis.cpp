@@ -410,6 +410,193 @@ RingMap AnalyzePassthroughGs(const Decoder::Program& gs) {
 	return result;
 }
 
+namespace {
+
+// The offsets a DS store covers, and which source operand carries each. Mirrors LowerDsWrite and
+// LowerDsWrite2 so the (pc, offset) pairs this produces name real IR instructions.
+[[nodiscard]] bool RingWriteOffsets(const Decoder::Instruction& inst,
+                                    std::vector<uint32_t>&      offsets) {
+	switch (inst.opcode) {
+		case Decoder::Opcode::DsWriteB32: offsets = {inst.offset}; return true;
+		case Decoder::Opcode::DsWrite2B32:
+			offsets = {inst.offset, inst.secondary_offset};
+			return true;
+		case Decoder::Opcode::DsWriteB64: offsets = {inst.offset, inst.offset + 4u}; return true;
+		default: return false;
+	}
+}
+
+// Every LDS opcode, so the plan can insist the ES touches LDS for nothing but the ESGS ring. If it
+// did anything else there, dropping the ring would change what the shader computes.
+[[nodiscard]] bool IsLdsAccess(Decoder::Opcode opcode) {
+	switch (opcode) {
+		case Decoder::Opcode::DsAddU32:
+		case Decoder::Opcode::DsAddRtnU32:
+		case Decoder::Opcode::DsSubU32:
+		case Decoder::Opcode::DsSubRtnU32:
+		case Decoder::Opcode::DsMinI32:
+		case Decoder::Opcode::DsMinRtnI32:
+		case Decoder::Opcode::DsMaxI32:
+		case Decoder::Opcode::DsMaxRtnI32:
+		case Decoder::Opcode::DsMinU32:
+		case Decoder::Opcode::DsMinRtnU32:
+		case Decoder::Opcode::DsMaxU32:
+		case Decoder::Opcode::DsMaxRtnU32:
+		case Decoder::Opcode::DsAndB32:
+		case Decoder::Opcode::DsAndRtnB32:
+		case Decoder::Opcode::DsOrB32:
+		case Decoder::Opcode::DsOrRtnB32:
+		case Decoder::Opcode::DsXorB32:
+		case Decoder::Opcode::DsXorRtnB32:
+		case Decoder::Opcode::DsWrxchgRtnB32:
+		case Decoder::Opcode::DsMinF32:
+		case Decoder::Opcode::DsMaxF32:
+		case Decoder::Opcode::DsConsume:
+		case Decoder::Opcode::DsAppend:
+		case Decoder::Opcode::DsReadSbyte:
+		case Decoder::Opcode::DsReadUbyte:
+		case Decoder::Opcode::DsReadSshort:
+		case Decoder::Opcode::DsReadUshort:
+		case Decoder::Opcode::DsRead2B32:
+		case Decoder::Opcode::DsReadB32:
+		case Decoder::Opcode::DsReadB64:
+		case Decoder::Opcode::DsRead2B64:
+		case Decoder::Opcode::DsRead2St64B64:
+		case Decoder::Opcode::DsReadB96:
+		case Decoder::Opcode::DsReadB128:
+		case Decoder::Opcode::DsReadAddtidB32:
+		case Decoder::Opcode::DsWriteByte:
+		case Decoder::Opcode::DsWriteShort:
+		case Decoder::Opcode::DsWrite2B32:
+		case Decoder::Opcode::DsWrite2St64B32:
+		case Decoder::Opcode::DsWrite2B64:
+		case Decoder::Opcode::DsWrite2St64B64:
+		case Decoder::Opcode::DsWriteB32:
+		case Decoder::Opcode::DsWriteB64:
+		case Decoder::Opcode::DsWriteB96:
+		case Decoder::Opcode::DsWriteB128:
+		case Decoder::Opcode::DsWriteAddtidB32:
+		case Decoder::Opcode::DsSwizzleB32: return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] std::string ExportTargetName(uint32_t target) {
+	return target == 0x0cu   ? "POS0"
+	       : target == 0x0du ? "POS1"
+	       : target >= 0x20u ? fmt::format("PARAM{}", target - 0x20u)
+	                         : fmt::format("?{:#04x}", target);
+}
+
+} // namespace
+
+EsPlan PlanEsExports(const Decoder::Program& es, const RingMap& map) {
+	EsPlan result {};
+
+	if (!map.matched) {
+		result.reject_reason = "the geometry shader did not match";
+		return result;
+	}
+	result.stride = map.stride;
+
+	// Which ring offsets the GS actually forwards, and to where.
+	std::unordered_map<uint32_t, const ExportComponent*> wanted;
+	for (const auto& c: map.components) {
+		if (c.kind == SourceKind::RingOffset) {
+			wanted.emplace(c.value, &c);
+		} else {
+			result.constants.push_back(c);
+		}
+	}
+
+	Tracker                     tracker;
+	std::unordered_set<uint32_t> covered;
+
+	for (const auto& inst: es.instructions) {
+		// An export shader in a real ES+GS pair exports nothing - the GS owns every export. One here
+		// means this is not the shape being recognized.
+		if (inst.opcode == Decoder::Opcode::Exp) {
+			result.reject_reason =
+			    fmt::format("export shader exports directly at pc 0x{:x}", inst.pc);
+			return result;
+		}
+
+		if (inst.opcode == Decoder::Opcode::VMulU32U24 ||
+		    inst.opcode == Decoder::Opcode::VMadU32U24) {
+			uint32_t bits = 0;
+			if ((ConstantBits(inst.src0, bits) || ConstantBits(inst.src1, bits)) &&
+			    bits == map.stride && IsVgpr(inst.dst)) {
+				// The ESGS ring is addressed at exactly `stride * slot`. A constant addend would put
+				// the store in some other LDS region, which this pattern does not have.
+				uint32_t addend = 0;
+				if (inst.opcode == Decoder::Opcode::VMadU32U24 &&
+				    (!ConstantBits(inst.src2, addend) || addend != 0u)) {
+					tracker.Clear(inst.dst.reg);
+					continue;
+				}
+				tracker.SetRingBase(inst.dst.reg, 0);
+				continue;
+			}
+		}
+
+		if (IsLdsAccess(inst.opcode)) {
+			std::vector<uint32_t> offsets;
+			uint32_t              addend = 0;
+			if (!IsVgpr(inst.src0) || !tracker.GetRingBase(inst.src0.reg, addend) ||
+			    !RingWriteOffsets(inst, offsets)) {
+				result.reject_reason = fmt::format(
+				    "export shader uses LDS for something other than the ESGS ring at pc 0x{:x}",
+				    inst.pc);
+				return result;
+			}
+			for (uint32_t i = 0; i < offsets.size(); i++) {
+				const auto offset = offsets[i];
+				const auto it     = wanted.find(offset);
+				if (it == wanted.end()) {
+					// The GS never reads this dword back, so nothing consumes it. Dropping it is what
+					// eliding the ring means; it is not evidence against the pattern.
+					continue;
+				}
+				if (!covered.insert(offset).second) {
+					result.reject_reason =
+					    fmt::format("ESGS ring offset {} is written more than once", offset);
+					return result;
+				}
+				result.stores.push_back({inst.pc, offset, it->second->target, it->second->component});
+			}
+			continue;
+		}
+
+		if (IsVgpr(inst.dst) && DefinesDst(inst)) {
+			const auto count = DefinedRegisterCount(inst);
+			for (uint32_t i = 0; i < count; i++) {
+				tracker.Clear(inst.dst.reg + i);
+			}
+		}
+		if (IsVgpr(inst.dst2)) {
+			tracker.Clear(inst.dst2.reg);
+		}
+	}
+
+	for (const auto& [offset, component]: wanted) {
+		if (!covered.contains(offset)) {
+			result.reject_reason = fmt::format(
+			    "the geometry shader forwards ESGS ring offset {} but the export shader never writes "
+			    "it",
+			    offset);
+			return result;
+		}
+	}
+
+	std::sort(result.stores.begin(), result.stores.end(),
+	          [](const RingStore& a, const RingStore& b) {
+		          return a.pc != b.pc ? a.pc < b.pc : a.offset < b.offset;
+	          });
+
+	result.matched = true;
+	return result;
+}
+
 std::string RingMapToString(const RingMap& map) {
 	if (!map.matched) {
 		return fmt::format("WriteToSlice: no match ({})\n",
@@ -418,16 +605,32 @@ std::string RingMapToString(const RingMap& map) {
 
 	std::string out = fmt::format("WriteToSlice: matched, ESGS stride {} bytes\n", map.stride);
 	for (const auto& c: map.components) {
-		const std::string target_name = c.target == 0x0cu   ? "POS0"
-		                                : c.target == 0x0du ? "POS1"
-		                                : c.target >= 0x20u ? fmt::format("PARAM{}", c.target - 0x20u)
-		                                                    : fmt::format("?{:#04x}", c.target);
-		const char        swizzle     = "xyzw"[c.component & 3u];
+		const auto target_name = ExportTargetName(c.target);
+		const char swizzle     = "xyzw"[c.component & 3u];
 		if (c.kind == SourceKind::RingOffset) {
 			out += fmt::format("  ring[{:2}] -> {}.{}\n", c.value, target_name, swizzle);
 		} else {
 			out += fmt::format("  const 0x{:08x} -> {}.{}\n", c.value, target_name, swizzle);
 		}
+	}
+	return out;
+}
+
+std::string EsPlanToString(const EsPlan& plan) {
+	if (!plan.matched) {
+		return fmt::format("WriteToSlice ES: no match ({})\n",
+		                   plan.reject_reason.empty() ? "unknown reason" : plan.reject_reason);
+	}
+
+	std::string out = fmt::format("WriteToSlice ES: matched, {} ring stores retargeted\n",
+	                              plan.stores.size());
+	for (const auto& s: plan.stores) {
+		out += fmt::format("  pc 0x{:04x} ring[{:2}] -> {}.{}\n", s.pc, s.offset,
+		                   ExportTargetName(s.target), "xyzw"[s.component & 3u]);
+	}
+	for (const auto& c: plan.constants) {
+		out += fmt::format("  const 0x{:08x} -> {}.{}\n", c.value, ExportTargetName(c.target),
+		                   "xyzw"[c.component & 3u]);
 	}
 	return out;
 }
