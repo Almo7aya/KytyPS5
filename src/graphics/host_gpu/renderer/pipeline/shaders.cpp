@@ -585,8 +585,18 @@ void CreatePipelineInternal(
 		const auto& b          = vs_input_info.buffers[bi];
 		input_desc[bi].binding = bi;
 		input_desc[bi].stride  = b.stride;
-		input_desc[bi].inputRate =
-		    (b.fetch_index == 0 ? vk::VertexInputRate::eVertex : vk::VertexInputRate::eInstance);
+		// A/B: KYTY_ALL_VERTEX_RATE=1 binds every buffer at vertex rate.
+		//
+		// fetch_index comes from a single bit of the attribute word (shader.cpp:672) and decides whether the
+		// buffer advances per vertex or per instance. If a buffer the guest meant to advance per vertex is
+		// bound at instance rate, every vertex of the mesh reads the same element; the other way round, each
+		// vertex reads a different transform. Either mangles a mesh into scattered fragments while leaving
+		// meshes that use only per-vertex buffers untouched.
+		static const bool all_vertex_rate = std::getenv("KYTY_ALL_VERTEX_RATE") != nullptr;
+
+		input_desc[bi].inputRate = (b.fetch_index == 0 || all_vertex_rate
+		                                ? vk::VertexInputRate::eVertex
+		                                : vk::VertexInputRate::eInstance);
 
 		for (int ai = 0; ai < b.attr_num; ai++) {
 			auto index                 = b.attr_indices[ai];

@@ -936,6 +936,26 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// A/B: m_num_instances is sticky state left behind by whichever draw last set it, so a draw arriving with
+// instance_count == 0 inherits a count it never asked for. Instances past the first then read per-instance
+// data that was never written for them, scattering copies of parts of the mesh at arbitrary positions - and
+// which draw inherits what depends on submission order, so it moves frame to frame.
+//
+//   KYTY_NO_STICKY_INSTANCES=1 - treat an unspecified count as exactly one instance instead of inheriting.
+//   KYTY_FORCE_ONE_INSTANCE=1  - clamp every draw to one instance, however the count was specified.
+//
+// Genuinely instanced geometry (foliage, crowds) loses its copies under either, so the question is only
+// whether the car and the character stop scattering.
+static bool NoStickyInstances() {
+	static const bool enabled = std::getenv("KYTY_NO_STICKY_INSTANCES") != nullptr;
+	return enabled;
+}
+
+static uint32_t ClampInstanceCount(uint32_t instance_count) {
+	static const bool force_one = std::getenv("KYTY_FORCE_ONE_INSTANCE") != nullptr;
+	return force_one ? 1u : instance_count;
+}
+
 void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, uint32_t flags,
                                  uint32_t type, uint32_t instance_count, const void* object_ids,
                                  uint32_t render_target_slice_offset, int32_t vertex_offset_add,
@@ -943,8 +963,9 @@ void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, u
 	CheckBuffer();
 
 	if (instance_count == 0) {
-		instance_count = m_num_instances;
+		instance_count = (NoStickyInstances() ? 1 : m_num_instances);
 	}
+	instance_count = ClampInstanceCount(instance_count);
 	if (object_ids != nullptr) {
 		LOGF("\t draw indexed multi-instanced objectIds = 0x%016" PRIx64 "\n",
 		     reinterpret_cast<uint64_t>(object_ids));
@@ -978,7 +999,8 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
 
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size,
-	                                         index_count, index_addr, flags, 1, m_num_instances);
+	                                         index_count, index_addr, flags, 1,
+	                                         ClampInstanceCount(m_num_instances));
 }
 
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
@@ -1299,7 +1321,8 @@ void CommandProcessor::SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flag
 	CheckBuffer();
 
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), vertex_count, flags,
-	                                        render_target_slice_offset, m_num_instances,
+	                                        render_target_slice_offset,
+	                                        ClampInstanceCount(m_num_instances),
 	                                        first_vertex, first_instance);
 }
 
