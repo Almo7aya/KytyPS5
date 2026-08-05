@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <semaphore>
@@ -1532,12 +1533,14 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
 }
 
-void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
+void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
+                                    uint64_t dst_gpu_addr) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
 		     "\t event_type  = 0x%08" PRIx32 "\n"
-		     "\t event_index = 0x%08" PRIx32 "\n",
-		     event_type, event_index);
+		     "\t event_index = 0x%08" PRIx32 "\n"
+		     "\t dst_gpu_addr = 0x%016" PRIx64 "\n",
+		     event_type, event_index, dst_gpu_addr);
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
@@ -1574,12 +1577,22 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 		case 0x00000019:
 		case 0x0000001a:
 		case 0x0000001b:
-		case 0x00000038:
-		case 0x00000039:
-		case 0x0000003a:
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
+			break;
+		case 0x00000038: // PIXEL_PIPE_STAT_CONTROL
+			break;
+		case 0x00000039: // PIXEL_PIPE_STAT_DUMP - occlusion query result
+			// Unreal computes visible pixels as `end - begin` of a 64-bit counter pair. There is no
+			// real Z-pass counting on the host, so write a monotonically increasing value to the
+			// destination; any `end - begin` is then positive and the primitive reports visible.
+			if (dst_gpu_addr != 0) {
+				const auto value = m_occlusion_counter++;
+				std::memcpy(reinterpret_cast<void*>(dst_gpu_addr), &value, sizeof(value));
+			}
+			break;
+		case 0x0000003a: // PIXEL_PIPE_STAT_RESET
 			break;
 		default:
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);

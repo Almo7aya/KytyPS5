@@ -2179,7 +2179,14 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	uint32_t event_index = (buffer[0] >> 8u) & 0x7u;
 	uint32_t event_type  = (buffer[0]) & 0x3fu;
 
-	cp.TriggerEvent(event_type, event_index);
+	// IT_EVENT_WRITE carries a destination address in the following dwords (low, high); only
+	// PIXEL_PIPE_STAT_DUMP consumes it, as the occlusion-query result location.
+	uint64_t dst_gpu_addr = 0;
+	if (event_type == 0x39 && KYTY_PM4_LEN(cmd_id) >= 4) {
+		dst_gpu_addr = buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u);
+	}
+
+	cp.TriggerEvent(event_type, event_index, dst_gpu_addr);
 
 	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
