@@ -714,30 +714,61 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 
-		// Why a colour target does or does not get cleared, once per distinct surface.
+		// How often each colour surface is bound versus actually cleared.
 		//
 		// GTA III's velocity buffer is never cleared and accumulates the previous frames' silhouettes,
 		// which is what makes the car and the character flicker: a pixel's motion vector comes from
-		// whichever stale silhouette last covered it. Exactly one colour clear happens in the whole
-		// frame - the separate-translucency surface - so the DCC clear-code path from 0db97ca fires for
-		// that target and not this one. These are the inputs to that decision, so the next run says which
-		// of them differs instead of it being guessed at.
+		// whichever stale silhouette last covered it. The capture shows exactly one colour clear in a
+		// whole frame - the separate-translucency surface - so the DCC clear-code path from 0db97ca fires
+		// for that target and not the rest.
+		//
+		// Counted per surface rather than sampled on first sight, because first sight happens during
+		// loading before any clear has been recorded, which said nothing. A surface with many binds and
+		// zero clears is one the guest expects to be cleared by a mechanism Kyty is missing.
 		{
-			static std::mutex         reported_mutex;
-			static std::set<uint64_t> reported;
-			const auto                base = target.desc.info.data.address;
-			std::unique_lock          lock(reported_mutex);
-			if (reported.size() < 24 && reported.insert(base).second) {
-				lock.unlock();
-				std::fprintf(stderr,
-				             "[rt-clear] base=0x%010" PRIx64 " %ux%u vkfmt=%d dcc=%d"
-				             " meta_addr=0x%010" PRIx64 " meta_cleared=%d code=0x%02x reg_clear=%d"
-				             " -> is_clear=%d\n",
-				             base, target.extent.width, target.extent.height,
-				             static_cast<int>(target.desc.info.pixel_format), has_dcc ? 1 : 0,
-				             metadata_address, meta_was_cleared ? 1 : 0,
-				             has_recorded_code ? (recorded_code & 0xffu) : 0u,
-				             target.color_clear_enable ? 1 : 0, attachment.is_clear ? 1 : 0);
+			struct ClearStats {
+				uint64_t binds       = 0;
+				uint64_t clears      = 0;
+				uint32_t width       = 0;
+				uint32_t height      = 0;
+				int      format      = 0;
+				bool     dcc         = false;
+				uint64_t meta        = 0;
+				uint32_t last_code   = 0;
+			};
+			static std::mutex                             stats_mutex;
+			static std::map<uint64_t, ClearStats>         stats;
+			static uint64_t                              total_binds = 0;
+			static uint32_t                              reports     = 0;
+
+			const auto       base = target.desc.info.data.address;
+			std::scoped_lock lock(stats_mutex);
+			if (stats.size() < 96 || stats.contains(base)) {
+				auto& entry  = stats[base];
+				entry.width  = target.extent.width;
+				entry.height = target.extent.height;
+				entry.format = static_cast<int>(target.desc.info.pixel_format);
+				entry.dcc    = has_dcc;
+				entry.meta   = metadata_address;
+				entry.binds++;
+				if (attachment.is_clear) {
+					entry.clears++;
+					if (has_recorded_code) {
+						entry.last_code = recorded_code & 0xffu;
+					}
+				}
+			}
+			if (++total_binds % 40000 == 0 && reports++ < 6) {
+				for (const auto& [addr, s]: stats) {
+					std::fprintf(stderr,
+					             "[rt-clear] base=0x%010" PRIx64 " %ux%u vkfmt=%d dcc=%d"
+					             " meta=0x%010" PRIx64 " binds=%llu clears=%llu code=0x%02x\n",
+					             addr, s.width, s.height, s.format, s.dcc ? 1 : 0, s.meta,
+					             static_cast<unsigned long long>(s.binds),
+					             static_cast<unsigned long long>(s.clears), s.last_code);
+				}
+				std::fprintf(stderr, "[rt-clear] ---- %llu surfaces ----\n",
+				             static_cast<unsigned long long>(stats.size()));
 				std::fflush(stderr);
 			}
 		}
