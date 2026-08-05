@@ -391,6 +391,10 @@ at best. Do not implement it.**
 
 ### 13.2 This TAA has no velocity input at all, so missing motion vectors cannot be the cause
 
+> **CORRECTED by §14.6 — this section's conclusion is too strong.** A velocity buffer does exist and is
+> consumed; it just is not one of the bindings of the dispatch inspected in frame 1659. Do not rely on
+> "there is no velocity" as an elimination.
+
 Five sampled inputs: two 1×1, depth (twice), one full-res R11G11B10, one full-res RGBA16F, plus one
 RGBA16F storage output. **None is a two-channel motion/velocity texture.** The guest compiled this TAA
 variant without one, so no amount of emulator work can make it consume velocity. The framing of "the
@@ -494,6 +498,48 @@ The cone also carries the **dither/checkerboard pattern** that Part 4 saw on the
 UE dithers volumetric and masked material sampling and relies on TAA to resolve it, which needs a dither
 offset that *changes every frame*. A constant offset produces a permanent stipple. Worth checking whether
 the frame index or `View.TemporalAAParams` Kyty supplies is static.
+
+### 14.6 There *is* a velocity buffer, and it looks wrong — §13.2 corrected
+
+Events 9674-9776 (7 draws, pass 3) write `ResourceId::47008`, `3360x1892 R16G16B16A16_UNORM`. Flat
+saturated regions follow the silhouettes of the car, character, lamp post and buildings - the signature
+of a motion-vector buffer. `get_resource_usage` shows it is **read** at events 11580 and 12424, so it is
+consumed, not dead.
+
+**That corrects §13.2.** Concluding "this TAA has no velocity input at all" from one dispatch's bindings
+in frame 1659 was too strong: velocity exists and is consumed. §13.1 (the "empty R32F at 20235e0000" is
+the populated depth buffer) still stands - the docs named the wrong resource - but the instinct that
+motion vectors were involved should not have been retired.
+
+What the contents look like, measured over the car/character region (x 1300-1700, y 1150-1450, 63
+samples):
+
+	r: min 0.0  max 0.0        mean 0.0
+	g: min 0.0  max 0.0        mean 0.0
+	b: min 0.0  max 0.753902   mean 0.220053
+
+Whole-target max is `r 1.0, g 1.0, b 0.81`. So R and G are pinned to exactly 0 over the dynamic objects
+while B carries the signal, and elsewhere R/G saturate to 1.0. UE encodes screen-space motion in **R and
+G**, biased so that zero motion is mid-range, so exact 0 there is either fully saturated negative motion
+across a whole object or an encoding this analysis has not identified. A velocity buffer in that state
+would make any consumer reproject from the wrong place, on exactly the dynamic objects that write
+velocity and not on static geometry - which is the observed split.
+
+Two candidate mechanisms **ruled out** already:
+
+- **Format mapping is correct.** `k16_16_16_16 + kUNorm -> eR16G16B16A16Unorm` is what the table does, so
+  Kyty is faithful to what the guest declared; this is not a UNORM/SFLOAT mix-up.
+- **The compressed export unpacks all four components.** The pixel shader's export is a packed-FP16
+  (`compr`) export, and the emitted SPIR-V builds the full float4 from both dwords
+  (`CompositeConstruct({_1277, _1278, _1281, _1282})`), so no component is being dropped by the `en`-mask
+  handling.
+
+So R=0/G=0 are the values the shader itself computed, which pushes the question up into its inputs -
+most likely the previous-frame transform it differences against.
+
+Noticed while checking: `kRenderTargetFormats` has **no `k16_16_16_16 + kSNorm` entry** at all, while
+`k16_16` and `k8_8_8_8` both do. Any title binding that combination hits the `EXIT` in
+`TextureGetRenderTargetFormat`. Latent, unrelated to this bug, worth filling in.
 
 ### 14.4 What is NOT established
 
