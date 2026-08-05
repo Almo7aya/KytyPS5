@@ -404,6 +404,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 	}
 
 	buffer.EndRendering();
+
+	// A/B: KYTY_BARRIER_AFTER_DISPATCH orders every dispatch against everything that reads afterwards.
+	//
+	// This is the ordering test that KYTY_BARRIER_EVERY_DRAW could not be: that one fired inside an active
+	// render pass, where Vulkan permits only subpass self-dependencies, so it was probably ignored and its
+	// negative result proves nothing. Here the render pass has just been ended, so a full dependency is
+	// legal.
+	//
+	// Unreal's per-object transforms and its skinned vertices are produced by compute passes -
+	// KYTY_FORCE_BUFFER_UPLOAD making the models worse proved the GPU is the producer, not the CPU. If those
+	// producers are not ordered against the draws that consume them, a draw reads half-written data: garbage
+	// for some objects on some frames, which is the symptom.
+	// The barrier below is normally emitted only when HasShaderBufferWrites/the image scan says this dispatch
+	// wrote something. If that detection misses a producer, the consuming draw has no dependency at all and
+	// reads half-written data - some objects, some frames, which is the symptom. These switches remove that
+	// condition so the detection is no longer trusted.
+	static const bool barrier_after_dispatch      = std::getenv("KYTY_BARRIER_AFTER_DISPATCH") != nullptr;
+	static const bool full_barrier_after_dispatch = std::getenv("KYTY_FULL_BARRIER_AFTER_DISPATCH") != nullptr;
+
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
 	auto bindings = PrepareBindings(buffer, input_info.stage, vk::ShaderStageFlagBits::eCompute,
@@ -425,8 +444,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 		                        image.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint);
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	if (has_storage_writes || barrier_after_dispatch || full_barrier_after_dispatch) {
 		ShaderWriteBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	if (full_barrier_after_dispatch) {
+		// Sledgehammer: order this dispatch against every later command, with a memory access mask that does
+		// not depend on Kyty classifying the write correctly. ShaderWriteBarrier's srcAccessMask is
+		// eShaderWrite only; if a dispatch writes through some path that does not land in that bucket, the
+		// dependency above is a no-op even when it is emitted.
+		const auto barrier = VulkanMemoryBarrier {vk::StructureType::eMemoryBarrier, nullptr,
+		                                          vk::AccessFlagBits::eMemoryWrite,
+		                                          vk::AccessFlagBits::eMemoryRead |
+		                                              vk::AccessFlagBits::eMemoryWrite};
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eAllCommands, vk::DependencyFlags {}, 1,
+		                          &barrier, 0, nullptr, 0, nullptr);
 	}
 	ResetBindings();
 }

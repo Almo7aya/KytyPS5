@@ -216,9 +216,11 @@ Rules that make this work:
 | `KYTY_FORCE_VELOCITY_CLEAR=1` | clear full-res R16G16B16A16_UNORM attachments | **tested: no effect on the flicker** |
 | `KYTY_META_CLEAR_ASSUME_ZERO=1` | codeless metadata clear ⇒ clear to zero | **tested: no effect on the flicker** |
 | `KYTY_FORCE_BUFFER_UPLOAD=1` | re-upload read-only buffers in full every use | **tested: models got much WORSE** — see §4.1b |
-| `KYTY_NO_STALE_UPLOAD=1` | never upload over a GPU-modified read-only range | may serve genuinely stale data if the tracker is right |
-| `KYTY_BARRIER_EVERY_DRAW=1` | every draw waits on all prior shader writes | heavy over-synchronisation, slow |
-| `KYTY_NO_STORAGE_CLAMP=1` | bind the descriptor's nominal size, not the mapped extent | may bind unmapped memory; relies on robust access |
+| `KYTY_NO_STALE_UPLOAD=1` | never upload over a GPU-modified read-only range | **tested: no effect** |
+| `KYTY_BARRIER_EVERY_DRAW=1` | every draw waits on all prior shader writes | **tested: no effect — but the test was INVALID, see §4.1c** |
+| `KYTY_NO_STORAGE_CLAMP=1` | bind the descriptor's nominal size, not the mapped extent | **tested: no effect** |
+| `KYTY_BARRIER_AFTER_DISPATCH=1` | barrier after *every* dispatch, not just detected writers | slow; over-synchronises compute |
+| `KYTY_FULL_BARRIER_AFTER_DISPATCH=1` | as above plus an `eAllCommands` / `eMemoryWrite→eMemoryRead` barrier | slowest; masks any mis-specified access bit |
 
 ### 4.1b `KYTY_FORCE_BUFFER_UPLOAD` made it worse — which is the most useful result yet
 
@@ -242,6 +244,49 @@ That inverts the hypothesis. The bug is not a *missed* CPU write; it is one of:
 
 Test them one at a time. Note 2 and 3 are expected to be slow / wasteful when on — only whether the
 misplacement changes matters.
+
+### 4.1c All three were tested: no effect. 1 and 3 are eliminated; 2 was never actually tested
+
+`KYTY_NO_STALE_UPLOAD`, `KYTY_BARRIER_EVERY_DRAW` and `KYTY_NO_STORAGE_CLAMP` all left the flicker
+unchanged. Hypotheses 1 (stale upload over GPU data) and 3 (storage clamp) are **eliminated**.
+
+Hypothesis 2 is **not** eliminated, because the test was broken. `KYTY_BARRIER_EVERY_DRAW` emitted its
+barrier inside `EmitDrawPrimitives`, which runs with a render pass active. Vulkan permits only subpass
+self-dependencies there, so a global buffer dependency at that point is invalid and almost certainly did
+nothing. Its negative result carries no information.
+
+What the barrier plumbing actually looks like, having read it:
+
+* `MakeShaderWriteDependency` is **correct and wide** — `srcAccessMask = eShaderWrite`, dst covers
+  `eShaderRead/Write`, `eVertexAttributeRead`, `eIndexRead`, `eUniformRead`, transfer and colour-attachment
+  access. Destination stages likewise cover `eVertexInput`, `eVertexShader`, `eFragmentShader`, transfer and
+  `eColorAttachmentOutput`. (An earlier reading of mine that the destination mask was compute-only was wrong:
+  `ShaderWriteBarrier`'s parameter is the *source* stage.)
+* The one real gap is that the post-dispatch barrier in `renderCompute.cpp` is **conditional**:
+
+  ```cpp
+  bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
+  has_storage_writes = std::any_of(program.info.images…, image.written && StorageImage…) || has_storage_writes;
+  if (has_storage_writes) { ShaderWriteBarrier(vk_buffer, eComputeShader); }
+  ```
+
+  If that detection misses a producing dispatch, **no dependency is emitted at all** and the consuming draw
+  is free to read half-written data — for whichever objects that dispatch produced, on whichever frames the
+  race lands badly. That is exactly the observed symptom, and it is fully consistent with §4.1b's finding
+  that the GPU is the producer.
+
+`KYTY_BARRIER_AFTER_DISPATCH=1` drops the condition. `KYTY_FULL_BARRIER_AFTER_DISPATCH=1` additionally emits
+an `eAllCommands`, `eMemoryWrite → eMemoryRead|eMemoryWrite` barrier, which does not depend on Kyty
+classifying the write into the `eShaderWrite` bucket at all. Both are placed after `buffer.EndRendering()`,
+so unlike `KYTY_BARRIER_EVERY_DRAW` they are legal.
+
+How to read the outcome:
+
+| Result | Conclusion |
+| --- | --- |
+| `BARRIER_AFTER_DISPATCH` fixes it | write detection (`HasShaderBufferWrites` / the image scan) misses real producers — fix the classifier |
+| only `FULL_BARRIER_AFTER_DISPATCH` fixes it | a write escapes the `eShaderWrite` access bucket — widen `MakeShaderWriteDependency`'s src mask |
+| neither changes anything | dispatch→draw ordering is fully eliminated; move to vertex/index buffer residency and the embedded vertex-fetch rewrite |
 
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
