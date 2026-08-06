@@ -155,47 +155,65 @@ void LogSubmittedBigDraw(uint32_t index_count, uint32_t frame_num) {
 	// the character's base-pass index counts, how many frames contained it at all. Equal to the frame count
 	// means the guest submits it every frame and the fault is downstream; short of it means the guest culls
 	// it on some frames and the fault is upstream of the renderer.
-	static constexpr uint32_t kTargets[] = {12357u, 9744u, 9054u, 12147u};
-	constexpr size_t          kCount     = std::size(kTargets);
+	if (index_count < 8000) {
+		return;
+	}
 
-	static Common::Mutex mutex;
-	static uint32_t      current_frame           = UINT32_MAX;
-	static bool          seen_this_frame[kCount] = {};
-	static uint32_t      frames_with[kCount]     = {};
-	static uint32_t      frames_total            = 0;
-	static uint32_t      reports                 = 0;
+	// Not keyed on index counts taken from one capture - a different session can use different meshes or LODs,
+	// and hardcoding them risks measuring nothing while looking like a clean negative. Instead every large
+	// draw is tracked, and the report names the ones present in only *some* frames of the window. A draw the
+	// guest issues every frame shows present == window; an intermittently culled one shows clearly fewer, and
+	// that is the character.
+	struct Entry {
+		uint32_t frames_present = 0;
+		uint32_t window_present = 0;
+		bool     seen_this_frame = false;
+	};
+
+	static Common::Mutex               mutex;
+	static std::map<uint32_t, Entry>   entries;
+	static uint32_t                    current_frame = UINT32_MAX;
+	static uint32_t                    frames_total  = 0;
+	static uint32_t                    window_frames = 0;
 
 	Common::LockGuard lock(mutex);
 
 	if (frame_num != current_frame) {
 		if (current_frame != UINT32_MAX) {
 			frames_total++;
-			for (size_t i = 0; i < kCount; i++) {
-				if (seen_this_frame[i]) {
-					frames_with[i]++;
+			window_frames++;
+			for (auto& [indices, entry]: entries) {
+				if (entry.seen_this_frame) {
+					entry.frames_present++;
+					entry.window_present++;
 				}
+				entry.seen_this_frame = false;
 			}
-			if (frames_total % 120 == 0 && reports < 12) {
-				reports++;
-				std::fprintf(stderr,
-				             "[frame-draw] frames=%" PRIu32 " 12357=%" PRIu32 " 9744=%" PRIu32
-				             " 9054=%" PRIu32 " 12147=%" PRIu32 "\n",
-				             frames_total, frames_with[0], frames_with[1], frames_with[2],
-				             frames_with[3]);
+			// No report cap: the first attempt capped at 12 reports and stopped at frame 1440, all of it
+			// logos, menus and loading before the character was ever on screen, so every line read zero and
+			// said nothing at all.
+			if (window_frames >= 300) {
+				std::fprintf(stderr, "[frame-draw] frames=%" PRIu32 " window=%" PRIu32 "\n",
+				             frames_total, window_frames);
+				for (auto& [indices, entry]: entries) {
+					// Only the intermittent ones matter. Present in every frame of the window is a draw
+					// the guest always issues; present in none means the object is simply off screen.
+					if (entry.window_present != 0 && entry.window_present < window_frames) {
+						std::fprintf(stderr,
+						             "[frame-draw]   indices=%" PRIu32 " present=%" PRIu32 "/%" PRIu32
+						             "\n",
+						             indices, entry.window_present, window_frames);
+					}
+					entry.window_present = 0;
+				}
 				std::fflush(stderr);
+				window_frames = 0;
 			}
 		}
 		current_frame = frame_num;
-		for (size_t i = 0; i < kCount; i++) {
-			seen_this_frame[i] = false;
-		}
 	}
 
-	for (size_t i = 0; i < kCount; i++) {
-		if (index_count == kTargets[i]) {
-			seen_this_frame[i] = true;
-		}
-	}
+	entries[index_count].seen_this_frame = true;
 }
 
 // A requested MRT slot that resolves to no image is dropped, and because resolved slots are packed every
