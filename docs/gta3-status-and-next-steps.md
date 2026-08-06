@@ -524,6 +524,74 @@ way and needs confirming against a pixel known to be covered by solid geometry.
 2. Only then read the offending draw's inputs. Do not pick draws by index count again - that assumption is what
    invalidated §4.1f.
 
+### 4.1j MEASURED FROM IMAGES: the defect is missing/misrouted GBuffer output, not geometry
+
+All of this comes from saved images and `read_texture_pixels`, not from the RenderDoc Python state queries -
+see the tool warning at the end of this section.
+
+**Ground truth, capture `kyty_frame1207.rdc`:**
+
+1. **The character is exactly `(0,0,0)`** in the final image (`ResourceId::3767`), read at full resolution -
+   not merely dark. The road beside it reads 0.066-0.117 and is correctly lit.
+2. **Completed GBuffer normal (`ResourceId::3149`, end of frame)**: road, sidewalk, buildings, trees and lamp
+   posts all have coherent normals. **The character is a pure black silhouette with no normal data.** **The car
+   has wildly wrong normals** - bright green/yellow panels against an otherwise coherent scene - plus black
+   gaps. The character's silhouette is correctly *shaped* (though the maintainer notes the head is missing), so
+   geometry and transform are fine.
+3. **The character's depth prepass runs but its base pass does not write.** That is why the silhouette is a
+   black cutout: prepass depth is present, so the road drawn later is depth-rejected there, leaving the cleared
+   zero, which lights to black.
+4. **The capture contains two GBuffer passes.** Both write the same aux targets (3149, 3282, 3480, 3432, 4087)
+   but a *different slot 0*:
+   * pass A, events ~4193-15073, slot 0 = `ResourceId::4083` (**R16G16B16A16_FLOAT**) - contains the character
+     draws 8466 (12357), 10449 (9744), 10629 (9054), 10647 (12147)
+   * pass B, events ~28801-31283, slot 0 = `ResourceId::49328` (**R11G11B10_FLOAT**) - contains **no character
+     draws at all**
+   The presented image comes from pass B. So the character's base pass runs on one frame and is absent on the
+   next: **that is the flicker.**
+5. Post-VS positions for the character are **identical** between prepass (643) and base pass (8466) across all
+   64 vertices sampled, confirming again that positions are not the problem.
+
+**Why the MRT resolve loop is the prime suspect** (`renderDraw.cpp`, `ResolveColorTargets` caller):
+
+```cpp
+for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+    if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+                      ctx.GetRenderTarget(slot).base.addr != 0)) {
+        ResolveRenderColorTarget(..., state.color_info[state.color_count], ..., slot);
+        if (state.color_info[state.color_count].image_id) { state.color_count++; }
+    }
+}
+```
+
+Two failure modes, both matching the observations:
+
+* Slots 1-7 attach only when the render-target mask says so. A stale or misread mask silently **detaches the
+  normal buffer** while the pixel shader still exports to it - the character writing no normal at all.
+* Resolved slots are **packed** into `color_info[color_count]`. A slot that fails to resolve leaves no hole, so
+  every later slot shifts down an index while the pixel shader keeps exporting to fixed locations - **each
+  export lands in the wrong attachment**, which is what garbage green normals on the car look like.
+
+**A/B switches added:** `KYTY_FORCE_ALL_MRT=1` attaches every slot with a non-zero base address, ignoring the
+mask. `KYTY_STRICT_MRT=1` skips a draw when a requested slot fails to resolve rather than shifting the rest.
+A `[mrt-drop]` stderr line (capped at 64) reports any dropped slot, so it is directly visible whether this
+happens at all.
+
+**Tool reliability warning - three separate RenderDoc Python binding failures cost real time here:**
+
+* `get_resource_usage` **usage names are wrong for Vulkan**. Both a colour attachment and a plain texture
+  report `VS_RWResource`, and `Usage.44` comes back unmapped. Do not infer attachment roles from it.
+* `pixel_history` appears to **only track colour attachment 0**. On `49328` (slot 0) it returned 30 rich
+  modifications; on `3149`/`3282` (slots 1-2) only clears. This produced the bogus §4.1i conclusion that a
+  target bound 1044 times was never written.
+* `get_pipeline_state` / `get_draw_call_state` raise `AttributeError` for **viewports, scissors, rasterizer,
+  blend, depth and stencil**, so none of that state is observable through this binding.
+* `pixel_history` and `save_texture` **need an explicit late `event_id`**; without one they report the state
+  before anything was drawn. §4.1i's "zero modifications" was partly this.
+
+Prefer `save_texture` plus `read_texture_pixels` - those have been reliable and are what produced every solid
+finding above.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The

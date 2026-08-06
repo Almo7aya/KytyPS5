@@ -107,6 +107,20 @@ void ReportDrawSkips() {
 	                 g_draw_skips.no_target.load(std::memory_order_relaxed)));
 	std::fflush(stderr);
 }
+
+// A requested MRT slot that resolves to no image is dropped, and because resolved slots are packed every
+// later slot shifts index while the pixel shader keeps exporting to fixed locations. Report the first few so
+// it is visible whether this happens at all, and how often.
+void ReportDroppedMrtSlot(const char* draw_name, uint32_t slot, uint64_t base_addr) {
+	static std::atomic<uint32_t> log_count {0};
+	const auto                   id = log_count.fetch_add(1, std::memory_order_relaxed);
+	if (id >= 64) {
+		return;
+	}
+	std::fprintf(stderr, "[mrt-drop] %s slot=%" PRIu32 " base=0x%010" PRIx64 "\n",
+	             draw_name != nullptr ? draw_name : "?", slot, base_addr);
+	std::fflush(stderr);
+}
 } // namespace
 
 static const char* RenderColorTypeName(RenderColorType type) {
@@ -1016,15 +1030,38 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	if (log_setup_phases) {
 		LogDrawPhase(draw.name, "ResolveRenderColorTarget");
 	}
+	// A/B switches for MRT attachment selection. Measured in _RenderDoc/kyty_frame1207.rdc (docs 4.1j): the
+	// character writes no GBuffer normal at all and the car writes garbage normals, while the road and foliage
+	// are correct.
+	//
+	// Two ways this loop can produce that. First, slots 1-7 are attached only when the render-target mask says
+	// so, and a stale or misread mask silently detaches the normal buffer even though the pixel shader still
+	// exports to it. Second, resolved slots are *packed* into color_info[color_count], so a slot that fails to
+	// resolve does not leave a hole - every later slot shifts down an index while the pixel shader keeps
+	// exporting to fixed locations, sending each export to the wrong attachment.
+	//
+	//   KYTY_FORCE_ALL_MRT=1 - attach every slot with a non-zero base address, ignoring the mask.
+	//   KYTY_STRICT_MRT=1    - skip the draw when a requested slot fails to resolve, instead of shifting.
+	static const bool force_all_mrt = std::getenv("KYTY_FORCE_ALL_MRT") != nullptr;
+	static const bool strict_mrt    = std::getenv("KYTY_STRICT_MRT") != nullptr;
+
+	bool mrt_slot_dropped = false;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
-		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
+		const bool masked_in = render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0;
+		const bool has_addr  = ctx.GetRenderTarget(slot).base.addr != 0;
+		if (slot == 0 || ((masked_in || force_all_mrt) && has_addr)) {
 			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
 			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
+			} else {
+				mrt_slot_dropped = true;
+				ReportDroppedMrtSlot(draw.name, slot, ctx.GetRenderTarget(slot).base.addr);
 			}
 		}
+	}
+	if (strict_mrt && mrt_slot_dropped) {
+		return false;
 	}
 	if (log_setup_phases) {
 		LogDrawPhase(draw.name, "ResolveRenderDepthTarget");
