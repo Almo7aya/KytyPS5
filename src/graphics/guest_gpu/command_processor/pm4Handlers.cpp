@@ -1370,6 +1370,23 @@ KYTY_HW_SH_PARSER(HwShSetCsRegisters) {
 	return reg_num;
 }
 
+// SPI_SHADER_USER_ACCUM_* / COMPUTE_USER_ACCUM_* configure gfx10's wave-level user-data accumulation. They are
+// a separate register block, not user-data contents - yet every accum handler below wrote them into its stage's
+// user-data array at slots 16..19, overwriting four descriptor slots with unrelated values and inflating
+// UserSgprInfo::count. The count matters because ShaderVsUserDataCount widens the window with
+// max(declared, count), so an inflated count also makes the shader read further into the array than the guest
+// programmed.
+//
+// A user-data slot holding something that is not a descriptor is exactly what §4.1p found: buffer 2 resolved
+// from user-data words containing PM4 command dwords and float data, producing a base outside the guest address
+// space, a null binding, zeroed position constants and a wrong clip position.
+//
+// A/B: KYTY_ALIAS_USER_ACCUM=1 restores the old aliasing behaviour.
+static bool AliasUserAccumIntoUserData() {
+	static const bool enabled = std::getenv("KYTY_ALIAS_USER_ACCUM") != nullptr;
+	return enabled;
+}
+
 static uint32_t UserSgprWriteNum(uint32_t slot, uint32_t reg_num, const char* stage) {
 	EXIT_IF(stage == nullptr);
 
@@ -1414,7 +1431,7 @@ KYTY_HW_SH_PARSER(HwShSetCsUserAccumSgpr) {
 	uint32_t slot = 16u + (cmd_offset - Pm4::COMPUTE_USER_ACCUM_0);
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "cs accum");
+	auto write_num = AliasUserAccumIntoUserData() ? UserSgprWriteNum(slot, reg_num, "cs accum") : 0u;
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetCsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1448,7 +1465,7 @@ KYTY_HW_SH_PARSER(HwShSetPsUserAccumSgpr) {
 	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_PS_0);
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "ps accum");
+	auto write_num = AliasUserAccumIntoUserData() ? UserSgprWriteNum(slot, reg_num, "ps accum") : 0u;
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetPsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1467,6 +1484,22 @@ KYTY_HW_SH_PARSER(HwShSetGsUserSgpr) {
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
 	auto write_num = UserSgprWriteNum(slot, reg_num, "gs");
 
+	// Companion to [ud4-write]: the same slots, written by the direct SET_SH_REG path. Comparing the two shows
+	// which route last wrote GS user-data slots 4..7 before a bad descriptor is materialised from them.
+	for (uint32_t i = 0; i < write_num; i++) {
+		const auto written_slot = slot + i;
+		if (written_slot >= 4u && written_slot <= 7u) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr,
+				             "[ud4-write] direct slot=%" PRIu32 " value=0x%08" PRIx32 " reg_num=%" PRIu32
+				             " write_num=%" PRIu32 " base_slot=%" PRIu32 "\n",
+				             written_slot, buffer[i], reg_num, write_num, slot);
+				std::fflush(stderr);
+			}
+		}
+	}
+
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
 	}
@@ -1482,7 +1515,7 @@ KYTY_HW_SH_PARSER(HwShSetGsUserAccumSgpr) {
 	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_ESGS_0);
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "gs accum");
+	auto write_num = AliasUserAccumIntoUserData() ? UserSgprWriteNum(slot, reg_num, "gs accum") : 0u;
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetGsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -1515,7 +1548,7 @@ KYTY_HW_SH_PARSER(HwShSetHsUserAccumSgpr) {
 	uint32_t slot = 16u + (cmd_offset - Pm4::SPI_SHADER_USER_ACCUM_LSHS_0);
 
 	auto reg_num   = (cmd_id >> 16u) & 0x3fffu;
-	auto write_num = UserSgprWriteNum(slot, reg_num, "hs accum");
+	auto write_num = AliasUserAccumIntoUserData() ? UserSgprWriteNum(slot, reg_num, "hs accum") : 0u;
 
 	for (uint32_t i = 0; i < write_num; i++) {
 		cp.GetShCtx().SetHsUserSgpr(slot + i, buffer[i], cp.GetUserDataMarker());
@@ -2447,6 +2480,26 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
 			}
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+		}
+
+		// The user-data shadow for GS slots 4..7 has been seen holding command-stream dwords - one sample
+		// contained 0xc0036300, which is this very packet's header (IT_SET_SH_REG_INDIRECT, CNT:3). That array
+		// is Kyty's own, so only SetGsUserSgpr can fill it, which means a register write is sourcing its value
+		// from the wrong place. This packet is the prime suspect: it walks (offset, value) pairs out of guest
+		// memory, so a wrong indirect_buffer or pair count reads whatever follows - including the command
+		// stream itself. Log every indirect write that lands in that range, with the source address and the
+		// raw pair, so the bad read is visible directly.
+		if (cmd_offset >= Pm4::SPI_SHADER_USER_DATA_GS_0 + 4u &&
+		    cmd_offset <= Pm4::SPI_SHADER_USER_DATA_GS_0 + 7u) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr,
+				             "[ud4-write] indirect regs=0x%016" PRIx64 " i=%" PRIu32 "/%" PRIu32
+				             " slot=%" PRIu32 " offset=0x%08" PRIx32 " value=0x%08" PRIx32 "\n",
+				             indirect_address, i, indirect_num_dw,
+				             cmd_offset - Pm4::SPI_SHADER_USER_DATA_GS_0, cmd_offset, value);
+				std::fflush(stderr);
+			}
 		}
 
 		pfunc(cp, cmd_offset, value);

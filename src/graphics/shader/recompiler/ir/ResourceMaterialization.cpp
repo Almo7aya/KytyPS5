@@ -1,16 +1,84 @@
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/shader/recompiler/ir/ScalarProvenance.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
+#include <mutex>
+#include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+
+// Last descriptor that decoded to a plausible base, per (shader, buffer slot).
+//
+// Buffer 2 of the character shaders is the skinning bone-matrix buffer: stride 16, 262 records (~87 bone
+// matrices at 3 rows each), read by fourteen consecutive buffer_load_format_xyzw on s[12:15]. Zeroing it binds
+// the 16-byte null buffer, so every bone matrix reads zero and skinned positions collapse - while the vertex
+// attributes, which come from the attrib table at s30-31 and are correctly rewritten, stay exact. That is the
+// wrong-w / correct-parameters split measured in §4.1o, and why only skinned meshes break.
+//
+// The guest does supply a valid descriptor for it (observed base 0x1440f46fc0, stride 16, records 0x106) and
+// the user-data write path is verified correct - every write arrives via the direct SET_SH_REG route with
+// reg_num == write_num - so an implausible value means those slots currently hold another draw's data. Reusing
+// the last good descriptor keeps skinning working: at worst a pose one frame stale, rather than a mesh
+// collapsed to the origin.
+//
+// A/B: KYTY_NO_DESCRIPTOR_FALLBACK=1 goes back to zeroing (the null binding).
+std::mutex                                               g_last_good_mutex;
+std::map<std::pair<uint64_t, uint32_t>, DescriptorValue>  g_last_good_descriptors;
+
+bool DisableDescriptorFallback() {
+	static const bool disabled = std::getenv("KYTY_NO_DESCRIPTOR_FALLBACK") != nullptr;
+	return disabled;
+}
+
+// Per (shader, buffer slot) good/bad tallies.
+//
+// The aggregate rate cannot answer whether this is the flicker's cause: "good" sums every buffer of every
+// shader, so 1000 bad against millions of good says nothing about one slot of one shader. It also explains why
+// the last-good fallback changed nothing - if this slot is bad on *every* materialisation there is never a good
+// value to fall back to, and the fallback is a no-op by construction.
+//
+// A slot that is bad nearly always means the guest does not put a descriptor there for this shader at all, and
+// the bone V# must arrive by another route - the buffer table at s28-29 is the obvious candidate. A slot that
+// is bad only occasionally means the value is real but read at the wrong moment.
+void TallyDescriptor(uint64_t shader_hash, uint32_t slot, bool ok) {
+	struct Tally {
+		uint64_t good = 0;
+		uint64_t bad  = 0;
+	};
+	static std::mutex                                        mutex;
+	static std::map<std::pair<uint64_t, uint32_t>, Tally>    tallies;
+	static uint64_t                                          reports = 0;
+
+	std::scoped_lock lock(mutex);
+	auto&            entry = tallies[std::make_pair(shader_hash, slot)];
+	if (ok) {
+		entry.good++;
+	} else {
+		entry.bad++;
+	}
+	if (!ok && ++reports % 200 == 0) {
+		std::fprintf(stderr, "[desc-tally] ---- after %llu bad ----\n",
+		             static_cast<unsigned long long>(reports));
+		for (const auto& [key, value]: tallies) {
+			if (value.bad != 0) {
+				std::fprintf(stderr,
+				             "[desc-tally] shader=0x%016" PRIx64 " slot=%" PRIu32 " good=%llu bad=%llu\n",
+				             key.first, key.second, static_cast<unsigned long long>(value.good),
+				             static_cast<unsigned long long>(value.bad));
+			}
+		}
+		std::fflush(stderr);
+	}
+}
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
@@ -305,33 +373,131 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	// A base beyond the guest address space cannot be a real allocation, so zero the descriptor as invalid
 	// rather than binding it.
 	//
-	// KYTY_LOG_BAD_DESCRIPTOR_SOURCE reports the shader and the size of the user-data window it was resolved
-	// from. The window is the prime suspect: the SRT evaluator dereferences whatever base the user data yields,
-	// with no check that the address is mapped, so a window that includes stale SGPRs left by an earlier draw
-	// resolves descriptor pointers to old or unrelated memory.
-	static const bool log_bad_source = std::getenv("KYTY_LOG_BAD_DESCRIPTOR_SOURCE") != nullptr;
+	// The SRT read trace came back empty for the offending shaders, so these descriptors involve no memory
+	// indirection at all - they are assembled straight from the user-data SGPR window. The garbage therefore
+	// comes from the window's own contents, so the probe dumps it: the descriptor dwords should be findable
+	// somewhere in it, which shows what offset was actually used and where the real descriptor sits.
+	static std::atomic<uint64_t> bad_count {0};
+	static std::atomic<uint64_t> good_count {0};
 	for (uint32_t i = 0; i < next.buffers.size(); i++) {
 		auto&                descriptor = next.buffers[i];
 		ShaderBufferResource buffer;
-		const bool           decoded   = DecodeBufferDescriptor(descriptor, buffer);
+		const bool           decoded    = DecodeBufferDescriptor(descriptor, buffer);
 		const bool           wrong_type = decoded && buffer.Type() != 0;
 		// 2^40 covers every guest allocation seen in practice; the observed valid bases sit around
 		// 0x11'xxxxxxxx and 0x20'xxxxxxxx, while every garbage one exceeded this.
 		const bool implausible_base = decoded && buffer.Base48() >= (uint64_t {1} << 40u);
 		if (wrong_type || implausible_base) {
-			if (log_bad_source && implausible_base) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+			if (implausible_base) {
+				// Frequency matters as much as content now. The guest encoding at pc 0x5d0 really does name
+				// s[12:15] as the V#, and the shader never writes those registers, so it expects user data
+				// there - yet the shadow holds float constants. If that happens on *every* materialisation of
+				// this shader it is a mapping error; if only sometimes, the shadow is stale relative to the
+				// draw and the fault is ordering. Count both cases to tell them apart.
+				const auto n = bad_count.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n % 500 == 0) {
 					std::fprintf(stderr,
-					             "[bad-descriptor-source] shader=0x%016" PRIx64 " buffer=%" PRIu32
-					             " base=0x%012" PRIx64 " user_data_words=%zu user_data_base=%" PRIu32
-					             " first_use_pc=0x%08" PRIx32 "\n",
-					             program.shader_hash, i, buffer.Base48(), runtime.user_data.size(),
-					             program.user_data_base, program.info.buffers[i].first_use_pc);
+					             "[bad-descriptor-rate] bad=%llu good=%llu\n",
+					             static_cast<unsigned long long>(n),
+					             static_cast<unsigned long long>(
+					                 good_count.load(std::memory_order_relaxed)));
 					std::fflush(stderr);
 				}
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 4) {
+					std::fprintf(stderr,
+					             "[bad-descriptor] shader=0x%016" PRIx64 " buffer=%" PRIu32
+					             " base=0x%012" PRIx64 " dwords=%08" PRIx32 ",%08" PRIx32
+					             ",%08" PRIx32 ",%08" PRIx32 " first_use_pc=0x%08" PRIx32
+					             " user_data_base=%" PRIu32 " words=%zu\n",
+					             program.shader_hash, i, buffer.Base48(), descriptor.dwords[0],
+					             descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3],
+					             program.info.buffers[i].first_use_pc, program.user_data_base,
+					             runtime.user_data.size());
+					for (size_t w = 0; w < runtime.user_data.size(); w += 8) {
+						std::fprintf(stderr, "[bad-descriptor]   ud[%02zu]:", w);
+						for (size_t k = w; k < w + 8 && k < runtime.user_data.size(); k++) {
+							std::fprintf(stderr, " %08" PRIx32, runtime.user_data[k]);
+						}
+						std::fprintf(stderr, "\n");
+					}
+
+					// The user data itself is correct - ud[4..7] holds four float constants (1.4285, 0.7,
+					// small magnitudes, -0.0) while every other quad is a clean V# with dword3 = 0x0004dfac.
+					// So the guest laid out [V#][4 floats][V#][V#][V#][V#] and the recompiler decided a
+					// descriptor lives where the constants are. Print how each descriptor dword was derived,
+					// which is what identifies the mis-tracking.
+					// Must go through GetDescriptorSource: descriptor ids are offset by two because 0 and 1
+					// are reserved for Undefined and Unknown, so indexing provenance.descriptors directly
+					// reads a different resource's chain entirely.
+					// Print the chain for *every* buffer, not just the bad one. The guest's own V# quads sit
+					// at user SGPRs 8-11, 16-19, 20-23, 24-27 and 28-31, with four float constants at
+					// s12-15. The tracker chose s12-15 for buffer 2, which is not one of the guest's quads -
+					// so seeing the whole set shows whether it is walking quads consecutively (s8, s12,
+					// s16, ...) and thus skipping the gap the guest left.
+					for (uint32_t b = 0; b < program.info.buffers.size(); b++) {
+						const auto  src   = program.info.buffers[b].source;
+						const auto* entry = GetDescriptorSource(program, src);
+						if (entry == nullptr) {
+							continue;
+						}
+						std::fprintf(stderr,
+						             "[bad-descriptor]   buf%" PRIu32 " source=%" PRIu32 " pc=0x%08" PRIx32
+						             " fmt=%d",
+						             b, src, program.info.buffers[b].first_use_pc,
+						             program.info.buffers[b].formatted ? 1 : 0);
+						for (uint32_t d = 0; d < entry->dword_count && d < 4; d++) {
+							std::fprintf(
+							    stderr, " %s",
+							    ScalarValueToString(program.provenance, entry->dwords[d]).c_str());
+						}
+						std::fprintf(stderr, "\n");
+					}
+					std::fflush(stderr);
+
+					// Dump the guest shader so the instruction at the first-use pc can be disassembled with
+					// _Build/v3/shader_disasm.exe. Four of the five buffers resolve onto real guest descriptor
+					// quads and only this one points at the constants block, so this is a single mis-resolved
+					// operand rather than a layout error - and the encoding at that pc is the ground truth for
+					// which SGPR the instruction actually names. 8 KB comfortably covers the first-use pcs seen
+					// (largest 0x8fc). Reading guest memory directly is what the SRT walker already does.
+					static std::atomic<bool> dumped {false};
+					bool                     expected = false;
+					if (dumped.compare_exchange_strong(expected, true) && runtime.shader_base != 0) {
+						const auto  path = fmt::format("_Shaders/bad_{:016x}.bin", program.shader_hash);
+						std::FILE*  out  = std::fopen(path.c_str(), "wb");
+						if (out != nullptr) {
+							std::fwrite(reinterpret_cast<const void*>(runtime.shader_base), 1, 8192, out);
+							std::fclose(out);
+							std::fprintf(stderr, "[bad-descriptor]   dumped shader to %s base=0x%012" PRIx64
+							                     "\n",
+							             path.c_str(), runtime.shader_base);
+							std::fflush(stderr);
+						}
+					}
+				}
 			}
-			descriptor.dwords.fill(0);
+			bool restored = false;
+			if (!DisableDescriptorFallback()) {
+				std::scoped_lock lock(g_last_good_mutex);
+				const auto       key = std::make_pair(program.shader_hash, i);
+				if (const auto found = g_last_good_descriptors.find(key);
+				    found != g_last_good_descriptors.end()) {
+					descriptor = found->second;
+					restored   = true;
+				}
+			}
+			if (!restored) {
+				descriptor.dwords.fill(0);
+			}
+			TallyDescriptor(program.shader_hash, i, false);
+		} else if (decoded && buffer.Base48() != 0) {
+			good_count.fetch_add(1, std::memory_order_relaxed);
+			TallyDescriptor(program.shader_hash, i, true);
+			if (!DisableDescriptorFallback()) {
+				std::scoped_lock lock(g_last_good_mutex);
+				g_last_good_descriptors[std::make_pair(program.shader_hash, i)] = descriptor;
+			}
 		}
 	}
 	next.images.assign(cursor, cursor + program.info.images.size());

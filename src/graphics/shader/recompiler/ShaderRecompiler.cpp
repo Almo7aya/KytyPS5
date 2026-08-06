@@ -795,6 +795,37 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	EmbeddedFetchData embedded_fetch;
+	// Whether embedded-fetch detection was attempted at all, and how much of it it covered.
+	//
+	// The character shaders read s[12:15] as a V# in fourteen consecutive buffer_load_format_xyzw with
+	// idxen=1 - the vertex-fetch idiom - and never write s12, so it is live-in. If those loads had been
+	// rewritten into Vulkan vertex inputs there would be no generic buffer resource for them, and no
+	// descriptor to resolve from user data. There is one (buffer 2, first use pc 0x5d0), so detection missed
+	// them and left a phantom resource whose V# the guest never provides. detected vs resources_num shows
+	// whether coverage is partial, and fetch_embedded=0 would mean detection never ran.
+	// Filtered to the shaders that actually produce bad descriptors rather than capped at the first N. A cap
+	// samples whichever shaders compile first, which here were all healthy ones - so the sample said "coverage
+	// is complete" while saying nothing about the shaders in question.
+	const bool traced_shader = [hash = options.shader_hash & 0xffffffffu]() {
+		return hash == 0x836daf41u || hash == 0x9bb8a80fu || hash == 0x696b5dcbu ||
+		       hash == 0xb25d62fdu || hash == 0x74705654u;
+	}();
+	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr) {
+		static std::atomic<uint32_t> log_count {0};
+		if (traced_shader || log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::fprintf(stderr,
+			             "[fetch-detect] hash=0x%016" PRIx64 " embedded=%d external=%d "
+			             "resources=%d buffers=%d attrib_reg=%d buffer_reg=%d shader_reg=%d\n",
+			             options.shader_hash, options.vertex_input_info->fetch_embedded ? 1 : 0,
+			             options.vertex_input_info->fetch_external ? 1 : 0,
+			             options.vertex_input_info->resources_num,
+			             options.vertex_input_info->buffers_num,
+			             options.vertex_input_info->fetch_attrib_reg,
+			             options.vertex_input_info->fetch_buffer_reg,
+			             options.vertex_input_info->fetch_shader_reg);
+			std::fflush(stderr);
+		}
+	}
 	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr &&
 	    options.vertex_input_info->fetch_embedded) {
 		embedded_fetch =
@@ -802,6 +833,17 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		                              ir.user_data_count, options.wave_size);
 		auto rewritten =
 		    RewriteEmbeddedVertexFetches(ir, options.vertex_input_info, embedded_fetch.loads);
+		{
+			static std::atomic<uint32_t> rewrite_log {0};
+			if (traced_shader || rewrite_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+				std::fprintf(stderr,
+				             "[fetch-rewrite] hash=0x%016" PRIx64 " detected=%zu rewritten=%" PRIu32
+				             " resources=%d\n",
+				             options.shader_hash, embedded_fetch.loads.size(), rewritten,
+				             options.vertex_input_info->resources_num);
+				std::fflush(stderr);
+			}
+		}
 		if (rewritten > 0 || !embedded_fetch.loads.empty()) {
 			LOGF("%s embedded vertex fetch rewrite: detected=%" PRIu64 " rewritten=%" PRIu32 "\n",
 			     GetDumpLabel(options), static_cast<uint64_t>(embedded_fetch.loads.size()),

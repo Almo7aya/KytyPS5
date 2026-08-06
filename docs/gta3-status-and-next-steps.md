@@ -784,6 +784,71 @@ for the draws that emit `[bad-vsharp]`. Compare a shader whose descriptors resol
 these. Note that the recompiler's own resource tracking does not reject these, so whatever validation it applies
 accepts a descriptor containing float data.
 
+### 4.1q CONFIRMED: buffer 2 is the bone-matrix buffer, and it is wrong 49-81% of the time
+
+This supersedes the descriptor speculation in §4.1p with measurements.
+
+**What buffer 2 is.** `[fetch-detect]` reports `buffer_reg=20 attrib_reg=22` for every offending shader. With the
+`+8` shift those are **s28-29** (buffer-table pointer) and **s30-31** (attrib-table pointer) - which identifies
+the "unused fifth quad" from §4.1p: `ud[20..23] = 7761fb78 00000020 | a126b230 00000012` is not a V# at all but
+two 64-bit pointers (`0x207761fb78`, `0x12a126b230`). So the 10-11 vertex attributes come from the attrib table
+*in memory*, and `[fetch-rewrite]` confirms `detected == resources` for all of them (10/10, 11/11) - embedded
+fetch coverage is complete and is **not** the problem.
+
+Buffer 2 at `s[12:15]` is therefore a separate buffer, and its shape names it: **stride 16, records 0x106 = 262**
+(≈87 bone matrices at 3 rows each), read by **fourteen consecutive `buffer_load_format_xyzw` on the same V#**
+with different index VGPRs. The guest encoding at pc 0x5d0 confirms the register:
+
+	0x000005d0: buffer_load_format_xyzw v61, v85, s12, 0   ; formatted=1 idxen=1
+
+and `s12` is **never written** anywhere in the shader, so it is live-in user data.
+
+**Buffer 2 is the skinning bone-matrix buffer.** Binding it null makes every bone matrix read zero, so skinned
+positions collapse while the vertex attributes - from the attrib table, correctly rewritten - stay byte-exact.
+That is precisely the wrong-`w` / identical-parameters split measured in §4.1o between events 21593 and 29956,
+and why only characters and cars break while static geometry is fine.
+
+**How often it is wrong** (`[desc-tally]`, per shader and slot):
+
+| shader | slot | good | bad | bad rate |
+| --- | --- | --- | --- | --- |
+| 0x836daf41 | 2 | 36 | 151 | **81%** |
+| 0x848fa53e | 2 | 16 | 33 | 67% |
+| 0x696b5dcb | 2 | 18 | 33 | 65% |
+| 0x9bb8a80f | 2 | 107 | 142 | 57% |
+| 0xb25d62fd | 2 | 42 | 40 | 49% |
+| 0x86a0f7bd | 0 | 90 | 1 | 1% (healthy, for contrast) |
+
+**The earlier aggregate rate was misleading and should not be cited.** `[bad-descriptor-rate] bad=1000
+good=5501267` sums every buffer of every shader; per slot the failure is catastrophic, not rare. Reasoning from
+the aggregate led to the wrong conclusion that this was too infrequent to matter.
+
+**What is ruled out, by measurement:**
+
+* **The write path is correct.** All 32 `[ud4-write]` samples are the *direct* `SET_SH_REG` route with
+  `reg_num == write_num` (12, 8, 20) and `base_slot=0` - no truncation, no over-read. `IT_SET_SH_REG_INDIRECT`
+  never writes these slots, so that handler is exonerated.
+* **The guest does supply a valid descriptor**, observed being written to exactly these slots:
+  `slot4=0x40f46fc0 slot5=0x00100014 slot6=0x00000106 slot7=0x0004dfac` → base `0x1440f46fc0`, stride 16,
+  records 0x106, `dword3=0x0004dfac`. A well-formed bone-buffer V#.
+* **Embedded fetch coverage is complete** (`detected == resources`), so no phantom resource.
+* **The decode is faithful** - the guest instruction really names `s12`, and `user_data_base = 8` is provably
+  right (with 0, buf3's `s24-27` would fall outside the 24-word window and materialisation would fail).
+* **The last-good fallback cannot work here.** Bone buffers are transient per-frame allocations, so a cached
+  descriptor points at memory since reused - garbage either way. `KYTY_NO_DESCRIPTOR_FALLBACK` toggles it.
+
+**The open contradiction.** The guest writes a correct bone V# to these slots via an inline `SET_SH_REG` payload
+- which cannot be stale at parse time - yet ~half to four-fifths of materialisations of the same shader read
+something else there. Note the game also submits a second command stream (2578 `*_buffer_ci.log` dumps carrying
+`SET_SH_REG_INDIRECT` and draws), and the CE/DE path exists (`WriteConstRam`/`DumpConstRam`, `WaitCe`,
+`IncrementCe/De`, `SuspendPm4`). That is the obvious place for a cross-stream ordering fault, but it is *not yet
+evidenced* - the direct-payload finding argues against it, so do not assume it.
+
+**Next.** Log, for one traced shader, the user-data slot 4-7 values at every direct write *and* at every
+materialisation, tagged with a monotonically increasing sequence number. That shows whether materialisation ever
+reads a version older or newer than the write that should precede it, which is the difference between an
+ordering fault and the guest genuinely programming those slots inconsistently for the same shader.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
