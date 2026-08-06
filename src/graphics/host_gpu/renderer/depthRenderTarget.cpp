@@ -62,6 +62,20 @@ static void ReportDepthFunc(uint8_t zfunc, bool test_enable, bool write_enable) 
 	std::fflush(stderr);
 }
 
+// How often a programmed depth operator contradicted the direction implied by the buffer's clear value. The
+// count distinguishes a working fix from an inert one - the previous attempt at this looked plausible and never
+// fired once.
+static void ReportDepthClearDirFlip(uint64_t base, int had, int wanted, bool writes_depth) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n == 1 || n % 20000 == 0) {
+		std::fprintf(stderr,
+		             "[depth-cleardir] flipped=%llu base=0x%012" PRIx64 " had=%d wanted=%d write=%d\n",
+		             static_cast<unsigned long long>(n), base, had, wanted, writes_depth ? 1 : 0);
+		std::fflush(stderr);
+	}
+}
+
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
 	va_list args;
@@ -328,6 +342,71 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	static const bool equal_to_lequal = std::getenv("KYTY_DEPTH_EQUAL_TO_LEQUAL") != nullptr;
 
 	r.depth_compare_op = static_cast<vk::CompareOp>(dc.zfunc);
+
+	// A/B: KYTY_NO_DEPTH_CLEAR_DIR=1 disables this.
+	//
+	// Measured in _RenderDoc/kyty_frame846.rdc (docs 4.1u). Reading the depth buffer directly: the character,
+	// the nearest object, stores 0.009683, while the car body pixel stores 0.007142 and a distant object stores
+	// 0.007172. Nearer is *larger*, and the stored values equal raw `z/w`, so the projection is reversed-Z and
+	// the viewport depth range is identity - no zscale=-1 flip is being applied to turn it back into
+	// conventional window depth.
+	//
+	// Reversed-Z with an identity viewport requires GEQUAL. The car's body panel (event 9697) computes
+	// 10/1227.76 = 0.008145 at a pixel holding 0.007142 - nearer, so it must pass - and is rejected. Its
+	// comparison therefore runs the wrong way, and because writers and testers of that buffer agree on direction
+	// (the earlier direction-match probe never fired), the buffer is being *filled* the wrong way too.
+	//
+	// The depth clear value is the independent authority on which direction a buffer wants: reversed-Z clears to
+	// 0 (far) and needs GEQUAL, conventional clears to 1 and needs LEQUAL. Where the programmed operator
+	// contradicts the clear, trust the clear - it is set by the same guest code that chose the projection, and
+	// unlike the operator it cannot be confused by stale state.
+	static const bool no_clear_dir = std::getenv("KYTY_NO_DEPTH_CLEAR_DIR") != nullptr;
+
+	if (!no_clear_dir && r.depth_test_enable) {
+		// +1 means "nearer is larger" (reversed-Z), -1 means conventional.
+		const auto operator_direction = [](vk::CompareOp op) -> int {
+			switch (op) {
+				case vk::CompareOp::eGreater:
+				case vk::CompareOp::eGreaterOrEqual: return +1;
+				case vk::CompareOp::eLess:
+				case vk::CompareOp::eLessOrEqual: return -1;
+				default: return 0;
+			}
+		};
+
+		static Common::Mutex           mutex;
+		static std::map<uint64_t, int> wanted_direction;
+
+		Common::LockGuard lock(mutex);
+		const auto        key = z.z_read_base_addr;
+		if (key != 0) {
+			// A clear records what the buffer wants. Only the unambiguous ends count: a mid-range clear says
+			// nothing about direction.
+			if (r.depth_clear_enable) {
+				if (r.depth_clear_value <= 0.0f) {
+					wanted_direction[key] = +1;
+				} else if (r.depth_clear_value >= 1.0f) {
+					wanted_direction[key] = -1;
+				}
+			}
+			const auto found = wanted_direction.find(key);
+			const auto have  = operator_direction(r.depth_compare_op);
+			if (found != wanted_direction.end() && have != 0 && have != found->second) {
+				switch (r.depth_compare_op) {
+					case vk::CompareOp::eLess: r.depth_compare_op = vk::CompareOp::eGreater; break;
+					case vk::CompareOp::eLessOrEqual:
+						r.depth_compare_op = vk::CompareOp::eGreaterOrEqual;
+						break;
+					case vk::CompareOp::eGreater: r.depth_compare_op = vk::CompareOp::eLess; break;
+					case vk::CompareOp::eGreaterOrEqual:
+						r.depth_compare_op = vk::CompareOp::eLessOrEqual;
+						break;
+					default: break;
+				}
+				ReportDepthClearDirFlip(key, have, found->second, r.depth_write_enable);
+			}
+		}
+	}
 	if (r.depth_compare_op == vk::CompareOp::eEqual) {
 		if (equal_to_gequal) {
 			r.depth_compare_op = vk::CompareOp::eGreaterOrEqual;
