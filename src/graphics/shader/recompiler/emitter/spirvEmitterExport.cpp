@@ -245,6 +245,31 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	state.builder.AddFunction({OpLabel, merge_label});
 }
 
+// A/B switches for the pixel valid mask, which decides whether the fragment is killed on return.
+//
+// The mask starts at 1 and is *overwritten* here with `exec ? 1 : 0` at every export carrying the vm bit, so
+// only the last such export decides the pixel's fate. In per-invocation mask mode Kyty emulates divergent
+// control flow by executing both sides and masking the writes, which means `exec` can legitimately read 0 for
+// an invocation sitting in a branch it did not take. A vm export emitted in that state latches the mask to 0
+// and OpKill then discards *every* GBuffer output for a pixel that should have lived - a black character and
+// missing parts of the car, varying per pixel with the material's branches, while flat road geometry with no
+// branching is untouched. See docs section 4.1l.
+//
+//   KYTY_VM_KILL_STICKY=1 - accumulate validity instead of overwriting: a pixel seen active at any vm export
+//                           stays valid. Closer to the hardware's accumulating valid mask.
+//   KYTY_NO_VM_KILL=1     - never kill on the valid mask. Blunt: genuine discards (alpha-masked foliage) stop
+//                           being discarded, so expect foliage to turn into opaque quads. Useful to confirm
+//                           this path is responsible even though it is not shippable.
+static bool VmKillSticky() {
+	static const bool enabled = std::getenv("KYTY_VM_KILL_STICKY") != nullptr;
+	return enabled;
+}
+
+static bool NoVmKill() {
+	static const bool enabled = std::getenv("KYTY_NO_VM_KILL") != nullptr;
+	return enabled;
+}
+
 void EmitUpdatePixelValidMask(EmitterState& state) {
 	if (state.pixel_valid_mask_variable == 0) {
 		return;
@@ -254,11 +279,19 @@ void EmitUpdatePixelValidMask(EmitterState& state) {
 	const auto value  = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpSelect, state.uint_type, value, active, ConstantU32(state, 1), ConstantU32(state, 0)});
+	if (VmKillSticky()) {
+		const auto previous = state.builder.AllocateId();
+		const auto merged   = state.builder.AllocateId();
+		state.builder.AddFunction({OpLoad, state.uint_type, previous, state.pixel_valid_mask_variable});
+		state.builder.AddFunction({OpBitwiseOr, state.uint_type, merged, previous, value});
+		state.builder.AddFunction({OpStore, state.pixel_valid_mask_variable, merged});
+		return;
+	}
 	state.builder.AddFunction({OpStore, state.pixel_valid_mask_variable, value});
 }
 
 void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
-	if (state.pixel_valid_mask_variable == 0) {
+	if (state.pixel_valid_mask_variable == 0 || NoVmKill()) {
 		return;
 	}
 
