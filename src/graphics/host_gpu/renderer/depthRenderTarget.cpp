@@ -27,6 +27,18 @@
 
 namespace Libs::Graphics {
 
+// How often an EQUAL depth test is programmed at all. If this never fires, the base pass does not use EQUAL and
+// the whole "bit-exact depth between prepass and base pass" theory is dead - worth knowing before reading
+// anything into the two relax switches doing nothing.
+static void ReportDepthEqualUse() {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n == 1 || n % 20000 == 0) {
+		std::fprintf(stderr, "[depth-equal] programmed=%llu\n", static_cast<unsigned long long>(n));
+		std::fflush(stderr);
+	}
+}
+
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
 	va_list args;
@@ -273,7 +285,34 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = dc.z_write_enable && !z.depth_view.depth_write_disable;
-	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
+	// A/B: relax an EQUAL depth test. The cast itself is right - GCN ZFUNC and VkCompareOp use the same
+	// values - but EQUAL is a demand for bit-exact depth that Kyty cannot honour.
+	//
+	// Unreal draws the base pass with depth EQUAL against the depth its prepass already wrote, which on real
+	// hardware always matches because both passes run position code that compiles identically. Kyty recompiles
+	// the prepass VS and the base-pass VS into *separate* SPIR-V modules (70990 and 102910 for the character),
+	// so their position arithmetic can differ by a rounding step - one may contract a multiply-add into an FMA
+	// where the other does not. Wherever the results differ by even one ULP, EQUAL fails and the base pass
+	// writes nothing while the prepass depth stays, which is exactly a character that occludes the road but has
+	// no GBuffer normal: the legs pass and the torso does not (docs 4.1n).
+	//
+	// Relaxing EQUAL is safe for visibility: the prepass already stored the frontmost depth, so accepting
+	// "at or in front of" cannot let hidden geometry through.
+	//   KYTY_DEPTH_EQUAL_TO_GEQUAL=1 - EQUAL becomes GREATER_OR_EQUAL (the reversed-Z direction, where nearer
+	//                                  is larger, which is what this title uses).
+	//   KYTY_DEPTH_EQUAL_TO_LEQUAL=1 - EQUAL becomes LESS_OR_EQUAL, for the conventional direction.
+	static const bool equal_to_gequal = std::getenv("KYTY_DEPTH_EQUAL_TO_GEQUAL") != nullptr;
+	static const bool equal_to_lequal = std::getenv("KYTY_DEPTH_EQUAL_TO_LEQUAL") != nullptr;
+
+	r.depth_compare_op = static_cast<vk::CompareOp>(dc.zfunc);
+	if (r.depth_compare_op == vk::CompareOp::eEqual) {
+		if (equal_to_gequal) {
+			r.depth_compare_op = vk::CompareOp::eGreaterOrEqual;
+		} else if (equal_to_lequal) {
+			r.depth_compare_op = vk::CompareOp::eLessOrEqual;
+		}
+		ReportDepthEqualUse();
+	}
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
