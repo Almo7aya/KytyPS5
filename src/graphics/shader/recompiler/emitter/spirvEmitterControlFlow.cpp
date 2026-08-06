@@ -202,8 +202,12 @@ void EmitRegisterVariables(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction({OpVariable, state.ptr_func_uint, state.pixel_valid_mask_variable,
 		                           StorageClassFunction});
-		state.builder.AddFunction(
-		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
+		// Normally 1, so a shader that never reaches a vm export keeps the pixel. Under
+		// KYTY_VM_KILL_STICKY the mask accumulates with OR instead of being overwritten, and starting from
+		// 1 would pin it at 1 forever - the switch would silently become KYTY_NO_VM_KILL, which is exactly
+		// how the first attempt at this test came out. Accumulation only carries information from 0.
+		state.builder.AddFunction({OpStore, state.pixel_valid_mask_variable,
+		                           ConstantU32(state, PixelValidMaskInitialValue())});
 	}
 	for (const auto& binding: state.registers) {
 		state.builder.AddFunction(

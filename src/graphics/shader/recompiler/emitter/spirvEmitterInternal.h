@@ -1514,6 +1514,9 @@ void EmitUpdatePixelValidMask(EmitterState& state);
 
 void EmitKillIfPixelValidMaskInactive(EmitterState& state);
 
+// Initial value for the pixel valid mask: 1 normally, 0 when KYTY_VM_KILL_STICKY makes the mask accumulate.
+uint32_t PixelValidMaskInitialValue();
+
 void ComputeReachableBlocks(EmitterState& state, const IR::Program& program);
 
 void AllocateBlockLabels(EmitterState& state, const IR::Program& program);

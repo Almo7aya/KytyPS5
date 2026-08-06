@@ -270,6 +270,10 @@ static bool NoVmKill() {
 	return enabled;
 }
 
+uint32_t PixelValidMaskInitialValue() {
+	return VmKillSticky() ? 0u : 1u;
+}
+
 void EmitUpdatePixelValidMask(EmitterState& state) {
 	if (state.pixel_valid_mask_variable == 0) {
 		return;
