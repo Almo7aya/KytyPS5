@@ -812,7 +812,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}();
 	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr) {
 		static std::atomic<uint32_t> log_count {0};
-		if (traced_shader || log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		if (std::getenv("KYTY_GTA3_DIAG") != nullptr && (traced_shader || log_count.fetch_add(1, std::memory_order_relaxed) < 8)) {
 			std::fprintf(stderr,
 			             "[fetch-detect] hash=0x%016" PRIx64 " embedded=%d external=%d "
 			             "resources=%d buffers=%d attrib_reg=%d buffer_reg=%d shader_reg=%d\n",
@@ -835,7 +835,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		    RewriteEmbeddedVertexFetches(ir, options.vertex_input_info, embedded_fetch.loads);
 		{
 			static std::atomic<uint32_t> rewrite_log {0};
-			if (traced_shader || rewrite_log.fetch_add(1, std::memory_order_relaxed) < 8) {
+			if (std::getenv("KYTY_GTA3_DIAG") != nullptr && (traced_shader || rewrite_log.fetch_add(1, std::memory_order_relaxed) < 8)) {
 				std::fprintf(stderr,
 				             "[fetch-rewrite] hash=0x%016" PRIx64 " detected=%zu rewritten=%" PRIu32
 				             " resources=%d\n",

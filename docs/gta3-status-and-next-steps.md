@@ -902,6 +902,44 @@ were filtered or capped before the population was understood:
 Log the whole population first, then filter. Verify a switch can actually fire before drawing a conclusion from
 its silence.
 
+### 4.1s HANDOFF: the transform constants are the remaining suspect
+
+Capture `_RenderDoc/kyty_frame846.rdc`. The skinned character mesh (16152 indices) is drawn at events **5544**
+and **5993**. Post-VS vertex 0:
+
+| | clip position (x, y, z, w) | `out_param_8` (world position) |
+| --- | --- | --- |
+| 5544 | `(3.735, -543.868, 409.597, 409.672)` | `(759.03, 683.78, -280.996)` |
+| 5993 | `(143750.48, 93987.73, 9785.37, 9784.89)` | `(-132721.1, -203391.9, 15442.4)` |
+
+`out_param_0`-`out_param_5` and `out_param_7` are **byte-identical** between the two. Only the clip position,
+`out_param_6` (a depth-like scalar) and `out_param_8` (world position) differ. Same mesh, same vertex, same
+fetched attributes - **different model transform**.
+
+This reproduces §4.1o's finding in a second capture and narrows it: the difference is in the *transform
+constants* the vertex shader reads, not in geometry, skinning descriptors, vertex fetch, or anything downstream.
+
+**Where to look.** The two shaders build position from different scalar registers:
+
+* prepass-side VS: `Fma(s30, v15, v21)`, `Fma(s29, v15, v37)`, `Fma(s48, v18, v35)` - s29, s30, s46, s48, s50
+* base-pass VS: s0, s4, s8, s30, s34, s39
+
+`user_data_base` is hardcoded to 8 for every vertex shader (`ShaderCompileSpirvVS`), so `s0`-`s7` are *not* user
+data and are initialised by `EmitInitialRegisterValue`. A base-pass VS reading `s0`/`s4` as FMA multiplicands is
+therefore reading registers Kyty supplies itself. Check what those are initialised to and what the PS5 NGG ABI
+actually passes there for a merged ES+GS shader. Note a blanket `user_data_base = 0` is provably wrong for
+shader 0x836daf41 (its buf3 uses `ud24-27`, which with base 0 would fall outside the 24-word window and fail
+materialisation), so if this is the fault the base must be determined per shader, not globally.
+
+**Verify before building on it.** Confirm the two events are the same view (both could be legitimate different
+passes - a shadow view would have a different transform by design). `get_draw_call_state` on each and compare
+render targets and viewport before concluding either is wrong.
+
+**Diagnostics.** All GTA III investigation probes are now behind `KYTY_GTA3_DIAG=1` and silent by default -
+`[bad-descriptor]`, `[desc-tally]`, `[srt-read-oob]`, `[fetch-detect]`, `[fetch-rewrite]`, `[mrt-drop]`. The
+draw-level ones keep their own switches (`KYTY_LOG_SKIPPED_DRAWS`, `KYTY_LOG_BIG_DRAWS`,
+`KYTY_LOG_SHORT_STORAGE`, `KYTY_LOG_BAD_VSHARP`, `KYTY_LOG_DEPTH_FUNC`).
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The

@@ -220,6 +220,9 @@ void LogSubmittedBigDraw(uint32_t index_count, uint32_t frame_num) {
 // later slot shifts index while the pixel shader keeps exporting to fixed locations. Report the first few so
 // it is visible whether this happens at all, and how often.
 void ReportDroppedMrtSlot(const char* draw_name, uint32_t slot, uint64_t base_addr) {
+	if (std::getenv("KYTY_GTA3_DIAG") == nullptr) {
+		return;
+	}
 	static std::atomic<uint32_t> log_count {0};
 	const auto                   id = log_count.fetch_add(1, std::memory_order_relaxed);
 	if (id >= 64) {

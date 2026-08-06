@@ -49,7 +49,16 @@ bool DisableDescriptorFallback() {
 // A slot that is bad nearly always means the guest does not put a descriptor there for this shader at all, and
 // the bone V# must arrive by another route - the buffer table at s28-29 is the obvious candidate. A slot that
 // is bad only occasionally means the value is real but read at the wrong moment.
+// GTA III skinning diagnostics master switch. Default off: these paths run per buffer per draw.
+bool Gta3DiagEnabled() {
+	static const bool enabled = std::getenv("KYTY_GTA3_DIAG") != nullptr;
+	return enabled;
+}
+
 void TallyDescriptor(uint64_t shader_hash, uint32_t slot, bool ok) {
+	if (!Gta3DiagEnabled()) {
+		return;
+	}
 	struct Tally {
 		uint64_t good = 0;
 		uint64_t bad  = 0;
@@ -388,7 +397,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		// 0x11'xxxxxxxx and 0x20'xxxxxxxx, while every garbage one exceeded this.
 		const bool implausible_base = decoded && buffer.Base48() >= (uint64_t {1} << 40u);
 		if (wrong_type || implausible_base) {
-			if (implausible_base) {
+			// Diagnostics for the GTA III skinning investigation (docs 4.1o-4.1r) are silent unless
+			// KYTY_GTA3_DIAG is set. They run per buffer per draw, so leaving them enabled costs both
+			// performance and a flooded stderr - and the descriptors they report turned out to be benign,
+			// see the retraction in 4.1r.
+			if (implausible_base && Gta3DiagEnabled()) {
 				// Frequency matters as much as content now. The guest encoding at pc 0x5d0 really does name
 				// s[12:15] as the V#, and the shader never writes those registers, so it expects user data
 				// there - yet the shadow holds float constants. If that happens on *every* materialisation of

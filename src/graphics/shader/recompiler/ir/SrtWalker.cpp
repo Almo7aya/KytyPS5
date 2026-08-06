@@ -498,7 +498,7 @@ private:
 		// for the two shaders that produce bad buffer descriptors, which is itself the finding: those are built
 		// directly from the user-data window with no SRT indirection at all. Kept so the case is visible if a
 		// different shader ever does resolve a descriptor through a bad address.
-		if ((address >> 40u) != 0) {
+		if ((address >> 40u) != 0 && std::getenv("KYTY_GTA3_DIAG") != nullptr) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 12) {
 				std::fprintf(stderr,
