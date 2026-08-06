@@ -491,6 +491,33 @@ private:
 		if (m_runtime.read_memory == nullptr) {
 			std::memcpy(&result, reinterpret_cast<const void*>(address), sizeof(result));
 		}
+
+		// KYTY_LOG_SRT_READS=<shader-hash-hex> traces every SRT descriptor read for one shader.
+		//
+		// §4.1p established that the garbage descriptors are read out of a region holding float data - base_lo
+		// values like 0x4789b877 and 0x47e73d00 are ~70769 and ~118522 as floats - so the *address* computed
+		// here is wrong, not the decode. This prints each address and the dword returned, which is what pins
+		// down whether the base came from the wrong user-data word, the wrong immediate offset, or an SRT
+		// indirection that should not have been followed.
+		//
+		// Filtered to a single shader hash because these run for every draw; the offenders are
+		// 0x836daf41 and 0x9bb8a80f, both failing on buffer 2 at first-use pc 0x5d0.
+		static const char* trace_hash = std::getenv("KYTY_LOG_SRT_READS");
+		if (trace_hash != nullptr) {
+			const auto wanted = std::strtoull(trace_hash, nullptr, 16);
+			if ((m_program.shader_hash & 0xffffffffu) == (wanted & 0xffffffffu)) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 96) {
+					std::fprintf(stderr,
+					             "[srt-read] shader=0x%016" PRIx64 " pc=0x%08" PRIx32
+					             " addr=0x%012" PRIx64 " -> 0x%08" PRIx32 " base=0x%012" PRIx64
+					             " imm=%" PRId64 "\n",
+					             m_program.shader_hash, value.pc, address, result,
+					             base & ~uint64_t {3}, static_cast<int64_t>(immediate));
+					std::fflush(stderr);
+				}
+			}
+		}
 		return true;
 	}
 
