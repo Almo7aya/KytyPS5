@@ -691,6 +691,54 @@ it. Resolve that first, with `save_texture` on `49328`/`3149` immediately before
 the technique that has been reliable here. Do not trust `find_draws` result sets without checking whether they
 were truncated by `max_results` - that is what produced the retraction above.
 
+### 4.1o ROOT CAUSE: the base-pass VS computes the wrong clip position
+
+Capture `kyty_frame1207`. The character in the second GBuffer pass is the **16152-index** mesh (not 12357 - that
+is another LOD; see §4.1m). Its two draws are:
+
+* depth prepass **event 21593** - depth-only, 14 vertex attributes (bone indices and weights, so skinned),
+  VS `ResourceId::117581`
+* base pass **event 29956** - targets `49328`, same 16152 vertices, VS is a different module
+
+Post-VS vertex 0, same mesh, same frame:
+
+| | position (x, y, z, w) |
+| --- | --- |
+| prepass 21593 | `(-120.550949, 262.767090, 10.0, **+1046.430054**)` |
+| base pass 29956 | `(1234.588989, -5135.379395, 10.0, **-5974.279297**)` |
+
+**The shading parameters are byte-identical between the two** - `out_param_0` is
+`-0.623272, 0.225318, -0.728147, 0.0` in both, `out_param_1` is `0.751295, 0.008327, -0.652659, 1.0` in both,
+and so on for every parameter and every vertex sampled. Same vertex, same fetched input data, same attribute
+results, and a completely different clip-space position.
+
+The prepass value is the correct one: `x/w = -120.55/1046.43 = -0.115` puts the vertex at screen x ≈ 1486, which
+is where the character actually is. The base pass produces **negative w**, so its geometry is clipped away
+entirely, and triangles that straddle `w = 0` project to enormous fragments at arbitrary positions.
+
+**This is the defect behind every symptom:**
+
+* the character occludes the road (prepass depth is correct) but has no GBuffer output at all - a pure black
+  silhouette reading exactly `(0,0,0)`;
+* parts of a mesh survive and parts do not, depending on which side of `w = 0` each vertex lands - the legs
+  rendering while the torso does not (event 34298), and the missing head;
+* fragments smeared across the screen where triangles cross the clip plane;
+* the car's normals wrong rather than absent - the same fault at a smaller magnitude;
+* the static world unaffected, because its base-pass shaders take a different path;
+* complete immunity to every buffer-residency, barrier, MRT, instancing, valid-mask and depth switch tested,
+  because none of them touch vertex position computation.
+
+It also explains the earlier confusion in §4.1f. Post-VS `w` really is negative for these draws - that reading
+was correct - but the comparison against world geometry was misleading, because the world's base-pass shaders
+are a different case. The `w` sign is the bug, not the convention.
+
+**Next step: find why.** Both shaders transform the same vertex, so the difference is in the position path only.
+Disassemble VS `117581` (prepass, correct) against event 29956's VS (base pass, wrong) and compare how each
+builds the exported position - specifically which user-data words or constant-buffer values feed it. The
+parameters being identical means the vertex fetch and attribute handling are already right, so the fault is
+confined to the position arithmetic or the constants it reads. Do not pursue anything downstream of the vertex
+shader; the geometry is already wrong when it leaves the VS.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
