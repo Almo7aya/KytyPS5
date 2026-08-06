@@ -808,8 +808,32 @@ void CreatePipelineInternal(
 	rasterizer.polygonMode             = vk::PolygonMode::eFill;
 	rasterizer.cullMode                = cull_mode;
 	rasterizer.frontFace               = front_face;
-	rasterizer.depthBiasEnable         = VK_FALSE;
-	rasterizer.depthBiasConstantFactor = 0.0f;
+	// A/B: KYTY_DEPTH_BIAS_SECOND_PASS nudges depth for passes that test depth without writing it.
+	//
+	// Measured in kyty_frame1207 (docs 4.1o): at the character's pixel, depth is last written at event 21593
+	// (0.0097581) and *every* later draw fails the depth test there, the character's base-pass draws included.
+	// Depth is present, so the road is rejected and the pixel keeps the cleared GBuffer - a black silhouette.
+	//
+	// The prepass and the base pass are recompiled into separate SPIR-V modules, so their position arithmetic
+	// can differ by a rounding step. A base-pass depth even one ULP farther than the prepass value fails a
+	// GEQUAL-style test just as it would fail EQUAL, which is why relaxing EQUAL could not help - EQUAL is never
+	// programmed at all, as the [depth-equal] counter showed.
+	//
+	// A depth bias is the standard remedy for coplanar re-draws. It applies only where depth is tested but not
+	// written, which is what a second pass over already-written depth looks like, so ordinary depth-writing
+	// geometry is untouched. The value is the constant factor in depth units; sign matters because it must push
+	// toward "nearer", which is positive under this title's reversed-Z and negative under a conventional one.
+	// Default 0 keeps the old behaviour.
+	static const float second_pass_bias = []() {
+		const char* value = std::getenv("KYTY_DEPTH_BIAS_SECOND_PASS");
+		return value != nullptr ? std::strtof(value, nullptr) : 0.0f;
+	}();
+
+	const bool second_pass_depth =
+	    second_pass_bias != 0.0f && static_params.depth_test_enable && !static_params.depth_write_enable;
+
+	rasterizer.depthBiasEnable         = second_pass_depth ? VK_TRUE : VK_FALSE;
+	rasterizer.depthBiasConstantFactor = second_pass_depth ? second_pass_bias : 0.0f;
 	rasterizer.depthBiasClamp          = 0.0f;
 	rasterizer.depthBiasSlopeFactor    = 0.0f;
 	rasterizer.lineWidth               = 1.0f;

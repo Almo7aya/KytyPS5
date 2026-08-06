@@ -27,16 +27,39 @@
 
 namespace Libs::Graphics {
 
-// How often an EQUAL depth test is programmed at all. If this never fires, the base pass does not use EQUAL and
-// the whole "bit-exact depth between prepass and base pass" theory is dead - worth knowing before reading
-// anything into the two relax switches doing nothing.
-static void ReportDepthEqualUse() {
-	static std::atomic<uint64_t> count {0};
-	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (n == 1 || n % 20000 == 0) {
-		std::fprintf(stderr, "[depth-equal] programmed=%llu\n", static_cast<unsigned long long>(n));
-		std::fflush(stderr);
+// Which depth compare ops the guest actually programs, split by whether depth is also written.
+//
+// The EQUAL-only counter this replaces returned zero, which killed the EQUAL theory but left the real operator
+// unknown - so the next guess would have been just as blind. A second pass over already-written depth shows up
+// here as test-enabled with write-disabled, and its operator is what a coplanar re-draw has to satisfy.
+static void ReportDepthFunc(uint8_t zfunc, bool test_enable, bool write_enable) {
+	static const bool enabled = std::getenv("KYTY_LOG_DEPTH_FUNC") != nullptr;
+	if (!enabled) {
+		return;
 	}
+	static std::atomic<uint64_t> counts[8][2] {};
+	static std::atomic<uint64_t> total {0};
+	if (!test_enable || zfunc > 7) {
+		return;
+	}
+	counts[zfunc][write_enable ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+	const auto n = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n % 20000 != 0) {
+		return;
+	}
+	static const char* names[8] = {"NEVER",   "LESS",     "EQUAL",  "LEQUAL",
+	                               "GREATER", "NOTEQUAL", "GEQUAL", "ALWAYS"};
+	std::fprintf(stderr, "[depth-func] total=%llu\n", static_cast<unsigned long long>(n));
+	for (uint32_t i = 0; i < 8; i++) {
+		const auto no_write = counts[i][0].load(std::memory_order_relaxed);
+		const auto write    = counts[i][1].load(std::memory_order_relaxed);
+		if (no_write != 0 || write != 0) {
+			std::fprintf(stderr, "[depth-func]   %-8s write=%llu nowrite=%llu\n", names[i],
+			             static_cast<unsigned long long>(write),
+			             static_cast<unsigned long long>(no_write));
+		}
+	}
+	std::fflush(stderr);
 }
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
@@ -311,8 +334,8 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 		} else if (equal_to_lequal) {
 			r.depth_compare_op = vk::CompareOp::eLessOrEqual;
 		}
-		ReportDepthEqualUse();
 	}
+	ReportDepthFunc(dc.zfunc, r.depth_test_enable, r.depth_write_enable);
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
