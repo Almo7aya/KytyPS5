@@ -1048,30 +1048,27 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, RenderCommandBuf
 	// resolve does not leave a hole - every later slot shifts down an index while the pixel shader keeps
 	// exporting to fixed locations, sending each export to the wrong attachment.
 	//
-	// The `[mrt-drop]` logs showed single draws dropping slots 1-5 together, every slot carrying a valid base
-	// address, leaving only slot 0 attached while the pixel shader still exported normal, albedo and the rest -
-	// which is exactly the character rendering with no GBuffer normal.
+	// The render-target mask is what distinguishes a live slot from a stale register left behind by an earlier
+	// pass, so attachment has to stay gated on it.
 	//
-	// So a slot is now attached whenever it has a base address, and `ignore_target_mask` is passed so
-	// ResolveRenderColorTarget stops bailing out at `mask == 0`. Masking is not lost: color_write_enable is
-	// still derived per slot from CB_TARGET_MASK further down, so a masked-off slot keeps its attachment - and
-	// therefore its index - while its writes stay suppressed. That is what keeps the pixel shader's fixed
-	// export locations aligned with the attachment list.
+	// Attaching every slot that merely holds a base address was tried and is wrong: it pulls in stale targets
+	// from previous passes, and since the render area is bounded by the attachments, the framebuffer shrinks to
+	// the smallest one - the game rendered cropped and never got past the loading screen. It also invalidated
+	// the reasoning behind it. The `[mrt-drop]` lines that motivated the change were slots that switch itself
+	// had forced Kyty to attempt; with the mask gate in place a slot is only tried when
+	// `mask != 0 && addr != 0`, which is exactly when ResolveRenderColorTarget cannot bail, so slots are not
+	// dropped and the packed indices never shift. See docs section 4.1k.
 	//
-	//   KYTY_LEGACY_MRT_MASK=1 - restore the old behaviour: require a non-zero mask, and let dropped slots
-	//                            shift every later slot down an index.
-	//   KYTY_STRICT_MRT=1      - skip a draw when a requested slot still fails to resolve.
-	static const bool legacy_mrt_mask = std::getenv("KYTY_LEGACY_MRT_MASK") != nullptr;
-	static const bool strict_mrt      = std::getenv("KYTY_STRICT_MRT") != nullptr;
+	//   KYTY_STRICT_MRT=1 - skip a draw if a requested slot ever does fail to resolve, rather than letting the
+	//                       later slots shift down an index. Kept as a guard, not as a fix.
+	static const bool strict_mrt = std::getenv("KYTY_STRICT_MRT") != nullptr;
 
 	bool mrt_slot_dropped = false;
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		const bool masked_in = render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0;
-		const bool has_addr  = ctx.GetRenderTarget(slot).base.addr != 0;
-		const bool attach    = legacy_mrt_mask ? (masked_in && has_addr) : has_addr;
-		if (slot == 0 || attach) {
+		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
 			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot, !legacy_mrt_mask);
+			                         render_target_slice_offset, slot);
 			if (state.color_info[state.color_count].image_id) {
 				state.color_count++;
 			} else {

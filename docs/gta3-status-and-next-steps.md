@@ -592,6 +592,50 @@ happens at all.
 Prefer `save_texture` plus `read_texture_pixels` - those have been reliable and are what produced every solid
 finding above.
 
+### 4.1k REVERTED: attaching every addressed MRT slot, and why §4.1j's mechanism was wrong
+
+Attaching a colour slot whenever it held a base address (passing `ignore_target_mask`) **broke the game**: the
+image rendered cropped and it never got past the loading screen, with no 3D at all.
+
+The cause is that the render-target registers for slots 1-7 keep **stale values from earlier passes**. The mask
+is precisely what distinguishes a live slot from a stale one. Attaching a stale slot brings in a target with
+different dimensions, and since the render area is bounded by its attachments, the framebuffer collapses to the
+smallest one.
+
+**This also invalidates the mechanism claimed in §4.1j.** The `[mrt-drop]` lines that motivated the change were
+slots that `KYTY_FORCE_ALL_MRT` had itself forced Kyty to attempt - stale slots that the mask gate was correctly
+rejecting. With the gate in place a slot is only attempted when `mask != 0 && addr != 0`, which is exactly the
+condition under which `ResolveRenderColorTarget` cannot take its `addr == 0 || mask == 0` early return. So
+**slots are not dropped in normal operation and the packed indices never shift.** The packing-shift hypothesis
+was measuring an artefact of its own diagnostic switch.
+
+`KYTY_FORCE_ALL_MRT` is removed. `KYTY_STRICT_MRT` is kept as a guard - it would skip a draw if a slot ever does
+fail to resolve - but it is not a fix, and its earlier "hides everything" result was likewise an artefact of
+being combined with forced stale attachments.
+
+**What survives from §4.1j is the measurement, not the explanation.** These remain solid, all from
+`save_texture` / `read_texture_pixels`:
+
+* the character is exactly `(0,0,0)` in the final image while the road beside it is correctly lit;
+* the completed GBuffer normal has coherent normals for road, buildings, trees and lamps, **no normal at all for
+  the character**, and **wrong normals for the car**;
+* the character's silhouette is correctly shaped and its post-VS positions match the depth prepass exactly, so
+  geometry and transform are fine;
+* the capture holds two GBuffer passes, and **the character's base-pass draws appear in the first and are
+  entirely absent from the second** (pass A events 4193-15073 contain 12357/9744/9054/12147; pass B events
+  28801-31283 contain none), while its depth prepass still runs - which is why it is a black cutout.
+
+**That last point is the live lead and it needs no MRT theory:** the character's base-pass draws are missing on
+some frames. Find out why a draw present in one frame is not submitted in the next. `[draw-skip]` counters
+already report `empty`, `metadata`, `no_vertex`, `ge_skip` and `no_target` - `no_target` was 1318 per 240k
+draws, worth attributing before anything else, since a base-pass draw losing all its attachments would land
+there.
+
+Also kept from this round, and correct independently: `DrawHasActivePixelShader` now checks
+`ShaderAddressValid` **before** reasoning about attachments and depth. The old order returned true for any draw
+with a colour attachment, which only avoided handing hash 0 to the recompiler because depth-only draws happened
+to leave `color_count` at zero.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
