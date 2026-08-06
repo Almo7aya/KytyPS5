@@ -739,6 +739,51 @@ parameters being identical means the vertex fetch and attribute handling are alr
 confined to the position arithmetic or the constants it reads. Do not pursue anything downstream of the vertex
 shader; the geometry is already wrong when it leaves the VS.
 
+### 4.1p The wrong position comes from garbage V# descriptors read out of float data
+
+Chain from §4.1o, now complete and measured at every step.
+
+`KYTY_LOG_SHORT_STORAGE` found two kinds of storage binding whose mapped extent is shorter than requested:
+
+	[short-storage] addr=0x11410538e0 asked=0xffffffff mapped=0x23c720   <- benign
+	[short-storage] addr=0x525fffffffff asked=0xe6ef5269 mapped=0x0      <- the defect
+
+The first is ordinary GNM over-provisioning: the descriptor claims 4 GB, 2.3 MB is mapped, reads inside it work.
+The second has a base that cannot be a guest allocation, nothing maps there, so it falls back to
+`BindNullStorageBuffer` - a 16-byte null buffer where **every read returns zero**.
+
+`KYTY_LOG_BAD_VSHARP` then dumped the raw descriptor dwords. Decoding them as GCN V#s:
+
+| dwords | decoded |
+| --- | --- |
+| `00000000,60f05500,00000011,00000266` | base_lo = **0**, base = `0x550000000000`, stride 8432, records 17 |
+| `000016fe,000002d5,a67a02e0,00000004` | base = `0x02d5000016fe`, records 2793013984 |
+| `47e73d00,0b750909,00000000,3f000000` | records = **0**, dword3 = `0x3f000000` = **0.5f** |
+| `4789ba00,0b800909,00000000,3f35c28f` | records = **0**, dword3 = `0x3f35c28f` = **0.709f** |
+
+Two things identify the fault:
+
+1. **`dword3` holds clean float values** (0.5, 0.709). A V#'s fourth dword encodes destination swizzle and number
+   format, never a float constant. So Kyty is reading these descriptors **out of a region containing float
+   data** - it is fetching the V# from the wrong address, not mis-decoding a real one.
+2. **Every flagged case is `formatted=1, read=1`** - the typed/formatted buffer path, not plain storage buffers.
+
+Supporting detail: shifting case 1's dwords by one position yields base `0x1160f05500`, which matches the shape
+of the addresses that *do* resolve correctly (`0x11410538e0`). Consistent with reading from a wrong offset rather
+than from wholly unrelated memory, at least for that case.
+
+So the defect is in **how a formatted buffer's V# is resolved** for these shaders - the user-data window or the
+SRT walk lands on the wrong address, the descriptor is garbage, the binding becomes the null buffer, and the
+bounds-checked constant loads in the base-pass VS return zero. Hence a correct set of vertex attributes and a
+wrong clip position, exactly as §4.1o measured.
+
+**Next step.** Find where these descriptors are resolved and why the address is wrong. Start from
+`ShaderMaterializeStageRuntime` and the SRT/user-data walk that fills `IR::ResourceSnapshot::buffers`, and log
+the *source* of each formatted buffer descriptor - which user-data word or which SRT indirection produced it -
+for the draws that emit `[bad-vsharp]`. Compare a shader whose descriptors resolve correctly against one of
+these. Note that the recompiler's own resource tracking does not reject these, so whatever validation it applies
+accepts a descriptor containing float data.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
