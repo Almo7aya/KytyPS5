@@ -136,6 +136,41 @@ void LogSkippedDraw(const char* reason, uint32_t index_count, const HW::Shader& 
 	std::fflush(stderr);
 }
 
+// How often each large draw is actually submitted.
+//
+// The logs show Kyty skips no sizeable draw at all, so if the character's base-pass draws really are absent
+// from some frames, the guest is not submitting them - and that moves the bug out of the renderer entirely.
+// This tallies submissions per distinct index count, which needs no frame counter to interpret: a draw issued
+// every frame accumulates in step with the big static world draws, while one the guest culls intermittently
+// falls behind. The character's base-pass draws are 12357, 9744, 9054 and 12147 indices.
+void LogSubmittedBigDraw(uint32_t index_count) {
+	static const bool enabled = std::getenv("KYTY_LOG_BIG_DRAWS") != nullptr;
+	if (!enabled || index_count < 8000) {
+		return;
+	}
+
+	static Common::Mutex                mutex;
+	static std::map<uint32_t, uint64_t> tally;
+	static uint64_t                     total   = 0;
+	static uint32_t                     reports = 0;
+
+	Common::LockGuard lock(mutex);
+	tally[index_count]++;
+	if (++total % 20000 != 0 || reports >= 10) {
+		return;
+	}
+	reports++;
+	std::fprintf(stderr, "[draw-big] total=%llu distinct=%zu\n", static_cast<unsigned long long>(total),
+	             tally.size());
+	for (const auto& [indices, count]: tally) {
+		if (count >= 8) {
+			std::fprintf(stderr, "[draw-big]   indices=%" PRIu32 " submitted=%llu\n", indices,
+			             static_cast<unsigned long long>(count));
+		}
+	}
+	std::fflush(stderr);
+}
+
 // A requested MRT slot that resolves to no image is dropped, and because resolved slots are packed every
 // later slot shifts index while the pixel shader keeps exporting to fixed locations. Report the first few so
 // it is visible whether this happens at all, and how often.
@@ -1255,6 +1290,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	EXIT_IF(draw.name == nullptr);
 
 	g_draw_skips.submitted.fetch_add(1, std::memory_order_relaxed);
+	LogSubmittedBigDraw(draw.index_count);
 	ReportDrawSkips();
 
 	// A/B: KYTY_BARRIER_EVERY_DRAW makes every draw wait on all prior shader writes.
