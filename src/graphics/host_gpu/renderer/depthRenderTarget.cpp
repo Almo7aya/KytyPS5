@@ -23,6 +23,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <map>
 #include <limits>
 
 namespace Libs::Graphics {
@@ -60,6 +61,20 @@ static void ReportDepthFunc(uint8_t zfunc, bool test_enable, bool write_enable) 
 		}
 	}
 	std::fflush(stderr);
+}
+
+// How often a test-only draw's depth direction disagreed with the pass that filled the buffer. Reported at a
+// low rate because the count itself is the interesting part: if this never fires, the direction mismatch seen at
+// event 9697 in kyty_frame846 is not reproducing and the fix is inert.
+static void ReportDepthDirectionFlip(uint64_t base, int draw_direction, int buffer_direction) {
+	static std::atomic<uint64_t> count {0};
+	const auto                   n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n == 1 || n % 5000 == 0) {
+		std::fprintf(stderr,
+		             "[depth-dir] flipped=%llu base=0x%012" PRIx64 " draw_dir=%d buffer_dir=%d\n",
+		             static_cast<unsigned long long>(n), base, draw_direction, buffer_direction);
+		std::fflush(stderr);
+	}
 }
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
@@ -328,6 +343,62 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	static const bool equal_to_lequal = std::getenv("KYTY_DEPTH_EQUAL_TO_LEQUAL") != nullptr;
 
 	r.depth_compare_op = static_cast<vk::CompareOp>(dc.zfunc);
+
+	// A/B: KYTY_NO_DEPTH_DIR_MATCH=1 disables this.
+	//
+	// A pass that only tests depth must compare in the same direction as the pass that filled the buffer.
+	// Measured in _RenderDoc/kyty_frame846.rdc (docs 4.1t): the car body panel at event 9697 computes depth
+	// 10/1227.76 = 0.008145 at pixel (2100,600) where the stored depth is 0.007142, written by event 90. Under
+	// this title's reversed-Z (z_clip = near = 10, w = z_view, so nearer is *larger*) 0.008145 is nearer and must
+	// pass - yet the draw is rejected with depth_test_failed, which only happens if it compares LESS/LEQUAL.
+	// Rejecting nearer fragments is what leaves the car's body black while its wheels and roofline survive.
+	//
+	// So remember the direction used by the draws that write this depth buffer, and if a later test-only draw
+	// arrives with the opposite direction, flip it to match. Draws that write depth are never touched, so the
+	// buffer's own convention is always set by the pass that establishes it.
+	static const bool no_dir_match = std::getenv("KYTY_NO_DEPTH_DIR_MATCH") != nullptr;
+
+	const auto direction_of = [](vk::CompareOp op) -> int {
+		switch (op) {
+			case vk::CompareOp::eGreater:
+			case vk::CompareOp::eGreaterOrEqual: return +1; // reversed Z: nearer is larger
+			case vk::CompareOp::eLess:
+			case vk::CompareOp::eLessOrEqual: return -1; // conventional Z: nearer is smaller
+			default: return 0;                           // NEVER/EQUAL/NOTEQUAL/ALWAYS carry no direction
+		}
+	};
+
+	if (!no_dir_match && r.depth_test_enable && z.z_read_base_addr != 0) {
+		static Common::Mutex                 mutex;
+		static std::map<uint64_t, int>       buffer_direction;
+		const auto                           key       = z.z_read_base_addr;
+		const auto                           direction = direction_of(r.depth_compare_op);
+
+		Common::LockGuard lock(mutex);
+		if (r.depth_write_enable) {
+			if (direction != 0) {
+				buffer_direction[key] = direction;
+			}
+		} else if (direction != 0) {
+			const auto found = buffer_direction.find(key);
+			if (found != buffer_direction.end() && found->second != direction) {
+				// Opposite direction from the pass that filled this buffer: mirror the operator, preserving
+				// whether it accepts equality.
+				switch (r.depth_compare_op) {
+					case vk::CompareOp::eLess: r.depth_compare_op = vk::CompareOp::eGreater; break;
+					case vk::CompareOp::eLessOrEqual:
+						r.depth_compare_op = vk::CompareOp::eGreaterOrEqual;
+						break;
+					case vk::CompareOp::eGreater: r.depth_compare_op = vk::CompareOp::eLess; break;
+					case vk::CompareOp::eGreaterOrEqual:
+						r.depth_compare_op = vk::CompareOp::eLessOrEqual;
+						break;
+					default: break;
+				}
+				ReportDepthDirectionFlip(key, direction, found->second);
+			}
+		}
+	}
 	if (r.depth_compare_op == vk::CompareOp::eEqual) {
 		if (equal_to_gequal) {
 			r.depth_compare_op = vk::CompareOp::eGreaterOrEqual;
