@@ -829,16 +829,24 @@ static bool DrawHasActivePixelShader(const RenderCommandBuffer& buffer,
 	const auto& ctx    = buffer.GetRegisters();
 	const auto& sh_ctx = buffer.GetShaders();
 
+	const auto& sh_regs = ctx.GetShaderRegisters();
+	const auto& ps      = sh_ctx.GetPs();
+
+	// No pixel shader bound means no active pixel shader, whatever is attached. Colour attachments used to
+	// imply one, which was safe only because a depth-only draw left color_count at zero. Now that every
+	// addressed slot is attached, such a draw reaches here with attachments and no shader, and treating it as
+	// active sends hash 0 to the recompiler - "missing from ShaderMap".
+	if (!ShaderAddressValid(ps.ps_regs.data_addr)) {
+		return false;
+	}
+
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count != 0 || !with_depth) {
 		return true;
 	}
 
-	const auto& sh_regs = ctx.GetShaderRegisters();
-	const auto& ps      = sh_ctx.GetPs();
-	return ShaderAddressValid(ps.ps_regs.data_addr) &&
-	       PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
+	return PixelShaderHasDepthOrCoverageSideEffects(sh_regs);
 }
 
 enum class CbColorMode : uint8_t {
