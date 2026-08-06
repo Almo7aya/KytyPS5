@@ -636,6 +636,61 @@ Also kept from this round, and correct independently: `DrawHasActivePixelShader`
 with a colour attachment, which only avoided handing hash 0 to the recompiler because depth-only draws happened
 to leave `color_count` at zero.
 
+### 4.1m LOD switching invalidates "the character is absent from pass B"
+
+The `--command-buffer-dump` / `--command-buffer-dump-folder` options dump the guest's own PM4 stream per frame
+(`{frame}_{id}_buffer_{type}.log`, written by `GraphicsDbgDumpDcb` in `libs/agc.cpp`). That is ground truth for
+what the game submits, independent of anything in the renderer, and it settled the question the last several
+rounds were circling.
+
+Draw packets are `IT_DRAW_INDEX_OFFSET_2`, payload `[max_size, index_offset, index_count, draw_initiator]`, so
+the third payload dword is the index count. Over 180 gameplay frames:
+
+| draw | frames present |
+| --- | --- |
+| world 10296 | 136/180 |
+| world 15900, character 12357 | 133/180 |
+| character 9744 | 61/180 |
+| character 9054, 12147 | 51/180 |
+
+The low numbers look like intermittent submission, but they are **LOD switching**: `indices=5280` appears in 97%
+of the frames *without* 9054 and only 14% of the frames *with* it. Near-perfect mutual exclusion - two LODs of
+one mesh. A mesh that swaps LOD changes its index count, which is indistinguishable from culling if you only
+count index counts.
+
+**So the guest submits the character every frame, and §4.1j's "pass B contains no character draws" was wrong.**
+Confirmed directly against the capture: **event 34244 has `num_indices=12357` and targets `49328`** - the
+character is in the second pass after all. The original search used `min_vertices=9000` with `max_results=40`
+and truncated before reaching event 34244, and I read the truncation as absence. Everything in §4.1j and §4.1k
+that rested on "the base-pass draw is missing on some frames" is retracted.
+
+Also settled this round:
+
+* **Kyty skips no sizeable draw.** `KYTY_LOG_SKIPPED_DRAWS` produced zero lines for any draw of 4000+ indices.
+  `no_target` cannot catch a base-pass draw (it requires neither colour nor depth). All 64 `[mrt-drop]` lines
+  are slot 0, which is always attempted regardless of mask, so a depth-only draw drops it legitimately - no
+  slot 1-7 ever drops, independently confirming there is no attachment index shifting.
+* **Occlusion queries are exonerated.** The default path returns false for every sample and the fallback writes
+  a global monotonic counter (`graphicsRun.cpp:1643`), so end-minus-begin is always at least 1 and every
+  primitive reads visible. The guest cannot be culling from query results.
+* **The depth compare op is exonerated.** `depthRenderTarget.cpp:276` casts `dc.zfunc` straight to
+  `vk::CompareOp`, and GCN's ZFUNC enum matches Vulkan's exactly (0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL,
+  4 GREATER, 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS), so the cast is right.
+* **The pixel valid mask is exonerated.** With `KYTY_VM_KILL_STICKY` accumulating correctly (it needs the mask
+  to start at 0 - starting at 1 silently turned it into `KYTY_NO_VM_KILL`, which is why the first attempt at
+  that test came out identical to it), alpha-masked foliage stays intact and the character still flickers.
+
+**Where this leaves it.** The character is submitted every frame, Kyty draws it, no draw is skipped, and yet the
+completed GBuffer normal shows it as a pure black silhouette with the car's normals wrong. So the draw executes
+and produces no useful GBuffer output. That is now the whole question, and it is narrow.
+
+The live detail worth chasing: `pixel_history` on `49328` at the character's pixel lists event 34226 failing
+with `backface_culled` + `depth_test_failed`, while event 34244 - the character's own 12357-index draw - does
+not appear at that pixel at all. Either it genuinely does not cover the pixel, or pixel_history is not showing
+it. Resolve that first, with `save_texture` on `49328`/`3149` immediately before and after event 34244, which is
+the technique that has been reliable here. Do not trust `find_draws` result sets without checking whether they
+were truncated by `max_results` - that is what produced the retraction above.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
