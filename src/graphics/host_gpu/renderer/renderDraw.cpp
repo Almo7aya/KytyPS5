@@ -108,6 +108,34 @@ void ReportDrawSkips() {
 	std::fflush(stderr);
 }
 
+// Which draws get skipped, and why.
+//
+// The capture (docs 4.1j/4.1k) showed the character's base-pass draws present in one GBuffer pass and absent
+// from the next, while its depth prepass still ran - the black cutout. The aggregate [draw-skip] counters say
+// how many were skipped but never which, so they cannot answer whether those particular draws are being
+// dropped by Kyty or simply not submitted by the guest.
+//
+// The character's base-pass draws are identifiable by index count: 12357, 9744, 9054 and 12147. If any appears
+// here, the reason names the path responsible. If none ever appears, Kyty is submitting every draw it is given
+// and the cause is upstream of the renderer.
+void LogSkippedDraw(const char* reason, uint32_t index_count, const HW::Shader& sh_ctx) {
+	static const bool enabled = std::getenv("KYTY_LOG_SKIPPED_DRAWS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	// Only sizeable indexed draws matter here; tiny ones are UI and post-process quads and would bury the log.
+	if (index_count < 4000) {
+		return;
+	}
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) >= 400) {
+		return;
+	}
+	std::fprintf(stderr, "[draw-skipped] reason=%s indices=%" PRIu32 " vs=0x%016" PRIx64 "\n", reason,
+	             index_count, static_cast<uint64_t>(sh_ctx.GetVs().gs_regs.chksum));
+	std::fflush(stderr);
+}
+
 // A requested MRT slot that resolves to no image is dropped, and because resolved slots are packed every
 // later slot shifts index while the pixel shader keeps exporting to fixed locations. Report the first few so
 // it is visible whether this happens at all, and how often.
@@ -1408,22 +1436,26 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, RenderCommandBuffer& buffer,
 	Common::LockGuard lock(m_context.GetMutex());
 	if (index_count == 0 || instance_count == 0) {
 		g_draw_skips.empty.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("empty", index_count, sh_ctx);
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer)) {
 		g_draw_skips.metadata.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("metadata", index_count, sh_ctx);
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		g_draw_skips.no_vertex.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("no_vertex", index_count, sh_ctx);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
 		g_draw_skips.ge_skip.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("ge_skip", index_count, sh_ctx);
 		return;
 	}
 
@@ -1541,22 +1573,26 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, RenderCommandBuffer& buffer, u
 	Common::LockGuard lock(m_context.GetMutex());
 	if (index_count == 0 || instance_count == 0) {
 		g_draw_skips.empty.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("empty", index_count, sh_ctx);
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer)) {
 		g_draw_skips.metadata.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("metadata", index_count, sh_ctx);
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		g_draw_skips.no_vertex.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("no_vertex", index_count, sh_ctx);
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
 		g_draw_skips.ge_skip.fetch_add(1, std::memory_order_relaxed);
+		LogSkippedDraw("ge_skip", index_count, sh_ctx);
 		return;
 	}
 
