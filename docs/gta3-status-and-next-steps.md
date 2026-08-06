@@ -940,6 +940,50 @@ render targets and viewport before concluding either is wrong.
 draw-level ones keep their own switches (`KYTY_LOG_SKIPPED_DRAWS`, `KYTY_LOG_BIG_DRAWS`,
 `KYTY_LOG_SHORT_STORAGE`, `KYTY_LOG_BAD_VSHARP`, `KYTY_LOG_DEPTH_FUNC`).
 
+### 4.1t Capture 846: the CAR is the broken object, and two more retractions
+
+`_RenderDoc/kyty_frame846.rdc`. GBuffer normal at event 10786 shows the **character rendering completely and
+correctly** - full body, coherent normals - and the **car broken**: body black, only wheels, roofline and a few
+scattered panels surviving. So the defect is **not specific to skinned meshes**, and any explanation resting on
+bone matrices is wrong.
+
+**Retraction 1 - §4.1s is void.** It compared events 5544 and 5993 and reported "different model transforms for
+the same vertex". Event 5544's only attachment is a **2048x2048 D16 depth target with no colour targets** - a
+shadow map - and 5993 is another shadow cascade. Two shadow views have different light matrices by design.
+The character's real main-view base pass is **event 8241**, which exports `w = +1047.8`, z = 10, NDC
+`(-0.119, 0.25)` - entirely correct. There is no transform discrepancy in this capture.
+
+**Retraction 2 - the depth-direction theory is disproven by measurement.** Tracing an actual black pixel rather
+than guessing at draws:
+
+* at `(2100, 600)`, inside the car's black body, the only draw reaching the pixel is **event 9697** (2910
+  indices, base pass, 6 MRTs) and it is rejected with `depth_test_failed`;
+* the stored depth `0.007141918875277042` was written by **event 90**, a different object (10437 indices, world
+  position `616, 1317, -285`) at `w = 1394.7`;
+* the car panel computes `10 / 1227.76 = 0.008145`.
+
+All draws export `z = 10.0` exactly with `w = z_view`, so depth is `10/w` and **decreases with distance** -
+nearer is larger, i.e. reversed-Z, which needs GEQUAL. 0.008145 is nearer than 0.007142 and should pass, yet it
+fails, which implies a LESS/LEQUAL comparison. A fix was implemented to make a test-only pass mirror the
+direction used by the pass that filled the buffer, keyed on the depth buffer's guest base address, with a
+`[depth-dir]` counter to prove it fired.
+
+**It never fired - zero flips over a whole session.** Writers and testers always agree on direction, so the
+operator is not inverted and this explanation is dead. The change was reverted rather than left as dead code.
+
+**What that leaves.** The `depth_test_failed` at that pixel is measured and real, but its cause is not the
+compare direction. Remaining candidates, none yet tested:
+
+* the viewport depth range (`minDepth`/`maxDepth` come from `viewport_offset[2]` / `viewport_scale[2]` in
+  `renderDraw.cpp`) remapping the stored value, so the comparison happens in a different space than the raw
+  `z/w` computed above;
+* `pixel_history`'s `failure_reasons` being approximate - this binding has already proven unreliable for MRT
+  slots and for usage names, so the reported reason may not be the real one. Verify with
+  `debug_shader_at_pixel` or by reading the depth buffer directly around that pixel before trusting it again.
+
+**Do not** start from "the character is broken" - in this capture it is not. Start from the car, event 9697, and
+confirm the failure reason independently before building on it.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
