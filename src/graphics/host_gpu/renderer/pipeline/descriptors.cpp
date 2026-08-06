@@ -92,6 +92,37 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
 	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+
+	// KYTY_LOG_BAD_VSHARP reports buffer descriptors whose base address cannot be a real guest allocation.
+	//
+	// The short-storage run produced `addr=0x525fffffffff asked=0xe6ef5269 mapped=0x0` - a 48-bit base whose
+	// low 32 bits are all ones, which is not a PS5 GPU address (those live in the 0x1x./0x2x. ranges). Nothing
+	// maps there, so the binding falls back to the 16-byte null buffer and every read through it returns zero.
+	// That is how the base-pass VS ends up with zeroed position constants while its vertex attributes stay
+	// correct - the asymmetry measured in §4.1o.
+	//
+	// The descriptor arrives here already resolved, so a garbage base means the V# itself is wrong: the
+	// user-data window or the SRT walk that produced it read from the wrong place. Dumping the raw dwords
+	// alongside the shader identifies which resource, which is what a fix needs.
+	static const bool log_bad_vsharp = std::getenv("KYTY_LOG_BAD_VSHARP") != nullptr;
+	if (log_bad_vsharp) {
+		const bool implausible = (address >> 40u) != 0 || (address & 0xffffffffu) == 0xffffffffu;
+		if (implausible && address != 0) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::fprintf(stderr,
+				             "[bad-vsharp] addr=0x%012" PRIx64 " stride=%" PRIu32 " records=%" PRIu64
+				             " dwords=%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32 ",%08" PRIx32
+				             " written=%d read=%d formatted=%d\n",
+				             address, stride, static_cast<uint64_t>(records), descriptor.fields[0],
+				             descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+				             resource.written ? 1 : 0, resource.read ? 1 : 0,
+				             resource.formatted ? 1 : 0);
+				std::fflush(stderr);
+			}
+		}
+	}
+
 	if (address == 0 || size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
