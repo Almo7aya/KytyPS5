@@ -111,6 +111,31 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	// here to the device limit to keep the binding legal.
 	static const bool no_storage_clamp = std::getenv("KYTY_NO_STORAGE_CLAMP") != nullptr;
 	auto bound_size = context.GetGpuResources().MappedExtent(address, size);
+
+	// KYTY_LOG_SHORT_STORAGE reports every binding whose mapped extent is shorter than the descriptor asks for.
+	//
+	// That is the precise condition under which the recompiled shader's bounds-checked loads return zero: the
+	// SPIR-V for the character's base-pass VS reads its position constants as
+	// `Phi(load, 0)` guarded by `ArrayLength(buffers[3])`, so anything past the bound reads as 0 and the
+	// exported position comes out wrong while attributes - which come from vertex buffers - stay correct. That
+	// asymmetry is exactly what §4.1o measured.
+	//
+	// This is measured rather than assumed because KYTY_NO_STORAGE_CLAMP was supposed to test the same idea and
+	// came back silent, but it replaced the bound with min(nominal_size, device_limit), and GNM descriptors are
+	// routinely over-provisioned toward UINT32_MAX - so that path may never have yielded a usable binding. A
+	// switch whose precondition never holds produces a false negative, which has happened repeatedly here.
+	static const bool log_short_storage = std::getenv("KYTY_LOG_SHORT_STORAGE") != nullptr;
+	if (log_short_storage && bound_size < size) {
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			std::fprintf(stderr,
+			             "[short-storage] addr=0x%010" PRIx64 " asked=0x%" PRIx64 " mapped=0x%" PRIx64
+			             " written=%d read=%d\n",
+			             address, size, bound_size, resource.written ? 1 : 0, resource.read ? 1 : 0);
+			std::fflush(stderr);
+		}
+	}
+
 	if (no_storage_clamp) {
 		const auto limit = static_cast<uint64_t>(
 		    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
