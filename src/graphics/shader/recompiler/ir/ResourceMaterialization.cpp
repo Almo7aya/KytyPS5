@@ -295,9 +295,42 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	auto             cursor = values.begin();
 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
 	cursor += program.info.buffers.size();
-	for (auto& descriptor: next.buffers) {
+	// Buffer descriptors were only rejected on a non-zero Type field, which lets obvious garbage through:
+	// §4.1p found descriptors whose fourth dword holds a float constant (0x3f000000 = 0.5f) and whose base is
+	// 0x525fffffffff or 0x550000000000, both far outside the guest address space. Those type bits happen to be
+	// zero, so they passed, bound as the null buffer, and every constant read through them returned zero -
+	// which is what corrupts the base-pass VS position while its vertex attributes stay correct.
+	//
+	// Images already get a real validity check (ValidImageDescriptor below); buffers now get the same treatment.
+	// A base beyond the guest address space cannot be a real allocation, so zero the descriptor as invalid
+	// rather than binding it.
+	//
+	// KYTY_LOG_BAD_DESCRIPTOR_SOURCE reports the shader and the size of the user-data window it was resolved
+	// from. The window is the prime suspect: the SRT evaluator dereferences whatever base the user data yields,
+	// with no check that the address is mapped, so a window that includes stale SGPRs left by an earlier draw
+	// resolves descriptor pointers to old or unrelated memory.
+	static const bool log_bad_source = std::getenv("KYTY_LOG_BAD_DESCRIPTOR_SOURCE") != nullptr;
+	for (uint32_t i = 0; i < next.buffers.size(); i++) {
+		auto&                descriptor = next.buffers[i];
 		ShaderBufferResource buffer;
-		if (DecodeBufferDescriptor(descriptor, buffer) && buffer.Type() != 0) {
+		const bool           decoded   = DecodeBufferDescriptor(descriptor, buffer);
+		const bool           wrong_type = decoded && buffer.Type() != 0;
+		// 2^40 covers every guest allocation seen in practice; the observed valid bases sit around
+		// 0x11'xxxxxxxx and 0x20'xxxxxxxx, while every garbage one exceeded this.
+		const bool implausible_base = decoded && buffer.Base48() >= (uint64_t {1} << 40u);
+		if (wrong_type || implausible_base) {
+			if (log_bad_source && implausible_base) {
+				static std::atomic<uint32_t> log_count {0};
+				if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
+					std::fprintf(stderr,
+					             "[bad-descriptor-source] shader=0x%016" PRIx64 " buffer=%" PRIu32
+					             " base=0x%012" PRIx64 " user_data_words=%zu user_data_base=%" PRIu32
+					             " first_use_pc=0x%08" PRIx32 "\n",
+					             program.shader_hash, i, buffer.Base48(), runtime.user_data.size(),
+					             program.user_data_base, program.info.buffers[i].first_use_pc);
+					std::fflush(stderr);
+				}
+			}
 			descriptor.dwords.fill(0);
 		}
 	}
