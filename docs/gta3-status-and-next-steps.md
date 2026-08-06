@@ -849,6 +849,59 @@ materialisation, tagged with a monotonically increasing sequence number. That sh
 reads a version older or newer than the write that should precede it, which is the difference between an
 ordering fault and the guest genuinely programming those slots inconsistently for the same shader.
 
+### 4.1r RETRACTION: the bad descriptors are benign, not the cause
+
+§4.1q claimed the bone-matrix descriptor being wrong 49-81% of the time was the defect. **That causal claim is
+withdrawn.** The identification of buffer 2 as the skinning bone-matrix buffer still holds; the failure rate does
+not mean what I said it meant.
+
+Logging the *content* of every write to user-data slots 4..7 across a whole run (rather than the first few
+hundred) shows the guest writing, into those same slots:
+
+	bf36ea57 3ed7e9f8 3f0ee8f3 3eacd7e4   -> -0.714, 0.421, 0.558, 0.338   (unit quaternion)
+	47f2c516 4757c900 450621de 3f800000   -> 124298, 55241, 2145.5, 1.0    (position, w = 1)
+	c377fb47 c268ad02 c3150099 00000000   -> -247.98, -232.67, -149.0
+	00000000 00700000 00000000 00000000   (200 times)
+
+Those are **inline transform constants**, not corrupted descriptors. And the reason the guest may legitimately
+put them there is in the shader itself:
+
+	0x000005cc: s_cbranch_scc0 0x000008e0
+	0x000005d0: buffer_load_format_xyzw v61, v85, s12, 0
+
+**The bone fetches sit inside a conditional branch.** A draw that does not take that branch never uses
+`s[12:15]` as a V#, so the guest is free to pass a quaternion in those registers. Kyty's resource tracker walks
+instructions linearly with no control-flow awareness, so it demands a valid V# for *every* draw of that shader.
+
+So the 49-81% "bad" rate is simply the fraction of draws that skip the skinning path, and those descriptors are
+harmless. That is why every intervention along this path changed nothing:
+
+* rejecting implausible descriptors - no visual change
+* the last-good descriptor fallback - no visual change
+* the USER_ACCUM aliasing fix - no visual change
+
+All three were operating on data that was never used.
+
+**What survives.** The §4.1o measurement is untouched and is still the strongest fact in this investigation: for
+the *same* mesh in the *same* frame, the depth prepass exports `w = +1046.43` and the base pass exports
+`w = -5974.28`, while every shading parameter is byte-identical. Something makes the base-pass VS compute a
+different clip position from the prepass VS for identical input. The descriptor path is now exonerated as the
+explanation.
+
+**Method note, because it cost many rounds.** Several probes here produced confident wrong answers because they
+were filtered or capped before the population was understood:
+
+* a one-shot shader dump captured a single shader and I generalised from it;
+* `[fetch-detect]`/`[fetch-rewrite]` capped at 24 and sampled only healthy shaders;
+* `[ud4-group]` capped at 900, covering seq 0..1736 while the reads of interest were at seq 34000+, and I read
+  the absence of writes as proof none existed;
+* a PM4-header test of `& 0xc0000000` flagged ordinary addresses such as `0xe0ed0000`;
+* the descriptor fallback and `KYTY_NO_STALE_UPLOAD` were both no-ops by construction, and their silence was
+  reported as an elimination.
+
+Log the whole population first, then filter. Verify a switch can actually fire before drawing a conclusion from
+its silence.
+
 ### 4.1a A/B RESULTS SO FAR — the velocity theory is retired as the *cause*
 
 `KYTY_FORCE_VELOCITY_CLEAR=1` and `KYTY_META_CLEAR_ASSUME_ZERO=1` were both tested: **no difference**. The
