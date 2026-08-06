@@ -143,32 +143,59 @@ void LogSkippedDraw(const char* reason, uint32_t index_count, const HW::Shader& 
 // This tallies submissions per distinct index count, which needs no frame counter to interpret: a draw issued
 // every frame accumulates in step with the big static world draws, while one the guest culls intermittently
 // falls behind. The character's base-pass draws are 12357, 9744, 9054 and 12147 indices.
-void LogSubmittedBigDraw(uint32_t index_count) {
+void LogSubmittedBigDraw(uint32_t index_count, uint32_t frame_num) {
 	static const bool enabled = std::getenv("KYTY_LOG_BIG_DRAWS") != nullptr;
-	if (!enabled || index_count < 8000) {
+	if (!enabled) {
 		return;
 	}
 
-	static Common::Mutex                mutex;
-	static std::map<uint32_t, uint64_t> tally;
-	static uint64_t                     total   = 0;
-	static uint32_t                     reports = 0;
+	// Counting total submissions could not answer this: objects appear in different numbers of passes per
+	// frame - prepass, base pass, shadow cascades, velocity - so a raw total says nothing about whether any
+	// individual frame is missing a draw. What matters is *per frame presence*, so this counts, for each of
+	// the character's base-pass index counts, how many frames contained it at all. Equal to the frame count
+	// means the guest submits it every frame and the fault is downstream; short of it means the guest culls
+	// it on some frames and the fault is upstream of the renderer.
+	static constexpr uint32_t kTargets[] = {12357u, 9744u, 9054u, 12147u};
+	constexpr size_t          kCount     = std::size(kTargets);
+
+	static Common::Mutex mutex;
+	static uint32_t      current_frame           = UINT32_MAX;
+	static bool          seen_this_frame[kCount] = {};
+	static uint32_t      frames_with[kCount]     = {};
+	static uint32_t      frames_total            = 0;
+	static uint32_t      reports                 = 0;
 
 	Common::LockGuard lock(mutex);
-	tally[index_count]++;
-	if (++total % 20000 != 0 || reports >= 10) {
-		return;
-	}
-	reports++;
-	std::fprintf(stderr, "[draw-big] total=%llu distinct=%zu\n", static_cast<unsigned long long>(total),
-	             tally.size());
-	for (const auto& [indices, count]: tally) {
-		if (count >= 8) {
-			std::fprintf(stderr, "[draw-big]   indices=%" PRIu32 " submitted=%llu\n", indices,
-			             static_cast<unsigned long long>(count));
+
+	if (frame_num != current_frame) {
+		if (current_frame != UINT32_MAX) {
+			frames_total++;
+			for (size_t i = 0; i < kCount; i++) {
+				if (seen_this_frame[i]) {
+					frames_with[i]++;
+				}
+			}
+			if (frames_total % 120 == 0 && reports < 12) {
+				reports++;
+				std::fprintf(stderr,
+				             "[frame-draw] frames=%" PRIu32 " 12357=%" PRIu32 " 9744=%" PRIu32
+				             " 9054=%" PRIu32 " 12147=%" PRIu32 "\n",
+				             frames_total, frames_with[0], frames_with[1], frames_with[2],
+				             frames_with[3]);
+				std::fflush(stderr);
+			}
+		}
+		current_frame = frame_num;
+		for (size_t i = 0; i < kCount; i++) {
+			seen_this_frame[i] = false;
 		}
 	}
-	std::fflush(stderr);
+
+	for (size_t i = 0; i < kCount; i++) {
+		if (index_count == kTargets[i]) {
+			seen_this_frame[i] = true;
+		}
+	}
 }
 
 // A requested MRT slot that resolves to no image is dropped, and because resolved slots are packed every
@@ -1290,7 +1317,6 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	EXIT_IF(draw.name == nullptr);
 
 	g_draw_skips.submitted.fetch_add(1, std::memory_order_relaxed);
-	LogSubmittedBigDraw(draw.index_count);
 	ReportDrawSkips();
 
 	// A/B: KYTY_BARRIER_EVERY_DRAW makes every draw wait on all prior shader writes.
@@ -1411,6 +1437,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, RenderCommandBuffer
 	// occlusion-test draw. The render pass only opens here, so the query has to be bracketed around
 	// the draw rather than at the dump itself.
 	const bool z_pass_query = buffer.BeginArmedZPassQuery();
+	LogSubmittedBigDraw(draw.index_count,
+	                    static_cast<uint32_t>(buffer.GetContext().GetGpu().GetFrameNum()));
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	if (z_pass_query) {
 		buffer.EndArmedZPassQuery();
