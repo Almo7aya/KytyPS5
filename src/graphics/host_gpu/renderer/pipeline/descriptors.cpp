@@ -91,30 +91,57 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	if (stride != 0 && records > UINT64_MAX / stride) {
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
-	const auto size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || size == 0) {
+	const auto nominal = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+	if (address == 0 || nominal == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
+	const auto  max_range =
+	    static_cast<uint64_t>(graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (alignment == 0) {
+		EXIT("storage buffer device alignment is unsupported\n");
 	}
+
+	// A GNM descriptor's num_records is routinely over-provisioned - commonly close to UINT32_MAX -
+	// because the shader bounds-checks its own accesses. The nominal footprint is therefore not a
+	// claim that any of it is resident, and binding it whole asks the buffer cache to stage, track
+	// and map memory the guest never mapped: that faults inside the staging copy or fails the memory
+	// tracker's range validation, depending on where the descriptor happens to point.
+	//
+	// Bind the contiguous mapped extent instead. Vulkan robust buffer access returns zero past the
+	// end, which is exactly what the guest's own bounds checks already assume. The extent comes from
+	// the ranges the guest mapped for GPU access rather than from host commit state: that is the
+	// question actually being asked, it costs a map probe instead of a kernel transition on a path
+	// that runs for every buffer of every draw, and it does not mistake a GPU-owned page for an
+	// absent one.
+	const auto requested = std::min(nominal, max_range);
+	const auto size      = context.GetGpuResources().MappedExtent(address, requested);
+
+	// A base that maps nothing binds the null buffer rather than faulting; reads then return zero,
+	// which is the same answer robust access gives past the end of a short binding.
+	if (size == 0) {
+		BindNullStorageBuffer(context, result);
+		return result;
+	}
+
 	auto binding = context.GetBufferCache().ObtainBuffer(
 	    command_buffer, address, size, resource.written, resource.read, resource.formatted);
 	const auto aligned_offset = binding.offset - binding.offset % alignment;
 	const auto adjustment     = binding.offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	result.owner  = std::move(binding.owner);
-	result.buffer = binding.buffer;
-	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	// Aligning the offset down puts `adjustment` bytes in front of the binding, so the described
+	// range has to leave room for them inside the device limit. Trimming the tail is safe for the
+	// same reason the clamp above is.
+	const auto bound_size = std::min(size, max_range - adjustment);
+	buffer_offset         = static_cast<uint32_t>(adjustment);
+	result.owner          = std::move(binding.owner);
+	result.buffer         = binding.buffer;
+	result.offset         = aligned_offset;
+	result.range          = static_cast<vk::DeviceSize>(bound_size + adjustment);
 	return result;
 }
 
