@@ -28,6 +28,10 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Contiguous mapped bytes starting at `vaddr`, capped at `max_size` and at the tracker's address
+	// space. Zero when nothing is mapped there. Lets a caller bind what the guest actually mapped
+	// rather than what a descriptor nominally claims.
+	[[nodiscard]] uint64_t MappedExtent(uint64_t vaddr, uint64_t max_size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
