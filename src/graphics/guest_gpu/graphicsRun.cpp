@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <semaphore>
@@ -1524,12 +1525,14 @@ void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id)
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), interrupt_context_id);
 }
 
-void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
+void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
+                                    uint64_t dst_gpu_addr) {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::TriggerEvent()\n"
-		     "\t event_type  = 0x%08" PRIx32 "\n"
-		     "\t event_index = 0x%08" PRIx32 "\n",
-		     event_type, event_index);
+		     "\t event_type   = 0x%08" PRIx32 "\n"
+		     "\t event_index  = 0x%08" PRIx32 "\n"
+		     "\t dst_gpu_addr = 0x%016" PRIx64 "\n",
+		     event_type, event_index, dst_gpu_addr);
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
@@ -1565,12 +1568,32 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index) {
 		case 0x00000019:
 		case 0x0000001a:
 		case 0x0000001b:
-		case 0x00000038:
-		case 0x00000039:
-		case 0x0000003a:
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
+			break;
+		// PIXEL_PIPE_STAT_CONTROL / _RESET configure and reset the Z-pass counters. Nothing is
+		// accumulated on the host between dumps, so there is no state for them to act on.
+		case 0x00000038:
+		case 0x0000003a: break;
+		// PIXEL_PIPE_STAT_DUMP is the occlusion-query writeback. Unreal stores a 64-bit counter
+		// here, renders, stores a second one 8 bytes above, and later reads `end - begin` on the CPU
+		// to decide whether a primitive was visible - dropping it from the next frame's draw list if
+		// not. With nothing written it read stale memory, computed a zero delta and culled, which is
+		// why only primitives whose bounds contain the camera (which Unreal marks unconditionally
+		// visible) ever appeared.
+		//
+		// There is no Z-pass counting on the host, so any pair whose end exceeds its begin makes the
+		// primitive report visible. Derive the value from the slot address rather than from a shared
+		// monotonic counter: the guest reads the two slots asynchronously and non-atomically a frame
+		// or two later, so a counter that grows over time can be sampled as a newer `begin` against
+		// an older `end`, giving a negative delta and a model that flashes. `(X + 8) >> 3` is always
+		// exactly one more than `X >> 3`, so the delta is 1 regardless of readback timing.
+		case 0x00000039:
+			if (dst_gpu_addr != 0) {
+				const uint64_t value = dst_gpu_addr >> 3u;
+				std::memcpy(reinterpret_cast<void*>(dst_gpu_addr), &value, sizeof(value));
+			}
 			break;
 		default:
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);
