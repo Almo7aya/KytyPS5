@@ -502,6 +502,10 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+		// A dropped ES/GS pair is the producer of whatever this draw was meant to write. Capture its
+		// guest words once so the pair can be disassembled offline and the reason it is unsupported
+		// can be read from the ISA rather than inferred from these register bits.
+		ShaderDumpSkippedGeShader(vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr);
 		const auto log_id = g_shader_stage_log_count.fetch_add(1);
 		if (log_id < 32) {
 			LOGF("Skipping unsupported GE shader draw: stages=0x%08" PRIx32

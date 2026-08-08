@@ -250,6 +250,9 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
+// Writes the raw guest words of an ES/GS pair that the draw path declined to compile, so the pair
+// can be disassembled offline. Runs once per process and never invokes the recompiler.
+void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr);
 
 } // namespace Libs::Graphics
 

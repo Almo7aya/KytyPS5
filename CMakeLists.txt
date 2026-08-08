@@ -364,6 +364,21 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+# Offline disassembler for shader pairs the draw path declines to compile. Links only the
+# decompiler so it drives the emulator's own Decoder without pulling in the renderer.
+add_executable(shader_disasm EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderDisasmTool.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ExportOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ImageOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/MemoryOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ScalarAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/ShaderDecoder.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/VectorAluOps.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.cpp"
+)
+target_link_libraries(shader_disasm fmt::fmt)
+target_include_directories(shader_disasm PRIVATE ${inc_headers})
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"

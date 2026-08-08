@@ -1719,4 +1719,46 @@ bool ShaderAddressValid(uint64_t addr) {
 	return reinterpret_cast<const uint32_t*>(addr) != nullptr;
 }
 
+void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr) {
+	// The draw these belong to is skipped on every frame, so the work is capped hard, and the
+	// recompiler is deliberately not invoked: an abort inside a decoder would take the title down
+	// once per frame rather than once. Only raw guest words are written here - disassembly happens
+	// offline, where a decode failure costs nothing.
+	static std::atomic<uint32_t> dumped {0};
+	if (dumped.fetch_add(1, std::memory_order_relaxed) != 0) {
+		return;
+	}
+
+	const auto folder = Config::GetShaderLogFolder() / "skipped_ge";
+	Common::File::CreateDirectories(folder);
+
+	const auto dump = [&folder](const char* stage, uint64_t addr) {
+		if (addr == 0 || !ShaderAddressValid(addr)) {
+			return;
+		}
+		ShaderMappedData data;
+		if (!ShaderGetMappedData(addr, data) || data.code_size_bytes == 0 ||
+		    data.code_size_bytes % sizeof(uint32_t) != 0) {
+			printf("skipped-ge: no mapped size for %s=0x%016" PRIx64 "\n", stage, addr);
+			return;
+		}
+		auto         name = folder / fmt::format("{}_{:016x}.bin", stage, addr);
+		Common::File file;
+		file.Create(name);
+		if (file.IsInvalid()) {
+			printf("skipped-ge: cannot create %s\n", Common::PathToString(name).c_str());
+			return;
+		}
+		file.Write(reinterpret_cast<const uint32_t*>(addr), data.code_size_bytes);
+		file.Close();
+		printf("skipped-ge: wrote %s (%" PRIu32 " dwords) for %s=0x%016" PRIx64 "\n",
+		       Common::PathToString(name).c_str(),
+		       data.code_size_bytes / static_cast<uint32_t>(sizeof(uint32_t)), stage, addr);
+	};
+
+	dump("es", es_addr);
+	dump("gs", gs_addr);
+	fflush(stdout);
+}
+
 } // namespace Libs::Graphics
