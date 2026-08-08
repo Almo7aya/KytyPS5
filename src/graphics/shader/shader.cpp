@@ -164,7 +164,11 @@ static std::span<const uint32_t> MakeShaderSpirvView(const std::vector<uint32_t>
 // of its own and SPI_SHADER_PGM_RSRC2_GS.USER_SGPR describes the geometry half - which is zero for a
 // pair whose geometry stage is never launched. Fall back to how many words the guest actually wrote,
 // or the window is empty and nothing the shader reads resolves.
-static uint32_t VertexUserSgprCount(const HW::VertexShaderInfo& regs) {
+// A vertex stage's user data lives in the GS user-SGPR block, but EsStageRegisters carries no count
+// of its own and SPI_SHADER_PGM_RSRC2_GS.USER_SGPR describes the geometry half - which is zero for a
+// pair whose geometry stage is never launched. Fall back to how many words the guest actually wrote,
+// or the window is empty and nothing the shader reads resolves.
+static uint32_t VertexUserSgprWindow(const HW::VertexShaderInfo& regs) {
 	const auto declared = static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr);
 	return declared != 0 ? declared : regs.gs_user_sgpr.count;
 }
@@ -649,6 +653,17 @@ static uint32_t VertexAttribFormatToBufferFormat(uint32_t format) {
 		}
 	}
 
+	// The two enumerations do not share an encoding, so returning the input unchanged writes a
+	// vertex-attribute format code into the descriptor's buffer-format field - the attribute is then
+	// decoded at whatever width that code happens to mean. Silent, and wrong per vertex. Every
+	// format this title uses is in the table above; report anything that is not rather than let it
+	// through unnoticed.
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+		LOGF("[attrib-format] no buffer format for vertex attrib format %" PRIu32
+		     "; the attribute will be decoded at the wrong width\n",
+		     format);
+	}
 	return format;
 }
 
@@ -789,7 +804,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 	uint64_t                shader_addr   = regs.es_regs.data_addr;
 	const HW::UserSgprInfo& user_sgpr     = regs.gs_user_sgpr;
-	auto                    user_sgpr_num = VertexUserSgprCount(regs);
+	auto                    user_sgpr_num = VertexUserSgprWindow(regs);
 	ShaderMappedData        data;
 	if (!ShaderGetMappedData(shader_addr, data)) {
 		LOGF("ShaderGetInputInfoVS(): shader=0x%016" PRIx64 " is missing from ShaderMap\n",
@@ -958,17 +973,47 @@ static bool LogPermutationMismatch(const ShaderProgramPermutation& permutation, 
 	return false;
 }
 
+// MakeVertexInputState picks each attribute's Vulkan format from the number of components the shader
+// actually fetches, falling back to the destination register span when that is unknown. Those counts
+// have exactly one writer - RewriteEmbeddedVertexFetches, which fills them in as a side effect of
+// recompiling - and the input info is rebuilt from scratch every draw, so a permutation cache hit
+// leaves them at zero and the format silently comes from the register span instead.
+//
+// Two draws sharing one shader then build different vertex layouts: the draw that compiled the
+// permutation uses the true fetch widths and every later draw uses the span. Wherever the two
+// disagree the attribute is decoded at the wrong width, which for bone indices and weights means
+// indexing the wrong matrices. Recover the counts from the cached program, which is where the
+// recompile derived them from in the first place, so both paths agree by construction.
+static void ApplyVertexFetchComponents(ShaderVertexInputInfo&               info,
+                                       const ShaderRecompiler::IR::Program& program) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op != ShaderRecompiler::IR::Opcode::LoadInputF32) {
+				continue;
+			}
+			const auto attr = inst.input_info.attr;
+			if (attr >= static_cast<uint32_t>(ShaderVertexInputInfo::RES_MAX)) {
+				continue;
+			}
+			info.resource_fetch_components[attr] =
+			    std::max(info.resource_fetch_components[attr],
+			             static_cast<int>(inst.input_info.chan + 1u));
+		}
+	}
+}
+
 static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
                                     const HW::VertexShaderInfo& regs, ShaderVertexInputInfo& info,
                                     uint64_t shader_hash) {
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
-	        std::span<const uint32_t>(regs.gs_user_sgpr.value, VertexUserSgprCount(regs)),
+	        std::span<const uint32_t>(regs.gs_user_sgpr.value, VertexUserSgprWindow(regs)),
 	        regs.es_regs.data_addr, info.stage, &error)) {
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
 	ApplyVertexOutputs(info, *permutation.program);
+	ApplyVertexFetchComponents(info, *permutation.program);
 	return true;
 }
 
@@ -1437,8 +1482,8 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.lane_mask_mode       = lane_mask_mode;
 	options.shader_hash          = regs.gs_regs.chksum;
 	options.shader_base          = shader_addr;
-	options.user_data_base       = 8;
-	options.user_data_count      = VertexUserSgprCount(regs);
+	options.user_data_base  = 8;
+	options.user_data_count = VertexUserSgprWindow(regs);
 	options.user_data            = regs.gs_user_sgpr.value;
 	options.descriptor_set       = 0;
 	options.push_constant_offset = 0;
