@@ -2,6 +2,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <optional>
@@ -158,6 +159,46 @@ private:
 	return 0;
 }
 
+// The vertex stage addresses the ring exactly as the geometry stage addresses its relocation slots,
+// so both scans need the same `stride * index + constant` tracking. Only the ring scan cares where a
+// value came from, so that part stays with it and this handles addresses alone.
+void TrackAddress(const Instruction& inst, uint32_t stride, Tracker& tracker) {
+	switch (inst.opcode) {
+		case Opcode::VMulU32U24:
+		case Opcode::VMadU32U24: {
+			const auto scale = InlineConstant(inst.src0);
+			if (IsVectorRegister(inst.dst) && scale && *scale == stride) {
+				const auto bias =
+				    inst.opcode == Opcode::VMadU32U24 ? InlineConstant(inst.src2).value_or(0) : 0;
+				tracker.SetAddress(inst.dst.reg, {bias, true});
+				return;
+			}
+			break;
+		}
+		case Opcode::VAddNcU32: {
+			if (IsVectorRegister(inst.dst) && IsVectorRegister(inst.src1)) {
+				if (const auto base = tracker.Address(inst.src1.reg)) {
+					if (const auto bias = InlineConstant(inst.src0)) {
+						tracker.SetAddress(inst.dst.reg, {base->constant + *bias, base->scaled});
+						return;
+					}
+				}
+			}
+			break;
+		}
+		default: break;
+	}
+
+	if (DefinesDestination(inst)) {
+		if (IsVectorRegister(inst.dst)) {
+			tracker.Kill(inst.dst.reg);
+		}
+		if (IsVectorRegister(inst.dst2)) {
+			tracker.Kill(inst.dst2.reg);
+		}
+	}
+}
+
 [[nodiscard]] const char* TargetName(WriteToSliceTarget target) {
 	switch (target) {
 		case WriteToSliceTarget::Position0: return "POS0";
@@ -200,18 +241,6 @@ WriteToSliceMap AnalyzePassthroughGs(const Program& gs) {
 		const auto& inst = gs.instructions[i];
 
 		switch (inst.opcode) {
-			case Opcode::VMulU32U24:
-			case Opcode::VMadU32U24: {
-				const auto scale = InlineConstant(inst.src0);
-				if (IsVectorRegister(inst.dst) && scale && *scale == map.ring_stride) {
-					const auto bias = inst.opcode == Opcode::VMadU32U24
-					                      ? InlineConstant(inst.src2).value_or(0)
-					                      : 0;
-					tracker.SetAddress(inst.dst.reg, {bias, true});
-					continue;
-				}
-				break;
-			}
 			case Opcode::VMovB32: {
 				// The geometry stage materializes some export components itself rather than reading
 				// them from the ring, so those constants are part of the map too.
@@ -219,19 +248,6 @@ WriteToSliceMap AnalyzePassthroughGs(const Program& gs) {
 					if (const auto constant = InlineConstant(inst.src0)) {
 						tracker.SetConstant(inst.dst.reg, *constant);
 						continue;
-					}
-				}
-				break;
-			}
-			case Opcode::VAddNcU32: {
-				// `base + constant` keeps addressing the same relocation region.
-				if (IsVectorRegister(inst.dst) && IsVectorRegister(inst.src1)) {
-					if (const auto base = tracker.Address(inst.src1.reg)) {
-						if (const auto bias = InlineConstant(inst.src0)) {
-							tracker.SetAddress(inst.dst.reg,
-							                   {base->constant + *bias, base->scaled});
-							continue;
-						}
 					}
 				}
 				break;
@@ -313,14 +329,7 @@ WriteToSliceMap AnalyzePassthroughGs(const Program& gs) {
 			default: break;
 		}
 
-		if (DefinesDestination(inst)) {
-			if (IsVectorRegister(inst.dst)) {
-				tracker.Kill(inst.dst.reg);
-			}
-			if (IsVectorRegister(inst.dst2)) {
-				tracker.Kill(inst.dst2.reg);
-			}
-		}
+		TrackAddress(inst, map.ring_stride, tracker);
 	}
 
 	if (map.slots.empty()) {
@@ -346,6 +355,107 @@ WriteToSliceMap AnalyzePassthroughGs(const Program& gs) {
 	return map;
 }
 
+WriteToSlicePlan PlanWriteToSlice(const Program& es, const WriteToSliceMap& gs_map) {
+	WriteToSlicePlan plan;
+
+	if (!gs_map.lowerable) {
+		plan.reject_reason = gs_map.reject_reason.empty() ? "geometry stage is not a passthrough"
+		                                                  : gs_map.reject_reason;
+		return plan;
+	}
+
+	const auto end = ProgramEnd(es);
+	if (end == 0) {
+		plan.reject_reason = "vertex shader has no terminator";
+		return plan;
+	}
+
+	// Read the stride from the vertex stage too rather than trusting the geometry stage's. The two
+	// describe the same ring, so a disagreement means these are not the pair they appear to be.
+	plan.ring_stride = DeriveRingStride(es, end);
+	if (plan.ring_stride == 0) {
+		plan.reject_reason = "no ESGS ring stride could be derived from the vertex shader";
+		return plan;
+	}
+	if (plan.ring_stride != gs_map.ring_stride) {
+		plan.reject_reason = fmt::format("ring stride disagrees: vertex {} bytes, geometry {} bytes",
+		                                 plan.ring_stride, gs_map.ring_stride);
+		return plan;
+	}
+
+	const auto slot_for_offset = [&gs_map](uint32_t ring_offset) -> const WriteToSliceSlot* {
+		for (const auto& slot: gs_map.slots) {
+			if (slot.from_ring && slot.ring_offset == ring_offset) {
+				return &slot;
+			}
+		}
+		return nullptr;
+	};
+
+	Tracker tracker(plan.ring_stride);
+	// A ring store whose data is not in a vector register cannot become an export, so it is a
+	// rejection rather than something to skip - skipping it would leave that component unwritten.
+	const auto record = [&](uint32_t pc, const Operand& data, uint32_t ring_offset) {
+		const auto* slot = slot_for_offset(ring_offset);
+		if (slot == nullptr) {
+			// The geometry stage exports nothing from this dword, so eliding the ring elides the
+			// store with it. Dead either way, and dropping it is the whole point of the lowering.
+			return true;
+		}
+		if (!IsVectorRegister(data)) {
+			plan.reject_reason =
+			    fmt::format("ring offset {} is stored from a non-vector operand", ring_offset);
+			return false;
+		}
+		plan.stores.push_back({pc, ring_offset, slot->target, slot->component});
+		return true;
+	};
+
+	for (size_t i = 0; i < end; i++) {
+		const auto& inst = es.instructions[i];
+
+		if (inst.opcode == Opcode::DsWriteB32 || inst.opcode == Opcode::DsWrite2B32) {
+			const auto base = IsVectorRegister(inst.src0) ? tracker.Address(inst.src0.reg)
+			                                             : std::optional<AddressValue> {};
+			if (base && base->scaled) {
+				if (!record(inst.pc, inst.src1, base->constant + inst.offset)) {
+					plan.stores.clear();
+					return plan;
+				}
+				if (inst.opcode == Opcode::DsWrite2B32 &&
+				    !record(inst.pc, inst.src2, base->constant + inst.secondary_offset)) {
+					plan.stores.clear();
+					return plan;
+				}
+			}
+			continue;
+		}
+
+		TrackAddress(inst, plan.ring_stride, tracker);
+	}
+
+	for (const auto& slot: gs_map.slots) {
+		if (!slot.from_ring) {
+			plan.constants.push_back(slot);
+			continue;
+		}
+		const auto stored = std::any_of(plan.stores.begin(), plan.stores.end(),
+		                                [&slot](const WriteToSliceStore& store) {
+			                                return store.ring_offset == slot.ring_offset;
+		                                });
+		if (!stored) {
+			plan.reject_reason =
+			    fmt::format("ring offset {} is exported but never stored", slot.ring_offset);
+			plan.stores.clear();
+			plan.constants.clear();
+			return plan;
+		}
+	}
+
+	plan.lowerable = true;
+	return plan;
+}
+
 std::string WriteToSliceMapToString(const WriteToSliceMap& map) {
 	if (!map.lowerable) {
 		return fmt::format("; writetoslice: not lowerable ({})\n",
@@ -360,6 +470,24 @@ std::string WriteToSliceMapToString(const WriteToSliceMap& map) {
 			text += fmt::format(";   const 0x{:08x} -> {}.{}\n", slot.constant,
 			                    TargetName(slot.target), "xyzw"[slot.component]);
 		}
+	}
+	return text;
+}
+
+std::string WriteToSlicePlanToString(const WriteToSlicePlan& plan) {
+	if (!plan.lowerable) {
+		return fmt::format("; writetoslice: pair not lowerable ({})\n",
+		                   plan.reject_reason.empty() ? "unknown" : plan.reject_reason);
+	}
+	std::string text = fmt::format("; writetoslice: ring stride {} bytes, {} stores\n",
+	                               plan.ring_stride, plan.stores.size());
+	for (const auto& store: plan.stores) {
+		text += fmt::format(";   pc 0x{:08x} ring+{:<3} -> {}.{}\n", store.pc, store.ring_offset,
+		                    TargetName(store.target), "xyzw"[store.component]);
+	}
+	for (const auto& slot: plan.constants) {
+		text += fmt::format(";   const 0x{:08x}      -> {}.{}\n", slot.constant,
+		                    TargetName(slot.target), "xyzw"[slot.component]);
 	}
 	return text;
 }

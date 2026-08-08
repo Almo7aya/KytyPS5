@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "common/stringUtils.h"
+#include "graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.h"
 #include "graphics/shader/recompiler/ir/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -33,6 +34,10 @@ struct CompileOptions {
 	const ShaderVertexInputInfo*  vertex_input_info    = nullptr;
 	const ShaderPixelInputInfo*   pixel_input_info     = nullptr;
 	const ShaderComputeInputInfo* compute_input_info   = nullptr;
+	// Set when this stage is the vertex half of a passthrough ES+GS pair, in which case the ESGS ring
+	// round-trip is elided and the ring stores become exports. Derived from the geometry stage, which
+	// is not compiled at all - see WriteToSliceAnalysis.
+	const Decoder::WriteToSliceMap* write_to_slice_map = nullptr;
 };
 
 struct CompileResult {

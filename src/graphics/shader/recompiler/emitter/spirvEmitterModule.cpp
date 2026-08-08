@@ -218,6 +218,9 @@ void AllocateOutputVariables(EmitterState& state) {
 				binding.variable_id =
 				    AllocateSharedOutputVariable(state, state.sample_mask_variable);
 				break;
+			case IR::StageOutputKind::Layer:
+				binding.variable_id = AllocateSharedOutputVariable(state, state.layer_variable);
+				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt:
 				binding.variable_id = AllocateInterfaceVariable(state);
@@ -293,6 +296,11 @@ void AddOutputAnnotationsAndNames(EmitterState& state) {
 		state.builder.AddName(state.sample_mask_variable, "gl_SampleMask");
 		state.builder.AddAnnotation(
 		    {OpDecorate, state.sample_mask_variable, DecorationBuiltIn, BuiltInSampleMask});
+	}
+	if (state.layer_variable != 0) {
+		state.builder.AddName(state.layer_variable, "gl_Layer");
+		state.builder.AddAnnotation(
+		    {OpDecorate, state.layer_variable, DecorationBuiltIn, BuiltInLayer});
 	}
 	for (const auto& binding: state.outputs) {
 		if (binding.kind == IR::StageOutputKind::Parameter ||
@@ -504,6 +512,11 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddCapability({CapabilityComputeDerivativeGroupQuadsKHR});
 		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");
 	}
+	if (state.layer_variable != 0) {
+		// Reading Layer in a fragment shader is core; writing it from the vertex stage is not.
+		state.builder.AddCapability({CapabilityShaderViewportIndexLayerEXT});
+		state.builder.AddExtension("SPV_EXT_shader_viewport_index_layer");
+	}
 	state.builder.AddExtInstImport(state.glsl_std450, "GLSL.std.450");
 	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.stage), state.main_func, "main",
@@ -651,6 +664,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.depth_variable != 0) {
 		state.builder.AddType(
 		    {OpVariable, state.ptr_output_float, state.depth_variable, StorageClassOutput});
+	}
+	if (state.layer_variable != 0) {
+		state.builder.AddType(
+		    {OpVariable, state.ptr_output_int, state.layer_variable, StorageClassOutput});
 	}
 	if (state.sample_mask_variable != 0) {
 		state.builder.AddType(

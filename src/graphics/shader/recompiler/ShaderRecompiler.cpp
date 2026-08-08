@@ -14,6 +14,7 @@
 #include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/SrtPatcher.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/WriteToSliceLowering.h"
 
 #include <algorithm>
 #include <array>
@@ -743,6 +744,16 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	if (options.write_to_slice_map != nullptr) {
+		// The geometry stage is never compiled: it says where each ring dword lands, and the vertex
+		// stage's own stores are rewritten into those exports. Rejection here is not a failure - the
+		// pair simply keeps its ring stores, which write to LDS nothing then reads.
+		const auto plan = Decoder::PlanWriteToSlice(decoded, *options.write_to_slice_map);
+		const auto stats = IR::LowerWriteToSlice(ir, plan);
+		LOGF("%s writetoslice: %s stores=%" PRIu32 " constants=%" PRIu32 "\n", GetDumpLabel(options),
+		     plan.lowerable ? "lowered" : plan.reject_reason.c_str(), stats.rewritten_stores,
+		     stats.constant_exports);
+	}
 	EmbeddedFetchData embedded_fetch;
 	if (options.stage == ShaderType::Vertex && options.vertex_input_info != nullptr &&
 	    options.vertex_input_info->fetch_embedded) {

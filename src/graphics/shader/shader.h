@@ -30,6 +30,10 @@ struct Program;
 struct ResourceSnapshot;
 } // namespace ShaderRecompiler::IR
 
+namespace ShaderRecompiler::Decoder {
+struct WriteToSliceMap;
+} // namespace ShaderRecompiler::Decoder
+
 struct ShaderStageRuntime {
 	std::shared_ptr<const ShaderRecompiler::IR::Program>          program;
 	std::shared_ptr<const ShaderRecompiler::IR::ResourceSnapshot> resources;
@@ -221,6 +225,10 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Recorded once at device creation. Writing gl_Layer from a vertex shader is a Vulkan 1.2 feature,
+// and without it a volume-rasterizing pair cannot be lowered at all - so it must be classified as
+// unlowerable rather than compiled into SPIR-V the device will reject.
+void ShaderSetOutputLayerSupported(bool supported);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
@@ -250,6 +258,11 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
+// The ring-offset -> export map for an ES/GS pair that rasterizes into a volume, or nullptr when the
+// pair is not that pattern. Decided from the ISA, not from register bits, and cached per address
+// pair because deciding it means decoding both stages. Disabled by KYTY_NO_WRITETOSLICE.
+const ShaderRecompiler::Decoder::WriteToSliceMap* ShaderWriteToSliceMap(uint64_t es_addr,
+                                                                       uint64_t gs_addr);
 // Writes the raw guest words of an ES/GS pair that the draw path declined to compile, so the pair
 // can be disassembled offline. Runs once per process and never invokes the recompiler.
 void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr);

@@ -361,6 +361,21 @@ void EmitVertexInputRegisters(EmitterState& state) {
 		state.builder.AddFunction({OpStore, instance_index,
 		                           EmitInputScalarU32(state, IR::StageInputKind::InstanceIndex)});
 	}
+
+	// s3 is NGG merged-wave info. Kyty's user data starts at s8, so s0-s7 are otherwise zero - and a
+	// WriteToSlice vertex stage opens by deriving EXEC from the ES vertex count in bits 6:0, which at
+	// zero leaves EXEC empty. Every store is then skipped and the whole lowering reads as a no-op.
+	//
+	// One is the count to seed, not the wave size. After lowering there is exactly one vertex per
+	// invocation and the mask is consumed as a per-invocation predicate, so one is what is true here;
+	// 64 would be worse than wrong, because EmitBitFieldMaskU64 masks the width to six bits and it
+	// would arrive as zero - reproducing the empty EXEC this exists to avoid.
+	if (state.program.write_to_slice_lowered) {
+		const auto merged_wave_info = PointerForRegister(state, {IR::RegisterFile::Scalar, 3});
+		if (merged_wave_info != 0) {
+			state.builder.AddFunction({OpStore, merged_wave_info, ConstantU32(state, 1)});
+		}
+	}
 }
 
 void EmitInstruction(EmitterState& state, const IR::Instruction& inst) {

@@ -501,7 +501,18 @@ static bool ShouldSkipGeShader(const RenderCommandBuffer& buffer) {
 	    !is_known_gs_out_prim_type(sh_regs.m_vgtGsOutPrimType) ||
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
-	if (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs) {
+	// A pair that rasterizes into a volume is rejected by every one of the gates above, because it is
+	// a real ES+GS with a real geometry stage. It is nonetheless drawable: its geometry stage is a
+	// strict passthrough, so the pair is semantically an instanced vertex shader and the recompiler
+	// elides the ring rather than executing the geometry stage. That is decided from the ISA of both
+	// stages, which is the only test precise enough not to catch another title's real geometry
+	// shader, and it is cached per address pair.
+	const bool write_to_slice =
+	    ShaderWriteToSliceMap(vertex_info.es_regs.data_addr, vertex_info.gs_regs.data_addr) !=
+	    nullptr;
+
+	if (!write_to_slice &&
+	    (unsupported_stage_mask || unsupported_gs_stage || ge_group_size || ge_shader_regs)) {
 		// A dropped ES/GS pair is the producer of whatever this draw was meant to write. Capture its
 		// guest words once so the pair can be disassembled offline and the reason it is unsupported
 		// can be read from the ISA rather than inferred from these register bits.

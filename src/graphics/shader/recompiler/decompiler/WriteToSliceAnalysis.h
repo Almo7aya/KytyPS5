@@ -39,11 +39,37 @@ struct WriteToSliceMap {
 	std::string                   reject_reason;
 };
 
+// The vertex stage's side of the same pattern: which of its ring stores produces which export
+// component. Identified by the store's pc and byte offset, because those are what survive into the
+// IR - LowerDsWrite2 splits a paired store into single-dword stores that each keep the pc of the
+// encoded instruction and carry their byte offset in MemoryInfo::offset. Matching on that pair means
+// the lowering never has to re-derive addresses in IR terms.
+struct WriteToSliceStore {
+	uint32_t           pc          = 0;
+	uint32_t           ring_offset = 0;
+	WriteToSliceTarget target      = WriteToSliceTarget::Position0;
+	uint32_t           component   = 0;
+};
+
+struct WriteToSlicePlan {
+	bool                           lowerable   = false;
+	uint32_t                       ring_stride = 0;
+	std::vector<WriteToSliceStore> stores;
+	std::vector<WriteToSliceSlot>  constants; // the components the geometry stage materialized itself
+	std::string                    reject_reason;
+};
+
 // Derives the ring-offset -> export-component map for a passthrough geometry shader, or reports why
 // the shader is not one. Never asserts: an unrecognised shader is a rejection, not a failure.
 [[nodiscard]] WriteToSliceMap AnalyzePassthroughGs(const Program& gs);
 
+// Pairs that map with the vertex stage's own ring stores. Rejects unless every ring-fed export
+// component has a store behind it - an export left unwritten would read whatever the output variable
+// happened to hold, which is a silently wrong image rather than a visible failure.
+[[nodiscard]] WriteToSlicePlan PlanWriteToSlice(const Program& es, const WriteToSliceMap& gs_map);
+
 [[nodiscard]] std::string WriteToSliceMapToString(const WriteToSliceMap& map);
+[[nodiscard]] std::string WriteToSlicePlanToString(const WriteToSlicePlan& plan);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 

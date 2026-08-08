@@ -555,6 +555,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
 	features12.timelineSemaphore = VK_TRUE;
+	// A volume-rasterizing ES+GS pair lowers to a vertex shader that writes the slice index to
+	// gl_Layer. Requested rather than required: without it the pair simply stays skipped.
+	features12.shaderOutputLayer         = supported_features12.shaderOutputLayer;
+	graphics.shader_output_layer_enabled = supported_features12.shaderOutputLayer == VK_TRUE;
+	ShaderSetOutputLayerSupported(graphics.shader_output_layer_enabled);
+	LOGF("Vulkan shaderOutputLayer: %s\n",
+	     graphics.shader_output_layer_enabled ? "enabled" : "unsupported");
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;

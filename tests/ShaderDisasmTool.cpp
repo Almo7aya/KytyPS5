@@ -10,6 +10,7 @@
 // the in-process dumper never calls the decoder itself.
 //
 //   shader_disasm <file.bin> [more.bin ...]
+//   shader_disasm --writetoslice <es.bin> <gs.bin>
 
 #include "graphics/shader/recompiler/decompiler/ShaderDecoder.h"
 #include "graphics/shader/recompiler/decompiler/WriteToSliceAnalysis.h"
@@ -71,11 +72,44 @@ int Disassemble(const char* path) {
 	return 0;
 }
 
+// The pair is what the lowering consumes, and only the pair can be checked: the geometry stage says
+// where each ring dword lands, and the vertex stage says which store puts it there. Either alone
+// looks fine while the two disagree.
+int PlanPair(const char* es_path, const char* gs_path) {
+	std::vector<uint32_t> es_words;
+	std::vector<uint32_t> gs_words;
+	if (!ReadWords(es_path, es_words) || !ReadWords(gs_path, gs_words)) {
+		return 1;
+	}
+
+	namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+
+	Decoder::Program es;
+	Decoder::Program gs;
+	// The decode result is deliberately ignored here for the reason given in Disassemble.
+	Decoder::DecodeProgram(es_words, es, nullptr);
+	Decoder::DecodeProgram(gs_words, gs, nullptr);
+
+	std::printf("; es %s, gs %s\n", es_path, gs_path);
+	const auto map = Decoder::AnalyzePassthroughGs(gs);
+	std::printf("%s", Decoder::WriteToSliceMapToString(map).c_str());
+	std::printf("%s", Decoder::WriteToSlicePlanToString(Decoder::PlanWriteToSlice(es, map)).c_str());
+	return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+	if (argc >= 2 && std::string(argv[1]) == "--writetoslice") {
+		if (argc != 4) {
+			std::printf("usage: shader_disasm --writetoslice <es.bin> <gs.bin>\n");
+			return 2;
+		}
+		return PlanPair(argv[2], argv[3]);
+	}
 	if (argc < 2) {
-		std::printf("usage: shader_disasm <file.bin> [more.bin ...]\n");
+		std::printf("usage: shader_disasm <file.bin> [more.bin ...]\n"
+		            "       shader_disasm --writetoslice <es.bin> <gs.bin>\n");
 		return 2;
 	}
 	int status = 0;

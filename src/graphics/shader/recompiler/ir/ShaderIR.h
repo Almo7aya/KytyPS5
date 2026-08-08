@@ -149,6 +149,10 @@ struct ExportInfo {
 	bool             done   = false;
 	bool             compr  = false;
 	bool             vm     = false;
+	// A hardware export writes a whole vec4, defaulting whatever `en` leaves out. Set this when an
+	// export is one of several that together make up a single hardware export, so that it writes only
+	// its enabled components and leaves the rest for its siblings.
+	bool component_store = false;
 
 	bool operator==(const ExportInfo& other) const = default;
 };
@@ -351,7 +355,7 @@ enum class StageInputKind {
 	Parameter,
 };
 
-enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask };
+enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask, Layer };
 
 struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
@@ -469,6 +473,10 @@ struct Program {
 	bool                    shader_info_complete       = false;
 	BindingLayout           bindings;
 	bool                    binding_layout_complete = false;
+	// This stage is the vertex half of a passthrough ES+GS pair whose ESGS ring round-trip has been
+	// elided. It still reads the NGG merged-wave info the hardware would have supplied, so the
+	// emitter has to seed it - see EmitVertexInputRegisters.
+	bool write_to_slice_lowered = false;
 };
 
 bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,

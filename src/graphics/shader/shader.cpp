@@ -24,8 +24,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -156,6 +158,15 @@ static constexpr uint32_t ShaderMaxPermutationsPerProgram = 64;
 
 static std::span<const uint32_t> MakeShaderSpirvView(const std::vector<uint32_t>& spirv) {
 	return {spirv.data(), spirv.size()};
+}
+
+// A vertex stage's user data lives in the GS user-SGPR block, but EsStageRegisters carries no count
+// of its own and SPI_SHADER_PGM_RSRC2_GS.USER_SGPR describes the geometry half - which is zero for a
+// pair whose geometry stage is never launched. Fall back to how many words the guest actually wrote,
+// or the window is empty and nothing the shader reads resolves.
+static uint32_t VertexUserSgprCount(const HW::VertexShaderInfo& regs) {
+	const auto declared = static_cast<uint32_t>(regs.gs_regs.rsrc2.user_sgpr);
+	return declared != 0 ? declared : regs.gs_user_sgpr.count;
 }
 
 void ShaderInit() {
@@ -778,7 +789,7 @@ static bool ShaderGetStaticInputInfoVS(const HW::VertexShaderInfo& regs,
 
 	uint64_t                shader_addr   = regs.es_regs.data_addr;
 	const HW::UserSgprInfo& user_sgpr     = regs.gs_user_sgpr;
-	auto                    user_sgpr_num = regs.gs_regs.rsrc2.user_sgpr;
+	auto                    user_sgpr_num = VertexUserSgprCount(regs);
 	ShaderMappedData        data;
 	if (!ShaderGetMappedData(shader_addr, data)) {
 		LOGF("ShaderGetInputInfoVS(): shader=0x%016" PRIx64 " is missing from ShaderMap\n",
@@ -952,7 +963,7 @@ static bool TryUseVertexPermutation(const ShaderProgramPermutation& permutation,
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(
 	        permutation.program,
-	        std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr),
+	        std::span<const uint32_t>(regs.gs_user_sgpr.value, VertexUserSgprCount(regs)),
 	        regs.es_regs.data_addr, info.stage, &error)) {
 		return LogPermutationMismatch(permutation, "VS", shader_hash, error);
 	}
@@ -1424,11 +1435,15 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	options.shader_hash          = regs.gs_regs.chksum;
 	options.shader_base          = shader_addr;
 	options.user_data_base       = 8;
-	options.user_data_count      = regs.gs_regs.rsrc2.user_sgpr;
+	options.user_data_count      = VertexUserSgprCount(regs);
 	options.user_data            = regs.gs_user_sgpr.value;
 	options.descriptor_set       = 0;
 	options.push_constant_offset = 0;
 	options.vertex_input_info    = &input_info;
+	// Non-null only for a volume-rasterizing ES+GS pair, in which case the geometry stage is not
+	// compiled at all - its exports become the vertex stage's, and the ring between them disappears.
+	options.write_to_slice_map =
+	    ShaderWriteToSliceMap(regs.es_regs.data_addr, regs.gs_regs.data_addr);
 	options.dump_ir              = ShaderRecompilerTextDumpEnabled();
 	options.early_dump           = options.dump_ir;
 	options.dump_label           = "ShaderRecompiler VS";
@@ -1582,6 +1597,11 @@ ShaderId ShaderGetIdVS(const HW::VertexShaderInfo& regs, const ShaderVertexInput
 	ret.ids.push_back(static_cast<uint32_t>(input_info.fetch_embedded));
 	ret.ids.push_back(input_info.resources_num);
 	ret.ids.push_back(input_info.export_count);
+	// The hash is the ES program's, but the exports it ends up with come from the geometry stage it
+	// is paired with. Two draws sharing a vertex stage across different pairings must not share a
+	// compiled program.
+	ret.ids.push_back(static_cast<uint32_t>(regs.gs_regs.data_addr & 0xffffffffu));
+	ret.ids.push_back(static_cast<uint32_t>((regs.gs_regs.data_addr >> 32u) & 0xffffffffu));
 
 	for (int i = 0; i < input_info.resources_num; i++) {
 		const auto& r  = input_info.resources[i];
@@ -1717,6 +1737,79 @@ ShaderId ShaderGetIdCS(const HW::ComputeShaderInfo& regs, const ShaderComputeInp
 
 bool ShaderAddressValid(uint64_t addr) {
 	return reinterpret_cast<const uint32_t*>(addr) != nullptr;
+}
+
+// Whether a pair is the WriteToSlice pattern is decided from the ISA - the geometry stage has to
+// analyse as a strict passthrough and the vertex stage has to have a store behind every export
+// component it feeds. Register bits cannot make that distinction, and getting it wrong means
+// mangling some other title's real geometry shader.
+//
+// Deciding it costs decoding both stages, which is far too expensive per draw and depends only on
+// the code, so the answer is cached against the pair of addresses.
+struct WriteToSliceEntry {
+	ShaderRecompiler::Decoder::WriteToSliceMap map;
+	bool                                       lowerable = false;
+};
+
+static std::map<std::pair<uint64_t, uint64_t>, WriteToSliceEntry> g_write_to_slice_cache;
+static std::mutex                                                 g_write_to_slice_cache_mutex;
+static std::atomic<bool>                                          g_shader_output_layer_supported {
+    false};
+
+void ShaderSetOutputLayerSupported(bool supported) {
+	g_shader_output_layer_supported.store(supported, std::memory_order_relaxed);
+}
+
+// Presence-only, so KYTY_NO_WRITETOSLICE=0 still disables. Cost when set: the colour-grading LUT
+// stays unwritten and the neutral substitution in the texture cache takes over again.
+static bool WriteToSliceDisabled() {
+	static const bool disabled = std::getenv("KYTY_NO_WRITETOSLICE") != nullptr;
+	return disabled;
+}
+
+static bool ShaderReadGuestProgram(uint64_t addr, ShaderRecompiler::Decoder::Program& program) {
+	ShaderMappedData data;
+	if (!ShaderGetMappedData(addr, data) || data.code_size_bytes == 0 ||
+	    data.code_size_bytes % sizeof(uint32_t) != 0) {
+		return false;
+	}
+	// The decode result is deliberately not consulted: the AGC size covers s_code_end padding and a
+	// trailing metadata blob, so decoding always walks off the end of a good program and reports a
+	// failure. The analysis stops at the first terminator instead.
+	ShaderRecompiler::Decoder::DecodeProgram(
+	    std::span<const uint32_t>(reinterpret_cast<const uint32_t*>(addr),
+	                              data.code_size_bytes / sizeof(uint32_t)),
+	    program, nullptr);
+	return true;
+}
+
+const ShaderRecompiler::Decoder::WriteToSliceMap* ShaderWriteToSliceMap(uint64_t es_addr,
+                                                                       uint64_t gs_addr) {
+	if (WriteToSliceDisabled() ||
+	    !g_shader_output_layer_supported.load(std::memory_order_relaxed) || es_addr == 0 ||
+	    gs_addr == 0 || es_addr == gs_addr || !ShaderAddressValid(es_addr) ||
+	    !ShaderAddressValid(gs_addr)) {
+		return nullptr;
+	}
+
+	std::scoped_lock lock(g_write_to_slice_cache_mutex);
+
+	const auto key   = std::make_pair(es_addr, gs_addr);
+	auto       found = g_write_to_slice_cache.find(key);
+	if (found == g_write_to_slice_cache.end()) {
+		WriteToSliceEntry                  entry;
+		ShaderRecompiler::Decoder::Program es;
+		ShaderRecompiler::Decoder::Program gs;
+		if (ShaderReadGuestProgram(es_addr, es) && ShaderReadGuestProgram(gs_addr, gs)) {
+			entry.map        = ShaderRecompiler::Decoder::AnalyzePassthroughGs(gs);
+			const auto plan  = ShaderRecompiler::Decoder::PlanWriteToSlice(es, entry.map);
+			entry.lowerable  = plan.lowerable;
+			LOGF("WriteToSlice es=0x%016" PRIx64 " gs=0x%016" PRIx64 ": %s\n", es_addr, gs_addr,
+			     plan.lowerable ? "lowerable" : plan.reject_reason.c_str());
+		}
+		found = g_write_to_slice_cache.emplace(key, std::move(entry)).first;
+	}
+	return found->second.lowerable ? &found->second.map : nullptr;
 }
 
 void ShaderDumpSkippedGeShader(uint64_t es_addr, uint64_t gs_addr) {

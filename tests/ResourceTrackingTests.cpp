@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/SrtPatcher.h"
 #include "graphics/shader/recompiler/ir/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/WriteToSliceLowering.h"
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
@@ -1898,6 +1899,92 @@ void TestTextureNullDescriptorUsesAddressBits() {
 	Check(!texture.IsNull(), "nonzero image base address was classified as null");
 }
 
+Instruction RingStore(uint32_t pc, uint32_t byte_offset, uint32_t data_vgpr) {
+	Instruction inst;
+	inst.pc                = pc;
+	inst.op                = Opcode::DsWriteB32;
+	inst.dst.kind          = OperandKind::Null;
+	inst.src_count         = 2;
+	inst.src[0].kind       = OperandKind::Register;
+	inst.src[0].reg.file   = RegisterFile::Vector;
+	inst.src[0].reg.index  = data_vgpr;
+	inst.src[1]            = Sgpr(0);
+	inst.memory.kind       = ResourceKind::Lds;
+	inst.memory.offset     = byte_offset;
+	inst.memory.data_bits  = 32;
+	return inst;
+}
+
+const Instruction* FindExport(const Program& program, ExportTargetKind kind, uint32_t index,
+                              uint32_t component) {
+	for (const auto& block: program.blocks) {
+		for (const auto& inst: block.instructions) {
+			if (inst.op == Opcode::Export && inst.export_info.kind == kind &&
+			    inst.export_info.index == index && inst.export_info.en == (1u << component)) {
+				return &inst;
+			}
+		}
+	}
+	return nullptr;
+}
+
+void TestWriteToSliceLowersRingStoresToComponentExports() {
+	Program program;
+	program.stage = ShaderType::Vertex;
+	program.blocks.emplace_back();
+	// The shape the vertex stage really has: paired stores share one pc, and an LDS store that is not
+	// part of the ring has to survive untouched.
+	program.blocks[0].instructions = {RingStore(0x100, 0, 6), RingStore(0x100, 4, 9),
+	                                  RingStore(0x108, 24, 7), RingStore(0x200, 64, 3)};
+
+	Decoder::WriteToSlicePlan plan;
+	plan.lowerable   = true;
+	plan.ring_stride = 28;
+	plan.stores      = {{0x100, 0, Decoder::WriteToSliceTarget::Parameter0, 0},
+	                    {0x100, 4, Decoder::WriteToSliceTarget::Parameter0, 1},
+	                    {0x108, 24, Decoder::WriteToSliceTarget::Position1, 2}};
+	plan.constants   = {{Decoder::WriteToSliceTarget::Parameter0, 3, false, 0, 0x3f800000}};
+
+	const auto stats = LowerWriteToSlice(program, plan);
+	Check(stats.rewritten_stores == 3 && stats.constant_exports == 1,
+	      "ring stores were not all rewritten");
+	Check(program.write_to_slice_lowered, "lowering did not mark the program");
+
+	const auto& instructions = program.blocks[0].instructions;
+	Check(instructions.size() == 5, "lowering changed the instruction count unexpectedly");
+	Check(instructions[4].op == Opcode::DsWriteB32 && instructions[4].memory.offset == 64,
+	      "an LDS store outside the ring map was rewritten");
+
+	const auto* param_x = FindExport(program, ExportTargetKind::Parameter, 0, 0);
+	const auto* layer   = FindExport(program, ExportTargetKind::Position, 1, 2);
+	const auto* constant = FindExport(program, ExportTargetKind::Parameter, 0, 3);
+	Check(param_x != nullptr && param_x->export_info.component_store &&
+	          param_x->src[0].reg.index == 6,
+	      "PARAM0.x did not take the value of its ring store");
+	Check(layer != nullptr && layer->src_count == 3 && layer->src[2].reg.index == 7,
+	      "POS1.z did not take the value of its ring store");
+	Check(constant != nullptr && constant->src[3].kind == OperandKind::ImmediateU32 &&
+	          constant->src[3].imm == 0x3f800000,
+	      "a geometry-stage constant was not materialized");
+}
+
+void TestWriteToSliceRejectionLeavesTheProgramAlone() {
+	Program program;
+	program.stage                  = ShaderType::Vertex;
+	program.blocks.emplace_back();
+	program.blocks[0].instructions = {RingStore(0x100, 0, 6)};
+	const auto before              = program.blocks[0].instructions;
+
+	Decoder::WriteToSlicePlan plan;
+	plan.reject_reason = "ring offset 8 is exported but never stored";
+	plan.stores        = {{0x100, 0, Decoder::WriteToSliceTarget::Parameter0, 0}};
+
+	const auto stats = LowerWriteToSlice(program, plan);
+	Check(stats.rewritten_stores == 0 && !program.write_to_slice_lowered &&
+	          program.blocks[0].instructions == before,
+	      "a rejected plan still rewrote the program");
+}
+
 } // namespace
 
 int main() {
@@ -1948,6 +2035,8 @@ int main() {
 		RUN(TestNativeBindingLayoutHonorsUserDataCount);
 		RUN(TestNativeBindingLayoutHonorsUserDataBase);
 		RUN(TestTextureNullDescriptorUsesAddressBits);
+		RUN(TestWriteToSliceLowersRingStoresToComponentExports);
+		RUN(TestWriteToSliceRejectionLeavesTheProgramAlone);
 		std::cout << "ResourceTrackingTests: all cases passed\n";
 		return 0;
 	} catch (const std::exception& e) {

@@ -146,6 +146,39 @@ void EmitMrtZExport(EmitterState& state, const IR::Instruction& inst) {
 	}
 }
 
+// POS1.z is the render-target array index. It is the one POS1-POS3 component that is modelled, and
+// it reaches the fragment stage as gl_Layer rather than as anything in gl_PerVertex.
+void EmitLayerExport(EmitterState& state, const IR::Instruction& inst) {
+	if (state.layer_variable == 0 || (inst.export_info.en & 0x4u) == 0 || inst.src_count <= 2u) {
+		return;
+	}
+	const auto raw   = EmitValueLoad(state, inst.src[2]);
+	const auto layer = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitcast, state.int_type, layer, raw});
+	state.builder.AddFunction({OpStore, state.layer_variable, layer});
+}
+
+// One hardware export lowered into several instructions: each writes only what its enable mask
+// names, so a later sibling cannot reset an earlier one's components to the vec4 defaults.
+void EmitComponentExport(EmitterState& state, const IR::Instruction& inst, uint32_t variable) {
+	const bool position = inst.export_info.kind == IR::ExportTargetKind::Position;
+	for (uint32_t component = 0; component < 4u; component++) {
+		if (((inst.export_info.en >> component) & 1u) == 0 || component >= inst.src_count) {
+			continue;
+		}
+		const auto value   = EmitFloatLoad(state, inst.src[component]);
+		const auto pointer = state.builder.AllocateId();
+		if (position) {
+			state.builder.AddFunction({OpAccessChain, state.ptr_output_float, pointer, variable,
+			                           ConstantU32(state, 0), ConstantU32(state, component)});
+		} else {
+			state.builder.AddFunction({OpAccessChain, state.ptr_output_float, pointer, variable,
+			                           ConstantU32(state, component)});
+		}
+		state.builder.AddFunction({OpStore, pointer, value});
+	}
+}
+
 void EmitExport(EmitterState& state, const IR::Instruction& inst) {
 	if (inst.export_info.kind == IR::ExportTargetKind::Null ||
 	    inst.export_info.kind == IR::ExportTargetKind::Primitive) {
@@ -161,8 +194,18 @@ void EmitExport(EmitterState& state, const IR::Instruction& inst) {
 		return;
 	}
 
+	if (inst.export_info.kind == IR::ExportTargetKind::Position && inst.export_info.index == 1) {
+		EmitLayerExport(state, inst);
+		return;
+	}
+
 	const auto variable = OutputVariableForExport(state, inst.export_info);
 	if (variable == 0) {
+		return;
+	}
+
+	if (inst.export_info.component_store) {
+		EmitComponentExport(state, inst, variable);
 		return;
 	}
 
