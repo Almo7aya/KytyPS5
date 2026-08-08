@@ -31,6 +31,48 @@ enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
+// A DCC fast clear is expressed by replicating one code byte across a surface's metadata. The four
+// constant-encoded codes carry the colour themselves and the hardware never consults
+// CB_COLOR#_CLEAR_WORD0/1 for them; DCC_CLEAR_CODE_REGISTER is the one encoding that does.
+// DCC_CODE_UNCOMPRESSED marks the surface as plain uncompressed data - what an initialise or a
+// decompress writes - and is not a clear.
+constexpr uint8_t DCC_CLEAR_CODE_0000     = 0x00;
+constexpr uint8_t DCC_CLEAR_CODE_0001     = 0x40;
+constexpr uint8_t DCC_CLEAR_CODE_1110     = 0x80;
+constexpr uint8_t DCC_CLEAR_CODE_1111     = 0xc0;
+constexpr uint8_t DCC_CLEAR_CODE_REGISTER = 0x20;
+constexpr uint8_t DCC_CODE_UNCOMPRESSED   = 0xff;
+
+// Maps a constant-encoded DCC clear code to its colour, and returns false for anything else -
+// including DCC_CLEAR_CODE_REGISTER, which needs the clear-word registers, and
+// DCC_CODE_UNCOMPRESSED, which must never become a clear.
+[[nodiscard]] inline bool DecodeDccConstantClear(uint8_t code, vk::ClearColorValue& color) {
+	const auto set = [&color](float rgb, float alpha) {
+		color.float32[0] = rgb;
+		color.float32[1] = rgb;
+		color.float32[2] = rgb;
+		color.float32[3] = alpha;
+	};
+	switch (code) {
+		case DCC_CLEAR_CODE_0000: set(0.0f, 0.0f); return true;
+		case DCC_CLEAR_CODE_0001: set(0.0f, 1.0f); return true;
+		case DCC_CLEAR_CODE_1110: set(1.0f, 0.0f); return true;
+		case DCC_CLEAR_CODE_1111: set(1.0f, 1.0f); return true;
+		default: return false;
+	}
+}
+
+// Metadata is filled a dword at a time, so a fill only encodes a clear code when its value is
+// byte-replicated.
+[[nodiscard]] inline constexpr bool DecodeDccFillCode(uint32_t fill, uint8_t& code) noexcept {
+	const auto value = static_cast<uint8_t>(fill);
+	if (fill != static_cast<uint32_t>(value) * 0x01010101u) {
+		return false;
+	}
+	code = value;
+	return true;
+}
+
 struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind               = ImageMetadataKind::None;

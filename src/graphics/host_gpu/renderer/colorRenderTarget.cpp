@@ -16,10 +16,47 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <limits>
 
 namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
+
+// CB_COLOR#_CLEAR_WORD0/1 hold the clear colour in the surface's own format. For a 64-bit format
+// that is two half pairs, which decoding as a packed 8888 pixel would turn into nonsense.
+static float ColorClearF16(uint32_t value) {
+	const uint32_t sign     = (value >> 15u) & 0x1u;
+	const uint32_t exponent = (value >> 10u) & 0x1fu;
+	const uint32_t mantissa = value & 0x3ffu;
+	const float    sign_mul = sign != 0 ? -1.0f : 1.0f;
+
+	if (exponent == 0) {
+		return mantissa == 0 ? sign_mul * 0.0f
+		                     : sign_mul * std::ldexp(static_cast<float>(mantissa), -24);
+	}
+	if (exponent == 0x1fu) {
+		return mantissa == 0 ? sign_mul * std::numeric_limits<float>::infinity()
+		                     : std::numeric_limits<float>::quiet_NaN();
+	}
+	return sign_mul *
+	       std::ldexp(static_cast<float>(0x400u | mantissa), static_cast<int>(exponent) - 25);
+}
+
+static bool DecodeColorClear(const HW::RenderTarget& rt, vk::Format format,
+                             vk::ClearColorValue& color) {
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		const uint32_t c0 = rt.clear_word0.word0;
+		const uint32_t c1 = rt.clear_word1.word1;
+		color.float32[0]  = ColorClearF16(c0);
+		color.float32[1]  = ColorClearF16(c0 >> 16u);
+		color.float32[2]  = ColorClearF16(c1);
+		color.float32[3]  = ColorClearF16(c1 >> 16u);
+		return true;
+	}
+	// Everything four bytes and under packs entirely into word0.
+	return DecodePackedColorClear(format, rt.clear_word0.word0, color);
+}
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
@@ -106,11 +143,9 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		}
 	}
 
-	// CB_COLOR_CONTROL describes the color-buffer operation / ROP3 logic op.
-	// ROP3 Copy is the normal color write path, not a render-target clear.
-	// SRGB clear words are still encoded as normalized component values.
-	// Fast color clears are metadata driven and must be handled explicitly when
-	// that metadata path is implemented; render-pass load must preserve contents.
+	// CB_COLOR_CONTROL describes the color-buffer operation / ROP3 logic op. ROP3 Copy is the normal
+	// color write path, not a render-target clear. A fast clear is metadata driven, so the decision
+	// is deferred to AcquireRenderTargets, once the matching metadata fill has marked this surface.
 	r.color_clear_enable = false;
 	r.color_clear_value  = {};
 
@@ -294,6 +329,19 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
+	if (rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0) {
+		// Keep the DCC allocation only as logical fast-clear state - a size is neither derivable
+		// from these registers nor needed, since the guest's metadata fill targets the base address.
+		desc.info.metadata.range = {rt.dcc_addr.addr, 0};
+		desc.info.metadata.kind  = ImageMetadataKind::Dcc;
+		// The clear-word registers are meaningful only when the recorded code selects them; a
+		// constant-encoded code carries its colour in the metadata fill and leaves these at zero.
+		uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+		if (m_context.GetTextureCache().MetaClearCode(rt.dcc_addr.addr, clear_code) &&
+		    clear_code == DCC_CLEAR_CODE_REGISTER) {
+			(void)DecodeColorClear(rt, target_format.format, r.color_clear_value);
+		}
+	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {
 			const auto& mip             = volume_layout.mips[level];
@@ -340,7 +388,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 	r.samples                  = samples;
 	r.export_mapping           = target_format.export_mapping;
 	r.color_clear_enable       = false;
-	r.color_clear_value        = {};
+	// color_clear_value is deliberately not reset here: the DCC block above may have decoded the
+	// clear-word registers into it for the register-sourced clear code.
 	BindRenderTarget(r.image_id);
 }
 

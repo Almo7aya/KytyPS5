@@ -31,7 +31,6 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
-
 thread_local const TextureCache* g_locked_cache = nullptr;
 
 class CacheLock final {
@@ -252,7 +251,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
+	// Colour targets register DCC entries too, so this cannot stay HTile-only.
+	if (owner->info.HasMetadata()) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
 	UnregisterImage(id);
@@ -1357,6 +1357,12 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id, desc);
+	// Host images are decompressed, so the DCC allocation is kept purely as logical fast-clear
+	// state: registering it is what lets the guest's metadata fill become an attachment clear.
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+		image.info.metadata = desc.info.metadata;
+		m_surface_metas.try_emplace(desc.info.metadata.range.address, MetaDataInfo {});
+	}
 	CommitGpuWrite(image);
 	TrackImageDownloadLocked(id, image);
 	const auto view = image.FindView(desc.view_info);
@@ -1870,20 +1876,44 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
+	// The mask tracks 32 slices. Depth bounds its slice count upstream, but a colour target's
+	// base_layer does not, and shifting past the width is undefined: a slice with no tracked state
+	// simply reports uncleared, which loads the attachment.
+	if (slice >= 32) {
+		return false;
+	}
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
 	CacheLock  lock(*this, m_lock);
 	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_code = clear_code;
+	// An uncompressed code is a decompress or an initialise, never a clear colour, so it leaves the
+	// entry without a usable code rather than recording one.
+	found->second.clear_code_valid = clear_code != DCC_CODE_UNCOMPRESSED;
 	return true;
 }
 
+bool TextureCache::MetaClearCode(uint64_t address, uint8_t& clear_code) {
+	CacheLock  lock(*this, m_lock);
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || !found->second.clear_code_valid) {
+		return false;
+	}
+	clear_code = found->second.clear_code;
+	return true;
+}
+
+// See IsMetaCleared on the slice bound.
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
+	if (slice >= 32) {
+		return false;
+	}
 	CacheLock  lock(*this, m_lock);
 	const auto found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end()) {

@@ -586,8 +586,35 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment        = state.color_attachments[i];
 		attachment.image_view   = target.image_view;
 		attachment.image_layout = layout;
-		attachment.clear_value  = target.color_clear_value.uint32;
-		attachment.is_clear     = target.color_clear_enable;
+		attachment.clear_value      = target.color_clear_value.uint32;
+		const auto metadata_address = target.desc.info.metadata.range.address;
+		const bool metadata_clear   = target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		                            cache.IsMetaCleared(metadata_address, view.base_layer);
+		if (metadata_clear) {
+			// The code the guest replicated across the DCC allocation decides the clear: a
+			// constant-encoded code carries the colour itself, DCC_CLEAR_CODE_REGISTER defers to the
+			// clear-word registers decoded during resolve, and anything else - notably an
+			// uncompressed fill from an initialise or decompress - is not a clear, so the attachment
+			// keeps its contents.
+			uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+			if (cache.MetaClearCode(metadata_address, clear_code)) {
+				vk::ClearColorValue dcc_clear {};
+				if (DecodeDccConstantClear(clear_code, dcc_clear)) {
+					attachment.clear_value = dcc_clear.uint32;
+					attachment.is_clear    = true;
+				} else if (clear_code == DCC_CLEAR_CODE_REGISTER) {
+					attachment.clear_value = target.color_clear_value.uint32;
+					attachment.is_clear    = true;
+				}
+			}
+			// Consume the state either way: the guest issued the clear once, and leaving it pending
+			// would replay it on a later frame.
+			if (!cache.TouchMeta(metadata_address, view.base_layer, false)) {
+				EXIT("failed to consume DCC clear state\n");
+			}
+		} else {
+			attachment.is_clear = target.color_clear_enable;
+		}
 	}
 	if (depth.image_id) {
 		const auto owner = cache.ResolveOwner(depth.image_id);

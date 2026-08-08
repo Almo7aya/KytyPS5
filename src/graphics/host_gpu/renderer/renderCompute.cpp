@@ -23,6 +23,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -61,19 +62,52 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+	if (program.info.has_bitwise_xor) {
+		return false;
+	}
+
+	// Locate the metadata target before doing anything expensive. This function runs for every
+	// dispatch, and recovering the clear code reads guest backing, so that work must not happen on
+	// the overwhelming majority of dispatches that clear no metadata at all.
+	uint64_t meta_address = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (cache.IsMeta(descriptor.Base48())) {
+			meta_address = descriptor.Base48();
+			break;
 		}
 	}
-	return false;
+	if (meta_address == 0) {
+		return false;
+	}
+
+	// The dispatch splats one dword across the metadata, and that dword is the clear code - the only
+	// place the colour exists, since constant-encoded codes never reach CB_COLOR#_CLEAR_WORD0/1.
+	// The dispatch is consumed rather than executed, so the value has to be recovered before it is
+	// discarded.
+	//
+	// It arrives through a companion read-only buffer, and the guest value sits at that descriptor's
+	// base: the index the recompiled shader applies is only Kyty's own host alignment adjustment on
+	// top of guest offset 0. A DCC clear code is byte-replicated by construction, so the first
+	// byte-replicated dword among the read-only buffers identifies it. Narrowing this further only
+	// risks rejecting the real fill, which fails silently as "no clear at all".
+	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		uint32_t   value      = 0;
+		if (LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value)) &&
+		    DecodeDccFillCode(value, clear_code)) {
+			break;
+		}
+		clear_code = DCC_CODE_UNCOMPRESSED;
+	}
+	return cache.ClearMeta(meta_address, clear_code);
 }
 
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,
