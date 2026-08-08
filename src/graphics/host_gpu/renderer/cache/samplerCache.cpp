@@ -50,17 +50,16 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 
 	const bool aniso = is_aniso_filter(mag_filter) || is_aniso_filter(min_filter);
 	if (aniso) {
-		switch (static_cast<Prospero::SamplerAnisoRatio>(r.MaxAnisoRatio())) {
-			case Prospero::SamplerAnisoRatio::kOne: aniso_ratio = 1.0f; break;
-			case Prospero::SamplerAnisoRatio::kTwo: aniso_ratio = 2.0f; break;
-			case Prospero::SamplerAnisoRatio::kFour: aniso_ratio = 4.0f; break;
-			case Prospero::SamplerAnisoRatio::kEight: aniso_ratio = 8.0f; break;
-			case Prospero::SamplerAnisoRatio::kSixteen: aniso_ratio = 16.0f; break;
-			default:
-				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
-				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
-				     r.fields[3]);
-		}
+		// MAX_ANISO_RATIO is three bits, so the encoded domain is 0-7, but only 0-4 name a ratio
+		// (1x through 16x). This title programs 7 for its post-processing samplers. The hardware
+		// saturates at the maximum ratio for anything above 4 rather than treating the descriptor as
+		// invalid, so the exponent is bounded instead of the encoding being rejected - an unnamed
+		// encoding is not a malformed sampler.
+		//
+		// Device selection already requires maxSamplerAnisotropy >= 16, so the saturated value is
+		// always within the device limit.
+		const auto ratio = static_cast<uint32_t>(r.MaxAnisoRatio());
+		aniso_ratio      = static_cast<float>(1u << (ratio < 4u ? ratio : 4u));
 	}
 
 	const auto mip_filter = r.MipFilter();
