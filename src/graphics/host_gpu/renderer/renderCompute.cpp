@@ -46,6 +46,62 @@ static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	return stride == 0 ? records : records * stride;
 }
 
+// Resolves a store's data operand to a constant, or declines. An immediate is the value itself; a
+// register is followed back to the most recent move of an immediate into it within the same block.
+// Anything else declines rather than guessing - a wrong code paints a wrong clear colour over an
+// entire surface.
+static bool ResolveStoredConstant(const ShaderRecompiler::IR::BasicBlock& block, size_t store_index,
+                                  uint32_t& value) {
+	namespace IR       = ShaderRecompiler::IR;
+	const auto& source = block.instructions[store_index].src[0];
+	if (source.kind == IR::OperandKind::ImmediateU32) {
+		value = source.imm;
+		return true;
+	}
+	if (source.kind != IR::OperandKind::Register) {
+		return false;
+	}
+	for (size_t i = store_index; i-- > 0;) {
+		const auto& candidate = block.instructions[i];
+		if (candidate.dst.kind != IR::OperandKind::Register || !(candidate.dst.reg == source.reg)) {
+			continue;
+		}
+		if (candidate.op != IR::Opcode::MoveU32 ||
+		    candidate.src[0].kind != IR::OperandKind::ImmediateU32) {
+			return false;
+		}
+		value = candidate.src[0].imm;
+		return true;
+	}
+	return false;
+}
+
+// The dispatch splats one dword across the metadata, and that dword is the clear code. When it comes
+// from a companion read-only buffer the value sits at that descriptor's base, but a fill that needs
+// no source - which is exactly what a clear to zero is - materializes the value in the shader
+// instead. The dispatch is consumed rather than executed, so read it out of the recompiled program
+// before it is discarded. Every store into the metadata buffer has to agree, or this declines.
+static bool RecoverMetaFillFromProgram(const ShaderRecompiler::IR::Program& program,
+                                       uint32_t resource, uint32_t& fill) {
+	namespace IR = ShaderRecompiler::IR;
+	bool found   = false;
+	for (const auto& block: program.blocks) {
+		for (size_t i = 0; i < block.instructions.size(); i++) {
+			const auto& inst = block.instructions[i];
+			if (inst.op != IR::Opcode::BufferStoreDword || inst.memory.resource != resource) {
+				continue;
+			}
+			uint32_t value = 0;
+			if (!ResolveStoredConstant(block, i, value) || (found && value != fill)) {
+				return false;
+			}
+			fill  = value;
+			found = true;
+		}
+	}
+	return found;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const RenderCommandBuffer&    buffer) {
 	const auto& program   = *input.stage.program;
@@ -69,14 +125,16 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	// Locate the metadata target before doing anything expensive. This function runs for every
 	// dispatch, and recovering the clear code reads guest backing, so that work must not happen on
 	// the overwhelming majority of dispatches that clear no metadata at all.
-	uint64_t meta_address = 0;
+	uint64_t meta_address  = 0;
+	uint32_t meta_resource = 0;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;
 		}
 		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		if (cache.IsMeta(descriptor.Base48())) {
-			meta_address = descriptor.Base48();
+			meta_address  = descriptor.Base48();
+			meta_resource = i;
 			break;
 		}
 	}
@@ -106,6 +164,22 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 			break;
 		}
 		clear_code = DCC_CODE_UNCOMPRESSED;
+	}
+	// No companion buffer carried the value, so the shader materialized it. Without this the fill is
+	// recorded as uncompressed, which is not a clear - the attachment then loads its previous
+	// contents while the pending state is consumed, and the surface is never cleared again.
+	if (clear_code == DCC_CODE_UNCOMPRESSED) {
+		uint32_t fill = 0;
+		if (RecoverMetaFillFromProgram(program, meta_resource, fill) &&
+		    DecodeDccFillCode(fill, clear_code)) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("MetaClear: recovered fill code 0x%02" PRIx32 " from the shader\n",
+				     static_cast<uint32_t>(clear_code));
+			}
+		} else {
+			clear_code = DCC_CODE_UNCOMPRESSED;
+		}
 	}
 	return cache.ClearMeta(meta_address, clear_code);
 }
