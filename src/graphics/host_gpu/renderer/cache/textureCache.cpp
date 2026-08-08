@@ -19,6 +19,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -31,6 +32,90 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+constexpr uint32_t ColorGradingLutSize    = 32;
+
+// Unreal builds its combined colour-grading volume with a WriteToSlice geometry-shader pass that is
+// not executed yet, so the allocation keeps its zero initialization and the tonemapper - which
+// samples it on the way to the display - maps every scene colour to black. Substituting a neutral
+// curve keeps the frame viewable until that pass runs; once the guest writes the volume for real the
+// predicate stops matching and this retires itself.
+//
+// Identify the resource by format, shape and element size only. The volume occupies one 64 KiB
+// render-target tile per slice, so its guest allocation is far larger than the packed texel size and
+// any comparison against the latter would keep this from ever engaging.
+bool IsEmptyColorGradingLut(const ImageInfo& info) {
+	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+	    info.type != Prospero::ImageType::kColor3D ||
+	    info.extent !=
+	        vk::Extent3D {ColorGradingLutSize, ColorGradingLutSize, ColorGradingLutSize} ||
+	    info.resources.levels != 1 || info.resources.layers != 1 || info.samples != 1 ||
+	    info.bytes_per_block != sizeof(uint32_t) || info.data.Empty() ||
+	    info.data.size > std::numeric_limits<size_t>::max()) {
+		return false;
+	}
+	// Scan in chunks with an early exit rather than staging the whole allocation: a populated volume
+	// almost always fails within the first few bytes, and this runs on the upload path.
+	std::array<uint8_t, 4096> chunk {};
+	for (uint64_t offset = 0; offset < info.data.size;) {
+		const auto count = std::min<uint64_t>(info.data.size - offset, chunk.size());
+		if (!LibKernel::Memory::TryReadBacking(info.data.address + offset, chunk.data(), count)) {
+			return false;
+		}
+		if (std::any_of(chunk.data(), chunk.data() + count, [](uint8_t byte) { return byte != 0; })) {
+			return false;
+		}
+		offset += count;
+	}
+	return true;
+}
+
+// The LUT is addressed in Unreal's logarithmic scene-colour space, so the cube coordinate has to be
+// decoded back to linear before any tone curve applies. Handing the coordinate straight to a display
+// transform would crush ordinary scene values toward black - the very failure being fixed.
+float DecodeUnrealLogColor(float encoded) {
+	constexpr float LinearRange = 14.0f;
+	constexpr float LinearGrey  = 0.18f;
+	constexpr float LogGrey     = 444.0f / 1023.0f;
+	const float     black       = std::exp2(-LogGrey * LinearRange) * LinearGrey;
+	return std::max(std::exp2((encoded - LogGrey) * LinearRange) * LinearGrey - black, 0.0f);
+}
+
+// A neutral filmic highlight rolloff and the sRGB display transfer: no title-specific grading, only
+// what is needed to put scene colour on screen at a plausible brightness.
+float NeutralFilmicToSrgb(float linear) {
+	const float mapped = std::clamp(
+	    linear * (2.51f * linear + 0.03f) / (linear * (2.43f * linear + 0.59f) + 0.14f), 0.0f, 1.0f);
+	return mapped <= 0.0031308f ? mapped * 12.92f
+	                            : 1.055f * std::pow(mapped, 1.0f / 2.4f) - 0.055f;
+}
+
+std::vector<uint32_t> BuildNeutralColorGradingLut() {
+	// The curve is per-channel and identical on all three axes, so there are only 32 distinct
+	// results. Evaluating it per texel instead would run the transcendentals 98304 times to produce
+	// those same 32 numbers.
+	std::array<uint32_t, ColorGradingLutSize> ramp {};
+	for (uint32_t i = 0; i < ColorGradingLutSize; i++) {
+		const float encoded = static_cast<float>(i) / static_cast<float>(ColorGradingLutSize - 1u);
+		ramp[i] = static_cast<uint32_t>(
+		              std::lround(NeutralFilmicToSrgb(DecodeUnrealLogColor(encoded)) * 1023.0f)) &
+		          0x3ffu;
+	}
+
+	// The volume is indexed red-fastest, so with a power-of-two edge the three coordinates are simply
+	// bit fields of the linear index. A2B10G10R10_UNORM_PACK32 packs red at bits 0-9, green at
+	// 10-19, blue at 20-29, and a constant alpha at 30-31.
+	static_assert(ColorGradingLutSize == 32, "index decomposition below assumes a 32^3 volume");
+	constexpr uint32_t Mask = ColorGradingLutSize - 1u;
+
+	std::vector<uint32_t> lut(static_cast<size_t>(ColorGradingLutSize) * ColorGradingLutSize *
+	                          ColorGradingLutSize);
+	for (size_t i = 0; i < lut.size(); i++) {
+		lut[i] = ramp[i & Mask] | (ramp[(i >> 5u) & Mask] << 10u) |
+		         (ramp[(i >> 10u) & Mask] << 20u) | (3u << 30u);
+	}
+	return lut;
+}
+
 thread_local const TextureCache* g_locked_cache = nullptr;
 
 class CacheLock final {
@@ -1102,13 +1187,30 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	bool       data_imported = false;
 	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto source =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source.buffer == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		if (IsEmptyColorGradingLut(image.info)) {
+			auto       plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+			const auto lut  = BuildNeutralColorGradingLut();
+			const auto size = lut.size() * sizeof(uint32_t);
+			EXIT_NOT_IMPLEMENTED(!plan.valid ||
+			                     size != plan.layout.slice_stride * image.info.extent.depth);
+			const auto source = m_buffer_cache.UploadTransient(lut.data(), size, 16);
+			for (auto& copy: plan.regions) {
+				copy.bufferOffset += source.offset;
+			}
+			image.Upload(plan.regions, source.buffer, source.offset, size);
+			LOGF("TextureCache: substituted a neutral colour-grading LUT for the zero-filled volume "
+			     "at 0x%016" PRIx64 " (binding=%u tile=%u)\n",
+			     image.info.data.address, static_cast<uint32_t>(desc.type), image.info.tile_mode);
+			data_imported = true;
+		} else {
+			const auto source =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			if (source.buffer == nullptr) {
+				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			data_imported = true;
+			UploadImage(image, desc, *source.buffer, source.offset);
 		}
-		data_imported = true;
-		UploadImage(image, desc, *source.buffer, source.offset);
 	}
 	if (data_imported) {
 		image.ClearBufferModified();
