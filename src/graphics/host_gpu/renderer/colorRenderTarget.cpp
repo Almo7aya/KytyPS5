@@ -113,8 +113,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, rt.view.last_array_slice_index, render_target_slice_offset);
+	auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index,
+	                                  rt.view.last_array_slice_index, render_target_slice_offset);
 	switch (view.type) {
 		case TargetViewType::Image2D:
 		case TargetViewType::Image2DArray: break;
@@ -300,11 +300,27 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, RenderCommandB
 
 	const vk::Extent2D view_extent = {std::max(width >> rt.view.current_mip_level, 1u),
 	                                  std::max(height >> rt.view.current_mip_level, 1u)};
-	const uint32_t     view_depth  = std::max(depth >> rt.view.current_mip_level, 1u);
-	if (volume &&
-	    (view.base_layer >= view_depth || view.layer_count > view_depth - view.base_layer)) {
-		EXIT("3D render-target view exceeds mip depth: base=%u count=%u depth=%u mip=%u\n",
+	const uint32_t view_depth = std::max(depth >> rt.view.current_mip_level, 1u);
+	if (volume && view.base_layer >= view_depth) {
+		EXIT("3D render-target view starts past the mip depth: base=%u count=%u depth=%u mip=%u\n",
 		     view.base_layer, view.layer_count, view_depth, rt.view.current_mip_level);
+	}
+	// A volume view that runs one slice past the surface is not a malformed view - it is how this
+	// title programs CB_COLOR#_VIEW for a 3D target. For the 32-deep grading LUT it writes
+	// SLICE_MAX = 32, exactly the slice count, which reads as an exclusive bound where SLICE_MAX is
+	// inclusive everywhere else. Which convention the hardware applies to 3D targets is not settled
+	// here, so rather than reinterpret the field the range is clamped to the slices that exist:
+	// whichever reading is right, those are the only ones that can be written, and the clamp is a
+	// no-op for a view that is already in range. Logged once so the open question stays visible.
+	if (volume && view.layer_count > view_depth - view.base_layer) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("RenderColorTarget: clamping 3D view to the surface: slice_start=%u slice_max=%u "
+			     "count=%u depth=%u mip=%u\n",
+			     rt.view.base_array_slice_index, rt.view.last_array_slice_index, view.layer_count,
+			     view_depth, rt.view.current_mip_level);
+		}
+		view.layer_count = view_depth - view.base_layer;
 	}
 
 	auto decision_log_id = g_render_color_log_count.fetch_add(1);
