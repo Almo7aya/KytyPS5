@@ -12,9 +12,6 @@ endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
 
-# assert.cpp stamps the build label into crash reports.
-add_dependencies(common KytyGitVersion)
-
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
 	PRIVATE
@@ -27,6 +24,7 @@ target_link_libraries(common
 		Tracy::TracyClient
 	PRIVATE
 		cpuinfo
+		kyty_git_version
 		spdlog::spdlog
 )
 
