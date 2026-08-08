@@ -303,6 +303,31 @@ void EmitPixelFrontFacingRegister(EmitterState& state, uint32_t vgpr) {
 	state.builder.AddFunction({OpStore, dst, bits});
 }
 
+// The ancillary VGPR carries the render-target array index at bits 26:16. A pixel shader reads
+// SV_RenderTargetArrayIndex from here when no stage exported it as an interpolant, which is exactly
+// what the volume-rasterizing grading pass does - it reconstructs the blue axis of the LUT from the
+// slice index. Left unpopulated the shader reads zero, every slice grades as though blue were zero,
+// and blue dies across the whole image.
+//
+// Only the array-index field is modelled. The sample index and the rest of the register stay zero,
+// because nothing has been observed reading them.
+void EmitPixelAncillaryRegister(EmitterState& state, uint32_t vgpr) {
+	const auto input = InputVariableForKind(state, IR::StageInputKind::Layer);
+	const auto dst   = PointerForRegister(state, {IR::RegisterFile::Vector, vgpr});
+	if (input == 0 || dst == 0) {
+		return;
+	}
+
+	const auto layer   = state.builder.AllocateId();
+	const auto bits    = state.builder.AllocateId();
+	const auto shifted = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, state.int_type, layer, input});
+	state.builder.AddFunction({OpBitcast, state.uint_type, bits, layer});
+	state.builder.AddFunction(
+	    {OpShiftLeftLogical, state.uint_type, shifted, bits, ConstantU32(state, 16)});
+	state.builder.AddFunction({OpStore, dst, shifted});
+}
+
 void EmitPixelInputRegisters(EmitterState& state) {
 	if (state.stage != ShaderType::Pixel || state.pixel_input_info == nullptr) {
 		return;
@@ -330,6 +355,10 @@ void EmitPixelInputRegisters(EmitterState& state) {
 	}
 	if (ps->ps_front_face) {
 		EmitPixelFrontFacingRegister(state, reg);
+		reg++;
+	}
+	if (ps->ps_ancillary) {
+		EmitPixelAncillaryRegister(state, reg);
 	}
 }
 

@@ -239,6 +239,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::LocalInvocationId: return BuiltInLocalInvocationId;
 		case IR::StageInputKind::LocalInvocationIndex: return BuiltInLocalInvocationIndex;
 		case IR::StageInputKind::GlobalInvocationId: return BuiltInGlobalInvocationId;
+		case IR::StageInputKind::Layer: return BuiltInLayer;
 		default: return UINT32_MAX;
 	}
 }
@@ -275,6 +276,10 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 		if (builtin != UINT32_MAX) {
 			state.builder.AddAnnotation(
 			    {OpDecorate, input.variable_id, DecorationBuiltIn, builtin});
+		}
+		// An integer fragment input carries no interpolation, built-in or not.
+		if (state.stage == ShaderType::Pixel && input.kind == IR::StageInputKind::Layer) {
+			state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
 		}
 	}
 }
@@ -513,9 +518,15 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		state.builder.AddExtension("SPV_KHR_compute_shader_derivatives");
 	}
 	if (state.layer_variable != 0) {
-		// Reading Layer in a fragment shader is core; writing it from the vertex stage is not.
+		// Writing Layer from the vertex stage. CapabilityShaderLayer would be the plain one but it
+		// is SPIR-V 1.5, and this builder emits 1.3.
 		state.builder.AddCapability({CapabilityShaderViewportIndexLayerEXT});
 		state.builder.AddExtension("SPV_EXT_shader_viewport_index_layer");
+	}
+	// Reading Layer in a fragment shader is what the BuiltIn's own Geometry capability covers - there
+	// is no narrower one for the input side in SPIR-V 1.3.
+	if (InputVariableForKind(state, IR::StageInputKind::Layer) != 0) {
+		state.builder.AddCapability({CapabilityGeometry});
 	}
 	state.builder.AddExtInstImport(state.glsl_std450, "GLSL.std.450");
 	state.builder.AddMemoryModel({AddressingModelLogical, MemoryModelGLSL450});
@@ -614,7 +625,8 @@ void EmitHeaderAndTypes(EmitterState& state) {
 		uint32_t ptr_type = state.ptr_input_uint;
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
-			case IR::StageInputKind::InstanceIndex: ptr_type = state.ptr_input_int; break;
+			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::Layer: ptr_type = state.ptr_input_int; break;
 			case IR::StageInputKind::WorkgroupId:
 			case IR::StageInputKind::LocalInvocationId:
 			case IR::StageInputKind::GlobalInvocationId:

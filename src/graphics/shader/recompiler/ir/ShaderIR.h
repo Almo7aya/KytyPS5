@@ -353,6 +353,7 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	Layer,
 };
 
 enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask, Layer };

@@ -856,6 +856,7 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pos_z                     = (active_inputs & 0x00000400u) != 0;
 	ps_info.ps_pos_w                     = (active_inputs & 0x00000800u) != 0;
 	ps_info.ps_front_face                = (active_inputs & 0x00001000u) != 0;
+	ps_info.ps_ancillary                 = (active_inputs & 0x00002000u) != 0;
 	ps_info.ps_sample_shading            = (active_inputs & 0x00000011u) != 0;
 	ps_info.ps_no_perspective            = (sh.ps_input_ena & sh.ps_input_addr & 0x00000020u) != 0;
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
@@ -1295,6 +1296,7 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_pos_z             = %s\n"
 	     "\t ps_pos_w             = %s\n"
 	     "\t ps_front_face        = %s\n"
+	     "\t ps_ancillary         = %s\n"
 	     "\t ps_sample_shading    = %s\n"
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
@@ -1303,7 +1305,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     info.input_num, info.ps_system_input_base, info.ps_pos_x ? "true" : "false",
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
 	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
-	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
+	     info.ps_ancillary ? "true" : "false", info.ps_sample_shading ? "true" : "false",
+	     info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
 	     info.ps_execute_on_noop ? "true" : "false");
 
@@ -1662,6 +1665,7 @@ ShaderId ShaderGetIdPS(const HW::PixelShaderInfo& regs, const ShaderPixelInputIn
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_z));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pos_w));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_front_face));
+	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_ancillary));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_no_perspective));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_pixel_kill_enable));
 	ret.ids.push_back(static_cast<uint32_t>(input_info.ps_sample_mask_export_enable));
@@ -1756,7 +1760,7 @@ static std::mutex                                                 g_write_to_sli
 static std::atomic<bool>                                          g_shader_output_layer_supported {
     false};
 
-void ShaderSetOutputLayerSupported(bool supported) {
+void ShaderSetLayerRoutingSupported(bool supported) {
 	g_shader_output_layer_supported.store(supported, std::memory_order_relaxed);
 }
 

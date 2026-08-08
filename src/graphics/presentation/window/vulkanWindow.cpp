@@ -557,11 +557,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features12.timelineSemaphore = VK_TRUE;
 	// A volume-rasterizing ES+GS pair lowers to a vertex shader that writes the slice index to
 	// gl_Layer. Requested rather than required: without it the pair simply stays skipped.
-	features12.shaderOutputLayer         = supported_features12.shaderOutputLayer;
-	graphics.shader_output_layer_enabled = supported_features12.shaderOutputLayer == VK_TRUE;
-	ShaderSetOutputLayerSupported(graphics.shader_output_layer_enabled);
-	LOGF("Vulkan shaderOutputLayer: %s\n",
-	     graphics.shader_output_layer_enabled ? "enabled" : "unsupported");
+	features12.shaderOutputLayer = supported_features12.shaderOutputLayer;
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
@@ -580,6 +576,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.vertexPipelineStoresAndAtomics =
 	    supported_features2.features.vertexPipelineStoresAndAtomics;
+	// The pixel half of the same pattern reads the slice index back as gl_Layer, and in SPIR-V 1.3
+	// that BuiltIn's only input-side capability is Geometry.
+	device_features.geometryShader = supported_features2.features.geometryShader;
+
+	// Both halves have to be available or the pair must not be lowered at all: producing the volume
+	// without being able to read the slice index back grades every slice as though blue were zero,
+	// which is a worse image than leaving the substituted neutral LUT in place.
+	graphics.shader_output_layer_enabled = supported_features12.shaderOutputLayer == VK_TRUE &&
+	                                       supported_features2.features.geometryShader == VK_TRUE;
+	ShaderSetLayerRoutingSupported(graphics.shader_output_layer_enabled);
+	LOGF("Vulkan layer routing: shaderOutputLayer=%s geometryShader=%s\n",
+	     supported_features12.shaderOutputLayer == VK_TRUE ? "yes" : "no",
+	     supported_features2.features.geometryShader == VK_TRUE ? "yes" : "no");
 
 	if (graphics.subgroup_size_control_enabled &&
 	    supported_features13.subgroupSizeControl == VK_TRUE) {

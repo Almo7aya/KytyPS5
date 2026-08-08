@@ -47,6 +47,7 @@ enum : uint32_t {
 	// Writing Layer from a vertex stage needs a capability; CapabilityShaderLayer would be the plain
 	// one but it is SPIR-V 1.5, and this builder emits 1.3.
 	CapabilityShaderViewportIndexLayerEXT    = 5254,
+	CapabilityGeometry                       = 2,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
 	StorageClassOutput                       = 3,

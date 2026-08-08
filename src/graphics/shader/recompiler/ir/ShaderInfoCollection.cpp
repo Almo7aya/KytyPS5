@@ -124,6 +124,11 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	if (pixel->ps_ancillary) {
+		// The render-target array index is the only field of the ancillary register that is
+		// modelled, and it arrives as gl_Layer.
+		AddInput(info, StageInputKind::Layer, 0, 1, "gl_Layer");
+	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
 	}

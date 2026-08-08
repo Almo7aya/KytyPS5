@@ -114,6 +114,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_pos_z                     = false;
 	bool                                           ps_pos_w                     = false;
 	bool                                           ps_front_face                = false;
+	// The ancillary VGPR. Its only modelled field is the render-target array index at bits 26:16,
+	// which is how a pixel shader reads SV_RenderTargetArrayIndex when no stage exports it as an
+	// interpolant - the volume-rasterizing LUT pass is exactly that case.
+	bool                                           ps_ancillary                 = false;
 	bool                                           ps_no_perspective            = false;
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
@@ -228,7 +232,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 // Recorded once at device creation. Writing gl_Layer from a vertex shader is a Vulkan 1.2 feature,
 // and without it a volume-rasterizing pair cannot be lowered at all - so it must be classified as
 // unlowerable rather than compiled into SPIR-V the device will reject.
-void ShaderSetOutputLayerSupported(bool supported);
+void ShaderSetLayerRoutingSupported(bool supported);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
