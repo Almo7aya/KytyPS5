@@ -110,14 +110,37 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	// and map memory the guest never mapped: that faults inside the staging copy or fails the memory
 	// tracker's range validation, depending on where the descriptor happens to point.
 	//
-	// Bind the contiguous mapped extent instead. Vulkan robust buffer access returns zero past the
-	// end, which is exactly what the guest's own bounds checks already assume. The extent comes from
-	// the ranges the guest mapped for GPU access rather than from host commit state: that is the
-	// question actually being asked, it costs a map probe instead of a kernel transition on a path
-	// that runs for every buffer of every draw, and it does not mistake a GPU-owned page for an
-	// absent one.
-	const auto requested = std::min(nominal, max_range);
-	const auto size      = context.GetGpuResources().MappedExtent(address, requested);
+	// Bind the contiguous mapped extent instead. The extent comes from the ranges the guest mapped for
+	// GPU access rather than from host commit state: that is the question actually being asked, it
+	// costs a map probe instead of a kernel transition on a path that runs for every buffer of every
+	// draw, and it does not mistake a GPU-owned page for an absent one.
+	//
+	// num_records is likewise not a reliable *lower* bound on what a shader reads. A skinned mesh
+	// fetches its bone matrices through one formatted descriptor indexed by bone number, and the
+	// descriptor it is given routinely describes fewer records than the mesh indexes - so binding
+	// exactly stride * num_records leaves every bone past the end reading zero under robust access.
+	// Zero matrices collapse their vertices onto the origin while the rest stay correctly posed,
+	// which is a mesh torn between two positions rather than one that is simply missing.
+	//
+	// So such a descriptor is given the mapped extent even when its record footprint is smaller. This
+	// can only grow the binding, never shrink it, and it stays inside memory the guest mapped for the
+	// GPU.
+	//
+	// Kept as narrow as the symptom allows, on two axes. Only a read-only descriptor with a stride
+	// qualifies - a stride is what makes a fetch indexed by record, which is the shape the bound bites
+	// on - so raw byte buffers and every written buffer keep the footprint they ask for. Whether the
+	// fetch is format-converted makes no difference to the bound and is deliberately not part of the
+	// test. And the growth is capped well below the mapping, because ObtainBuffer does not merely bind
+	// this range: it tracks it, which write-protects the guest pages underneath. Reaching further than
+	// the resource needs puts unrelated game data behind that protection, which is a good deal worse
+	// than a short binding. Sixty-four kilobytes is a thousand-odd matrices - far past any real mesh -
+	// while staying inside a handful of the buffer cache's own pages.
+	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
+	const bool         indexed_fetch   = resource.read && !resource.written && stride != 0;
+	const auto read_extent = std::min(max_range, IndexedFetchCap);
+	const auto requested =
+	    indexed_fetch && nominal < read_extent ? read_extent : std::min(nominal, max_range);
+	const auto size = context.GetGpuResources().MappedExtent(address, requested);
 
 	// A base that maps nothing binds the null buffer rather than faulting; reads then return zero,
 	// which is the same answer robust access gives past the end of a short binding.
