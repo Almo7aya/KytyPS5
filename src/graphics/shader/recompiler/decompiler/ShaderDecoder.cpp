@@ -334,6 +334,11 @@ void SetRawWords(Instruction& inst, std::span<const uint32_t> code, uint32_t wor
 	}
 }
 
+// s_code_end: SOPP opcode 0x1f with an empty simm16 field.
+[[nodiscard]] bool IsCodeEnd(uint32_t word) {
+	return (word & 0xffff0000u) == 0xbf9f0000u;
+}
+
 void SetUnsupported(Instruction& inst, Family family, uint32_t opcode_id, const char* reason) {
 	inst.opcode             = Opcode::Unsupported;
 	inst.family             = family;
@@ -354,6 +359,16 @@ bool DecodeProgram(std::span<const uint32_t> code, Program& program, std::string
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		const uint32_t pc   = word_index * 4u;
 		const uint32_t word = code[word_index];
+
+		// The AGC shader size covers the code, the s_code_end padding the compiler emits so the
+		// instruction prefetcher can run past the end, and a trailing metadata blob. s_code_end is
+		// exactly the marker for where the code stops - it is never executed and never branched to -
+		// so decoding past it walks into padding and then into data that decodes as garbage. A
+		// shader ending in s_endpgm already stops below; one ending any other way, such as the
+		// s_setpc_b64 return of a merged NGG stage, ran on into the metadata and failed there.
+		if (IsCodeEnd(word) && !branch_targets.contains(pc)) {
+			return true;
+		}
 
 		Instruction inst;
 		bool        ok = false;

@@ -446,6 +446,33 @@ bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
 	return false;
 }
 
+// An S_SETPC_B64 whose address register the shader never writes cannot be jumping anywhere inside
+// itself - it can only be going back to an address the caller left in that SGPR pair, so it is a
+// return rather than a branch. That is how a merged NGG stage ends: the vertex half returns through
+// s[6:7]. There is no target to resolve by construction, and failing the whole graph over it throws
+// away a shader that is entirely ordinary apart from how it finishes.
+//
+// The write test is deliberately loose about width: a 64-bit destination one register below also
+// covers the pair, and over-reporting a write only falls back to the unresolved-target failure,
+// which is the safe direction.
+bool SetpcReturnsToCaller(const Decoder::Program& program, uint32_t setpc_index) {
+	const auto& setpc = program.instructions[setpc_index];
+	if (setpc.src0.kind != Decoder::OperandKind::Sgpr) {
+		return false;
+	}
+	const auto low  = setpc.src0.reg;
+	const auto high = low + 1u;
+	for (const auto& inst: program.instructions) {
+		for (const auto* dst: {&inst.dst, &inst.dst2}) {
+			if (dst->kind == Decoder::OperandKind::Sgpr && dst->reg + 1u >= low &&
+			    dst->reg <= high) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, uint32_t first_pc,
                    uint32_t end_pc) {
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
@@ -1367,6 +1394,7 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 	labels.insert(end_pc);
 
 	std::map<uint32_t, SetpcTargetInfo> setpc_targets;
+	std::set<uint32_t>                  setpc_returns;
 	bool                                indirect_setpc = false;
 	for (uint32_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst    = program.instructions[i];
@@ -1385,6 +1413,11 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			}
 		} else if (inst.opcode == Opcode::SSetpcB64) {
 			SetpcTargetInfo target_info;
+			if (SetpcReturnsToCaller(program, i)) {
+				setpc_returns.insert(inst.pc);
+				labels.insert(next_pc);
+				continue;
+			}
 			if (!ResolveSetpcTargets(program, i, target_info)) {
 				SetFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
 				           fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc),
@@ -1463,6 +1496,8 @@ bool BuildGraph(const Decoder::Program& program, Graph& graph, std::string* erro
 			block.terminator.kind       = TerminatorKind::Branch;
 			block.terminator.condition  = BranchCondition::Always;
 			block.terminator.true_block = pc_to_block.at(end_pc);
+		} else if (last.opcode == Opcode::SSetpcB64 && setpc_returns.contains(last.pc)) {
+			block.terminator.kind = TerminatorKind::Return;
 		} else if (last.opcode == Opcode::SSetpcB64) {
 			const auto& target_info = setpc_targets.at(last.pc);
 			if (target_info.indirect) {
