@@ -92,7 +92,13 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 		EXIT("storage buffer descriptor footprint overflow\n");
 	}
 	const auto nominal = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || nominal == 0) {
+	// An indexed read-only fetch is exempt from the empty-footprint shortcut. num_records is the field
+	// the extension below exists because it under-reports, and zero is that same under-reporting at
+	// its limit: taking it at face value binds nothing at all, so every index reads zero and the whole
+	// mesh collapses rather than part of it. A base that genuinely maps nothing still lands on the
+	// null buffer a few lines down, once the mapping has been asked rather than the descriptor.
+	const bool indexed_fetch = resource.read && !resource.written && stride != 0;
+	if (address == 0 || (nominal == 0 && !indexed_fetch)) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
@@ -140,8 +146,7 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	// pass reads the same bone matrices in compute and writes the posed vertices out - so excluding
 	// it puts that pass straight back on the short binding and the tear returns.
 	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
-	const bool         indexed_fetch   = resource.read && !resource.written && stride != 0;
-	const auto read_extent = std::min(max_range, IndexedFetchCap);
+	const auto         read_extent     = std::min(max_range, IndexedFetchCap);
 	const auto requested =
 	    indexed_fetch && nominal < read_extent ? read_extent : std::min(nominal, max_range);
 	const auto size = context.GetGpuResources().MappedExtent(address, requested);
