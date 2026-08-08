@@ -135,6 +135,10 @@ static BufferView NativeStorageBuffer(RenderContext& context, CommandBuffer& com
 	// the resource needs puts unrelated game data behind that protection, which is a good deal worse
 	// than a short binding. Sixty-four kilobytes is a thousand-odd matrices - far past any real mesh -
 	// while staying inside a handful of the buffer cache's own pages.
+	//
+	// Compute is deliberately included. Skinning does not only happen in the draw path - a skin-cache
+	// pass reads the same bone matrices in compute and writes the posed vertices out - so excluding
+	// it puts that pass straight back on the short binding and the tear returns.
 	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
 	const bool         indexed_fetch   = resource.read && !resource.written && stride != 0;
 	const auto read_extent = std::min(max_range, IndexedFetchCap);
@@ -922,8 +926,8 @@ void RenderExecutor::RebindBuffers(CommandBuffer&                     buffer,
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
-		resources.buffers.push_back(NativeStorageBuffer(m_context, buffer, descriptor,
-		                                                program.info.buffers[i], buffer_offset));
+		resources.buffers.push_back(NativeStorageBuffer(
+		    m_context, buffer, descriptor, program.info.buffers[i], buffer_offset));
 		const auto dword = layout.buffer_offset_dword + i / 4u;
 		const auto shift = (i % 4u) * 8u;
 		prepared.user_data[dword] |= buffer_offset << shift;
