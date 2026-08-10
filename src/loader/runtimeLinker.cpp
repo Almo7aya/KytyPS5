@@ -829,6 +829,21 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		        info->access_violation_vaddr)) {
 			return true;
 		}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		MEMORY_BASIC_INFORMATION fault_mbi = {};
+		if (VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &fault_mbi,
+		                 sizeof(fault_mbi)) != 0) {
+			LOGF("fault-va: state=%u protect=0x%08" PRIx32 " type=%u base=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>(fault_mbi.State),
+			     static_cast<uint32_t>(fault_mbi.Protect), static_cast<uint32_t>(fault_mbi.Type),
+			     reinterpret_cast<uint64_t>(fault_mbi.BaseAddress),
+			     reinterpret_cast<uint64_t>(fault_mbi.RegionSize));
+		} else {
+			LOGF("fault-va: VirtualQuery failed\n");
+		}
+#endif
 	}
 
 	LOGF("kyty_exception_handler: %016" PRIx64 "\n", info->exception_address);

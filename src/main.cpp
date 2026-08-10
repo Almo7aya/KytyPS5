@@ -12,10 +12,31 @@
 
 #include <charconv>
 #include <cstdio>
+#include <exception>
 #include <fmt/format.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
 
 using namespace Common;
 using namespace Emulator;
+
+static void TerminateHandler() {
+	std::printf("[TERM-MARK] std::terminate: unhandled exception\n");
+	fflush(stdout);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void*      frames[48] {};
+	const auto frame_count =
+	    CaptureStackBackTrace(0, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+	for (uint16_t i = 0; i < frame_count; i++) {
+		const auto address = reinterpret_cast<uintptr_t>(frames[i]);
+		std::printf("[TERM-MARK]   frame[%u]=0x%016" PRIxPTR "\n", i, address);
+	}
+	fflush(stdout);
+#endif
+	std::_Exit(9);
+}
 
 static std::string GetBuildString() {
 	Date date = Date::FromMacros(std::string(__DATE__));
@@ -278,6 +299,8 @@ int main(int argc, char* argv[]) {
 	auto& slist = *SubsystemsList::Instance();
 
 	slist.SetArgs(argc, argv);
+
+	std::set_terminate(TerminateHandler);
 
 	auto* core    = CommonSubsystem::Instance();
 	auto* threads = ThreadsSubsystem::Instance();
