@@ -1,8 +1,10 @@
 #include "common/hostException.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -73,6 +75,63 @@ static Handler LoadInstalledHandler() noexcept {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+// Resume trampoline for guest-mode continuations. The Windows 11 24H2 guarded
+// context-restore path validates the continuation RSP against the thread's
+// stack, so a guest RSP fail-fasts before the resume. The exception filter
+// instead gives the dispatcher a host-stack RSP and this trampoline address
+// (both valid), then the trampoline swaps in the guest RSP and jumps to the
+// guest RIP without touching any general-purpose register:
+//   +0x00: xchg rsp, [rip+0x08]   ; 48 87 24 25 08 00 00 00
+//   +0x08: jmp  [rip+0x0a]        ; ff 25 0a 00 00 00
+//   +0x10: rsp_slot (guest RSP)
+//   +0x18: rip_slot (guest RIP)
+struct Trampoline {
+	alignas(8) uint8_t code[16] {};
+	uint64_t            rsp_slot = 0;
+	uint64_t            rip_slot = 0;
+};
+
+static constexpr uint32_t kTrampolineCount = 64;
+static std::mutex         g_trampoline_mutex;
+static Trampoline*        g_trampolines[kTrampolineCount] {};
+static uint32_t           g_trampoline_threads[kTrampolineCount] {};
+
+static Trampoline* AcquireTrampoline() {
+	const auto thread_id = static_cast<uint32_t>(GetCurrentThreadId());
+	std::lock_guard lock(g_trampoline_mutex);
+
+	uint32_t free_slot = kTrampolineCount;
+	for (uint32_t i = 0; i < kTrampolineCount; i++) {
+		if (g_trampolines[i] != nullptr) {
+			if (g_trampoline_threads[i] == thread_id) {
+				return g_trampolines[i];
+			}
+		} else if (free_slot == kTrampolineCount) {
+			free_slot = i;
+		}
+	}
+	if (free_slot == kTrampolineCount) {
+		return nullptr;
+	}
+
+	auto* tramp = static_cast<Trampoline*>(VirtualAlloc(nullptr, sizeof(Trampoline),
+	                                                    MEM_COMMIT | MEM_RESERVE,
+	                                                    PAGE_EXECUTE_READWRITE));
+	if (tramp == nullptr) {
+		return nullptr;
+	}
+
+	const uint8_t bytes[16] = {0x48, 0x87, 0x24, 0x25, 0x08, 0x00, 0x00, 0x00,
+	                           0xFF, 0x25, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
+	for (uint32_t i = 0; i < sizeof(bytes); i++) {
+		tramp->code[i] = bytes[i];
+	}
+
+	g_trampolines[free_slot]        = tramp;
+	g_trampoline_threads[free_slot] = thread_id;
+	return tramp;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	FilterScope filter_scope;
 
@@ -133,7 +192,48 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 
 	const auto handler = LoadInstalledHandler();
 
-	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	if (!handler(info)) {
+		std::fprintf(stderr,
+		             "HOST EXCEPTION **unresolved**: type=%s addr=0x%016" PRIx64
+		             " fault_ip=0x%016" PRIx64 "\n",
+		             info.type == ExceptionType::IllegalInstruction ? "illegal_instruction"
+		                                                            : "access_violation",
+		             info.access_violation_vaddr, info.exception_address);
+		std::fprintf(stderr,
+		             "  regs: rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64
+		             " rdx=%016" PRIx64 " rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64
+		             " rsp=%016" PRIx64 " r8=%016" PRIx64 " r9=%016" PRIx64 " r10=%016" PRIx64
+		             " r11=%016" PRIx64 " r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64
+		             " r15=%016" PRIx64 "\n",
+		             info.rax, info.rbx, info.rcx, info.rdx, info.rsi, info.rdi, info.rbp,
+		             info.rsp, info.r8, info.r9, info.r10, info.r11, info.r12, info.r13,
+		             info.r14, info.r15);
+		std::fflush(stderr);
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows 11 24H2 dispatches EXCEPTION_CONTINUE_EXECUTION through
+	// ntdll!RtlGuardRestoreContext, which fail-fasts (0xc0000409,
+	// FAST_FAIL_INVALID_SET_OF_CONTEXT) when the continuation RSP is not
+	// within the current thread's stack. Guest code resumes with a guest-mode
+	// RSP, so the resume is redirected through a per-thread trampoline: the
+	// dispatcher is given a host-stack RSP (valid) and the trampoline address
+	// (module code, valid), and the trampoline itself swaps in the guest RSP
+	// and jumps to the guest RIP using only the RSP register, preserving all
+	// guest general-purpose registers.
+	if (auto* trampoline = AcquireTrampoline(); trampoline != nullptr) {
+		auto* const context = exception->ContextRecord;
+		trampoline->rsp_slot = context->Rsp;
+		trampoline->rip_slot = context->Rip;
+		context->Rip         = reinterpret_cast<uintptr_t>(trampoline->code);
+		context->Rsp         = reinterpret_cast<uintptr_t>(&context);
+		context->ContextFlags = (context->ContextFlags & ~0x50u) | 0x100000Fu;
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+#endif
+
+	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 #elif defined(__APPLE__)
@@ -313,6 +413,34 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows 11 24H2 dispatches a vectored-handler continuation through
+	// ntdll!RtlGuardRestoreContext, which validates the continuation RSP by
+	// calling RtlGuardIsValidStackPointer.  That validator reads the current
+	// thread's TEB stack bounds, and guest threads (which run with a guest
+	// RSP and a guest-mode TEB) never pass it, so the dispatcher fail-fasts
+	// (0xc0000409, FAST_FAIL_INVALID_SET_OF_CONTEXT) before resuming guest
+	// code.  The validation block is skipped when the process shadow-stack
+	// policy byte at LdrSystemDllInitBlock+0x9c has bit 0 set; set it so the
+	// dispatcher restores the continuation context as-is (the guest resume
+	// itself is handled by the trampoline below).
+	HMODULE ntdll_module = GetModuleHandleW(L"ntdll.dll");
+	uint8_t* guard_policy =
+	    (ntdll_module != nullptr)
+	        ? reinterpret_cast<uint8_t*>(GetProcAddress(ntdll_module, "LdrSystemDllInitBlock"))
+	        : nullptr;
+	if (guard_policy != nullptr) {
+		DWORD old_protect = 0;
+		if (VirtualProtect(guard_policy + 0x9c, 1, PAGE_READWRITE, &old_protect) != 0) {
+			guard_policy[0x9c] |= 0x01u;
+			VirtualProtect(guard_policy + 0x9c, 1, old_protect, &old_protect);
+			printf("host_exception: guarded-restore RSP validation disabled (policy byte=0x%02x)\n",
+			       guard_policy[0x9c]);
+		} else {
+			printf("host_exception: guarded-restore RSP validation patch failed (error=%lu)\n",
+			       static_cast<unsigned long>(GetLastError()));
+		}
+	}
+
 	if (AddVectoredExceptionHandler(1, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);

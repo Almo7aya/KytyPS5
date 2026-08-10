@@ -3569,6 +3569,39 @@ static std::vector<VirtualRanges::Range> RequireGuestRuntimeMemory(uint64_t vadd
 	return ranges;
 }
 
+static void RegisterCETCompatibleDynamicRange(uint64_t vaddr, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	using SetProcessDynamicEnforcedCetCompatibleRanges_t = BOOL(WINAPI*)(
+	    HANDLE, USHORT, const PROCESS_DYNAMIC_ENFORCED_ADDRESS_RANGE*);
+	static const auto func = [] {
+		const auto kernel32 = GetModuleHandleW(L"kernel32.dll");
+		return kernel32 == nullptr
+		           ? static_cast<SetProcessDynamicEnforcedCetCompatibleRanges_t>(nullptr)
+		           : reinterpret_cast<SetProcessDynamicEnforcedCetCompatibleRanges_t>(
+		                 GetProcAddress(kernel32, "SetProcessDynamicEnforcedCetCompatibleRanges"));
+	}();
+	static bool error_logged = false;
+	if (func == nullptr || vaddr == 0 || size == 0) {
+		return;
+	}
+	PROCESS_DYNAMIC_ENFORCED_ADDRESS_RANGE range{};
+	range.BaseAddress = static_cast<UINT_PTR>(vaddr);
+	range.Size        = static_cast<SIZE_T>(size);
+	range.Flags       = DYNAMIC_ENFORCED_ADDRESS_RANGE_ADD;
+	const auto ok = func(GetCurrentProcess(), 1, &range);
+	if ((!ok || (range.Flags & DYNAMIC_ENFORCED_ADDRESS_RANGE_PROCESSED) == 0) &&
+	    !error_logged) {
+		error_logged = true;
+		LOGF("SetProcessDynamicEnforcedCetCompatibleRanges(0x%016" PRIx64 ", 0x%016" PRIx64
+		     ") failed: %u\n",
+		     vaddr, size, static_cast<uint32_t>(GetLastError()));
+	}
+#else
+	(void)vaddr;
+	(void)size;
+#endif
+}
+
 static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
                                            VirtualMemory::Mode mode, const char* name,
                                            VirtualRangeType type, bool fixed) {
@@ -3594,6 +3627,9 @@ static uint64_t AllocateGuestRuntimeMemory(uint64_t search_addr, uint64_t size,
 		return 0;
 	}
 	MapGpuRange(vaddr, mapped_size);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RegisterCETCompatibleDynamicRange(vaddr, mapped_size);
+#endif
 	return vaddr;
 }
 
