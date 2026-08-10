@@ -3829,11 +3829,17 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 			break;
 		}
 
+		// A null start for a map operation requests kernel-chosen placement. Do not carry the
+		// batch's MAP_FIXED flag into that operation: address zero cannot be mapped as a fixed guest
+		// address, and the mapping function writes the selected address back to entry->start.
+		constexpr int GUEST_MAP_FIXED = 0x10;
+		const int map_flags = entry->start == nullptr ? (flags & ~GUEST_MAP_FIXED) : flags;
+
 		int result = OK;
 		switch (entry->operation) {
 			case MAP_OP_MAP_DIRECT:
 				result = KernelMapNamedDirectMemory(&entry->start, entry->length, entry->protection,
-				                                    flags, static_cast<int64_t>(entry->offset), 0,
+				                                    map_flags, static_cast<int64_t>(entry->offset), 0,
 				                                    "anon");
 				break;
 			case MAP_OP_UNMAP:
@@ -3844,7 +3850,7 @@ int KYTY_SYSV_ABI KernelBatchMap2(KernelBatchMapEntry* entries, int num_entries,
 				break;
 			case MAP_OP_MAP_FLEXIBLE:
 				result = KernelMapNamedFlexibleMemory(&entry->start, entry->length,
-				                                      entry->protection, flags, "anon");
+				                                      entry->protection, map_flags, "anon");
 				break;
 			case MAP_OP_TYPE_PROTECT:
 				result =

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -81,7 +82,8 @@ static Handler LoadInstalledHandler() noexcept {
 // instead gives the dispatcher a host-stack RSP and this trampoline address
 // (both valid), then the trampoline swaps in the guest RSP and jumps to the
 // guest RIP without touching any general-purpose register:
-//   +0x00: xchg rsp, [rip+0x08]   ; 48 87 24 25 08 00 00 00
+//   +0x00: xchg rsp, [rip+0x09]   ; 48 87 25 09 00 00 00
+//   +0x07: nop                    ; 90
 //   +0x08: jmp  [rip+0x0a]        ; ff 25 0a 00 00 00
 //   +0x10: rsp_slot (guest RSP)
 //   +0x18: rip_slot (guest RIP)
@@ -90,6 +92,9 @@ struct Trampoline {
 	uint64_t            rsp_slot = 0;
 	uint64_t            rip_slot = 0;
 };
+
+static_assert(offsetof(Trampoline, rsp_slot) == 0x10);
+static_assert(offsetof(Trampoline, rip_slot) == 0x18);
 
 static constexpr uint32_t kTrampolineCount = 64;
 static std::mutex         g_trampoline_mutex;
@@ -121,11 +126,12 @@ static Trampoline* AcquireTrampoline() {
 		return nullptr;
 	}
 
-	const uint8_t bytes[16] = {0x48, 0x87, 0x24, 0x25, 0x08, 0x00, 0x00, 0x00,
+	const uint8_t bytes[16] = {0x48, 0x87, 0x25, 0x09, 0x00, 0x00, 0x00, 0x90,
 	                           0xFF, 0x25, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00};
 	for (uint32_t i = 0; i < sizeof(bytes); i++) {
 		tramp->code[i] = bytes[i];
 	}
+	FlushInstructionCache(GetCurrentProcess(), tramp->code, sizeof(tramp->code));
 
 	g_trampolines[free_slot]        = tramp;
 	g_trampoline_threads[free_slot] = thread_id;
@@ -228,7 +234,9 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 		trampoline->rip_slot = context->Rip;
 		context->Rip         = reinterpret_cast<uintptr_t>(trampoline->code);
 		context->Rsp         = reinterpret_cast<uintptr_t>(&context);
-		context->ContextFlags = (context->ContextFlags & ~0x50u) | 0x100000Fu;
+		// Preserve the exception's original ContextFlags. In particular, clearing
+		// CONTEXT_XSTATE loses the upper halves of AVX registers when a guest
+		// instruction faults and is retried through this trampoline.
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 #endif
@@ -433,7 +441,7 @@ bool InstallHandler(Handler handler) {
 		if (VirtualProtect(guard_policy + 0x9c, 1, PAGE_READWRITE, &old_protect) != 0) {
 			guard_policy[0x9c] |= 0x01u;
 			VirtualProtect(guard_policy + 0x9c, 1, old_protect, &old_protect);
-			printf("host_exception: guarded-restore RSP validation disabled (policy byte=0x%02x)\n",
+			printf("host_exception: guarded-restore workaround active (policy byte=0x%02x)\n",
 			       guard_policy[0x9c]);
 		} else {
 			printf("host_exception: guarded-restore RSP validation patch failed (error=%lu)\n",
