@@ -5,3 +5,10 @@ build/
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
+
+# Emulator runtime data
+_DownloadData/
+_Shaders/
+_TempData/
+_Textures/
+*.pdb
