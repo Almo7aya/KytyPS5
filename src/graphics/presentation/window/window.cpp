@@ -27,6 +27,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "debugger/debugger.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/vma.h"
@@ -511,6 +512,13 @@ void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
+
+	// Input arbiter: debugger overlay, then IME, then the guest. Without this, typing an
+	// address into the debugger would also press buttons in the game.
+	if (Debugger::HandleEvent(*event)) {
+		return;
+	}
+
 	if (ProcessImeInput(*event)) {
 		return;
 	}

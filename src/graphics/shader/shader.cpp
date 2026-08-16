@@ -9,6 +9,7 @@
 #include "common/magicEnum.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "debugger/target/graphics.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1322,7 +1323,26 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 static bool ShaderRecompilerTextDumpEnabled() {
 	// Graphics debug dump already writes SPIR-V binaries to _Shaders. Keep the very large
 	// disassembly/IR text behind the shader-log switch so file logging cannot stall boot.
-	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+	//
+	// The debugger's shader views need the same text, so --debugger asks for it too; that is a
+	// deliberate cost of running with the debugger on, not of running at all.
+	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent ||
+	       Debugger::Graphics::WantsShaderText();
+}
+
+// Hand a freshly recompiled shader to the debugger's registry. Cheap and skipped entirely when
+// the debugger is off; the strings are only non-empty when it asked for them above.
+static void RecordShaderForDebugger(Debugger::Graphics::ShaderStage stage, uint64_t hash,
+                                    uint64_t base_address, std::span<const uint32_t> code,
+                                    const ShaderRecompiler::CompileResult& result,
+                                    const std::vector<uint32_t>&           spirv) {
+	if (!Debugger::Graphics::IsCapturing()) {
+		return;
+	}
+
+	Debugger::Graphics::RecordShader(
+	    stage, hash, base_address, static_cast<uint32_t>(code.size() * sizeof(uint32_t)),
+	    spirv.data(), spirv.size(), result.decoded_dump, result.ir_dump);
 }
 
 static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
@@ -1456,6 +1476,8 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 	ApplyVertexOutputs(input_info, *input_info.stage.program);
 	spirv = std::move(result.spirv);
 	DumpShaderRecompilerSpirv("vs", options.shader_hash, spirv);
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Vertex, options.shader_hash,
+	                        shader_addr, code, result, spirv);
 
 	if (options.dump_ir) {
 		if (!options.early_dump) {
@@ -1508,6 +1530,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 	ApplyPixelOutputs(input_info, *input_info.stage.program);
 	spirv = std::move(result.spirv);
 	DumpShaderRecompilerSpirv("ps", options.shader_hash, spirv);
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Pixel, options.shader_hash,
+	                        options.shader_base, code, result, spirv);
 
 	if (options.dump_ir) {
 		if (!options.early_dump) {
@@ -1557,6 +1581,8 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(result.resources));
 	spirv = std::move(result.spirv);
 	DumpShaderRecompilerSpirv("cs", options.shader_hash, spirv);
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Compute, options.shader_hash,
+	                        options.shader_base, code, result, spirv);
 
 	if (options.dump_ir) {
 		if (!options.early_dump) {

@@ -107,6 +107,22 @@ bool RedZoneProtectionEnabled() {
 }
 #endif
 
+bool DebuggerEnabled() {
+	return g_config->debugger_enabled;
+}
+
+bool DebuggerUiVisible() {
+	return g_config->debugger_ui_visible;
+}
+
+bool DebuggerBreakOnEntry() {
+	return g_config->debugger_break_entry;
+}
+
+const std::vector<std::string>& GetDebuggerBreakpoints() {
+	return g_config->debugger_breakpoints;
+}
+
 const Keymap& GetKeymap() {
 	return g_config->keymap;
 }

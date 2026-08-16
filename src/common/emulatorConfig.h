@@ -54,7 +54,13 @@ struct ConfigOptions {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
-	Keymap keymap;
+	// Debugger. Nothing in the debugger subsystem arms unless `debugger_enabled` is set; every
+	// other option here implies it (see main.cpp).
+	bool                     debugger_enabled     = false;
+	bool                     debugger_ui_visible  = false;
+	bool                     debugger_break_entry = false;
+	std::vector<std::string> debugger_breakpoints;
+	Keymap                   keymap;
 };
 
 void Load(const ConfigOptions& cfg);
@@ -88,6 +94,11 @@ bool ReadbackLinearImagesEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
+
+bool                            DebuggerEnabled();
+bool                            DebuggerUiVisible();
+bool                            DebuggerBreakOnEntry();
+const std::vector<std::string>& GetDebuggerBreakpoints();
 
 const Keymap& GetKeymap();
 
