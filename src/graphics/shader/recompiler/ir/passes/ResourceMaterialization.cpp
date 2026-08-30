@@ -104,6 +104,30 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
+                           ShaderBufferResource& result) {
+	if (!DecodeBufferDescriptor(descriptor, result) || result.Type() != 0 ||
+	    (stage != ShaderType::Compute && result.AddTid())) {
+		return false;
+	}
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = (result.DstSelXYZW() >> (component * 3u)) & 0x7u;
+		if (selector == 2u || selector == 3u) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerResource& result) {
+	if (descriptor.dword_count != std::size(result.fields)) {
+		return false;
+	}
+	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
+	return result.MaxAnisoRatio() <= static_cast<uint32_t>(Prospero::SamplerAnisoRatio::kSixteen) &&
+	       result.MipFilter() <= static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear);
+}
+
 const DescriptorSource* Source(const Program& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -564,7 +588,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	cursor += program.info.buffers.size();
 	for (auto& descriptor: next.buffers) {
 		ShaderBufferResource buffer;
-		if (DecodeBufferDescriptor(descriptor, buffer) && buffer.Type() != 0) {
+		if (!ValidBufferDescriptor(descriptor, program.stage, buffer)) {
 			descriptor.dwords.fill(0);
 		}
 	}
@@ -655,6 +679,12 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		return false;
 	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
+	for (auto& descriptor: next.samplers) {
+		ShaderSamplerResource sampler;
+		if (!ValidSamplerDescriptor(descriptor, sampler)) {
+			descriptor.dwords.fill(0);
+		}
+	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	if (!ValidateResourceSnapshot(program, next, error)) {
 		return false;
