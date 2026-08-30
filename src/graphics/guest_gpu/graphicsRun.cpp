@@ -1526,15 +1526,12 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     event_index, event_address);
 			}
 
-			// The query layout contains one interleaved begin/end pair per DB. Deriving the
-			// synthetic counter from the slot keeps every pair stable across asynchronous reads.
+			// Deriving the synthetic counter from the slot keeps each begin/end pair stable across
+			// asynchronous reads.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | ((event_address >> 3u) & counter_mask);
-			for (uint32_t db = 0; db < 16u; db++) {
-				results[db * 2u] = value;
-			}
+			auto*              result       = reinterpret_cast<volatile uint64_t*>(event_address);
+			*result = ready_bit | ((event_address >> 3u) & counter_mask);
 			break;
 		}
 		case 0x0000003a: // PIXEL_PIPE_STAT_RESET
