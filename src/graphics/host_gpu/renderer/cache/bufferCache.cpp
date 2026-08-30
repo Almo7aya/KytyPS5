@@ -578,7 +578,9 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+	(void)DecodeDccFillCode(value, clear_code);
+	(void)m_texture_cache.ClearMeta(vaddr, clear_code);
 	{
 		const auto region = m_texture_cache.QueryRegion(vaddr, size);
 		if (!HasGpuDirtyBytes(vaddr, size) && !region.gpu_image_bytes) {

@@ -1863,16 +1863,17 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    found->second.type == MetaDataInfo::Type::Dcc) {
-		// Preserve the broad metadata-clear operation for CMask/FMask/HTile. DCC requires a
-		// validated fill value, so an arbitrary compute write must not clear it.
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	if (found->second.type == MetaDataInfo::Type::Dcc) {
+		found->second.fill_value = static_cast<uint32_t>(clear_code) * 0x01010101u;
+		found->second.fill_size  = 0;
+	}
 	return true;
 }
 
