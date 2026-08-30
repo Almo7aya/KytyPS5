@@ -21,6 +21,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -61,19 +62,39 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+	if (program.info.has_bitwise_xor) {
+		return false;
+	}
+
+	uint64_t meta_address = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (cache.IsMeta(descriptor.Base48())) {
+			meta_address = descriptor.Base48();
+			break;
 		}
 	}
-	return false;
+	if (meta_address == 0) {
+		return false;
+	}
+
+	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		uint32_t   value      = 0;
+		if (LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value)) &&
+		    DecodeDccFillCode(value, clear_code)) {
+			break;
+		}
+		clear_code = DCC_CODE_UNCOMPRESSED;
+	}
+	return cache.ClearMeta(meta_address, clear_code);
 }
 
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,

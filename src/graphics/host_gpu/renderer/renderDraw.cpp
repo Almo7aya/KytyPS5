@@ -532,40 +532,14 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 		return false;
 	}
 
-	// Translate recognized constant and register-backed DCC states into a host clear value.
-	clear_value = {};
-	switch (static_cast<uint8_t>(metadata_value)) {
-		case 0x00: break;
-		case 0x20:
-			if (!target.metadata_clear_supported) {
-				return false;
-			}
-			clear_value = target.color_clear_value;
-			break;
-		case 0x40:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[3] = 1.0f;
-			break;
-		case 0x80:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			break;
-		case 0xc0:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			clear_value.float32[3] = 1.0f;
-			break;
-		default: return false;
+	// Constant codes carry their colour directly. The register code selects the clear-word
+	// registers, while anything else (notably 0xff, which means uncompressed) is not a clear.
+	const auto clear_code = static_cast<uint8_t>(metadata_value);
+	clear_value           = {};
+	bool materialize      = DecodeDccConstantClear(clear_code, clear_value);
+	if (clear_code == DCC_CLEAR_CODE_REGISTER && target.metadata_clear_supported) {
+		clear_value = target.color_clear_value;
+		materialize = true;
 	}
 
 	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
@@ -579,7 +553,7 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 			EXIT("failed to consume DCC clear state\n");
 		}
 	}
-	return true;
+	return materialize;
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,

@@ -19,6 +19,34 @@ enum class VideoOutCompression : uint8_t { Uncompressed, Dcc256_256_0, Dcc256_64
 
 enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
+constexpr uint8_t DCC_CLEAR_CODE_REGISTER = 0x20;
+constexpr uint8_t DCC_CODE_UNCOMPRESSED   = 0xff;
+
+[[nodiscard]] inline bool DecodeDccConstantClear(uint8_t code, vk::ClearColorValue& color) {
+	const auto set = [&color](float rgb, float alpha) {
+		color.float32[0] = rgb;
+		color.float32[1] = rgb;
+		color.float32[2] = rgb;
+		color.float32[3] = alpha;
+	};
+	switch (code) {
+		case 0x00: set(0.0f, 0.0f); return true;
+		case 0x40: set(0.0f, 1.0f); return true;
+		case 0x80: set(1.0f, 0.0f); return true;
+		case 0xc0: set(1.0f, 1.0f); return true;
+		default: return false;
+	}
+}
+
+[[nodiscard]] inline constexpr bool DecodeDccFillCode(uint32_t fill, uint8_t& code) noexcept {
+	const auto value = static_cast<uint8_t>(fill);
+	if (fill != static_cast<uint32_t>(value) * 0x01010101u) {
+		return false;
+	}
+	code = value;
+	return true;
+}
+
 struct ImageMetadataInfo {
 	GuestRange          range;
 	ImageMetadataKind   kind               = ImageMetadataKind::None;
