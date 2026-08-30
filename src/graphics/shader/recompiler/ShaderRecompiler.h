@@ -26,6 +26,7 @@ struct CompileOptions {
 	const uint32_t*             user_data                  = nullptr;
 	IR::SrtMemoryReader         read_memory                = nullptr;
 	IR::SrtMemoryReader         read_specialization_memory = nullptr;
+	IR::SrtMemoryRangeValidator validate_memory_range       = nullptr;
 	void*                       read_memory_data           = nullptr;
 	const IR::ResourceSnapshot* resource_snapshot          = nullptr;
 	ShaderStageInputInfo        input_info;

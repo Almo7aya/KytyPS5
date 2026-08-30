@@ -661,6 +661,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		                                               : reinterpret_cast<uint64_t>(code.data());
 		runtime.read_memory = options.read_memory;
 		runtime.read_specialization_memory = options.read_specialization_memory;
+		runtime.validate_memory_range = options.validate_memory_range;
 		if (runtime.read_memory == nullptr && options.user_data == nullptr) {
 			runtime.read_memory = ReadZeroMemory;
 		}

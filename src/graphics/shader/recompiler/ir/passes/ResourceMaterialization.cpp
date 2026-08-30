@@ -104,8 +104,10 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor);
+
 bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
-                           ShaderBufferResource& result) {
+                           const SrtRuntime& runtime, ShaderBufferResource& result) {
 	if (!DecodeBufferDescriptor(descriptor, result) || result.Type() != 0 ||
 	    (stage != ShaderType::Compute && result.AddTid())) {
 		return false;
@@ -116,7 +118,14 @@ bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
 			return false;
 		}
 	}
-	return true;
+	if (runtime.validate_memory_range == nullptr) {
+		return true;
+	}
+	// Tracking is static, so a resource that is inactive on the current path can have undefined
+	// descriptor registers. Canonicalize those values before they affect specialization.
+	const auto size = ScalarBufferSize(result);
+	return result.Base48() != 0 && size != 0 &&
+	       runtime.validate_memory_range(runtime.userdata, result.Base48(), size);
 }
 
 bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerResource& result) {
@@ -588,7 +597,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	cursor += program.info.buffers.size();
 	for (auto& descriptor: next.buffers) {
 		ShaderBufferResource buffer;
-		if (!ValidBufferDescriptor(descriptor, program.stage, buffer)) {
+		if (!ValidBufferDescriptor(descriptor, program.stage, runtime, buffer)) {
 			descriptor.dwords.fill(0);
 		}
 	}

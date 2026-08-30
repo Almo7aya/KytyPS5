@@ -55,6 +55,10 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
 }
 
+bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::TryClampRangeSize(address, size) != 0;
+}
+
 } // namespace
 
 struct ShaderBinaryInfo {
@@ -856,7 +860,8 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
                         const ShaderParams& params, ShaderVertexInputInfo& info) {
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
-	                                   ReadShaderGuestMemory)) {
+	                                   ReadShaderGuestMemory, nullptr,
+	                                   ValidateShaderGuestMemoryRange)) {
 		return LogPermutationMismatch(*program, "VS", error);
 	}
 	ApplyVertexOutputs(info, *program);
@@ -867,7 +872,8 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
                         const ShaderParams& params, ShaderPixelInputInfo& info) {
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
-	                                   ReadShaderGuestMemory)) {
+	                                   ReadShaderGuestMemory, nullptr,
+	                                   ValidateShaderGuestMemoryRange)) {
 		return LogPermutationMismatch(*program, "PS", error);
 	}
 	ApplyPixelOutputs(info, *program);
@@ -878,7 +884,8 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
                         const ShaderParams& params, ShaderComputeInputInfo& info) {
 	std::string error;
 	if (!ShaderMaterializeStageRuntime(program, params.user_data, params.Base(), info.stage, &error,
-	                                   ReadShaderGuestMemory)) {
+	                                   ReadShaderGuestMemory, nullptr,
+	                                   ValidateShaderGuestMemoryRange)) {
 		return LogPermutationMismatch(*program, "CS", error);
 	}
 	return true;
@@ -1241,6 +1248,7 @@ static ShaderRecompiler::CompileOptions MakeCompileOptions(const ShaderParams& p
 	options.user_data_count            = static_cast<uint32_t>(params.user_data.size());
 	options.user_data                  = params.user_data.data();
 	options.read_specialization_memory = ReadShaderGuestMemory;
+	options.validate_memory_range       = ValidateShaderGuestMemoryRange;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = ShaderStageLabel(stage);
