@@ -2152,9 +2152,8 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	uint32_t   event_type     = (buffer[0]) & 0x3fu;
 	uint64_t   event_address  = 0;
 
-	if (event_type == 0x39u) {
-		EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
-		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	if (event_type == 0x39u && packet_size_dw >= 4u) {
+		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u);
 	}
 
 	cp.TriggerEvent(event_type, event_index, event_address);
