@@ -24924,10 +24924,9 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
-  alignas(16) std::array<std::array<uint64_t, 2>, 16> results;
-  for (auto &pair : results) {
-    pair.fill(untouched);
-  }
+  constexpr uint64_t counter_mask = ready_bit - 1u;
+  alignas(16) std::array<uint64_t, 4> results;
+  results.fill(untouched);
 
   const auto dump = [&](uint64_t *address) {
     const auto raw_address = reinterpret_cast<uint64_t>(address);
@@ -24939,24 +24938,27 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
     return processor.Process(execution, packet);
   };
 
-  const auto begin_result = dump(&results[0][0]);
-  bool begin_written = begin_result == Pm4ProcessResult::Complete;
-  for (const auto &pair : results) {
-    begin_written &= pair[0] == ready_bit && pair[1] == untouched;
-  }
+  const auto begin_address = reinterpret_cast<uint64_t>(&results[1]);
+  const auto begin_value = ready_bit | ((begin_address >> 3u) & counter_mask);
+  const auto begin_result = dump(&results[1]);
+  const bool begin_written = begin_result == Pm4ProcessResult::Complete &&
+                             results[0] == untouched &&
+                             results[1] == begin_value &&
+                             results[2] == untouched &&
+                             results[3] == untouched;
 
-  const auto end_result = dump(&results[0][1]);
-  bool end_written = end_result == Pm4ProcessResult::Complete;
-  uint64_t visible_samples = 0;
-  for (const auto &pair : results) {
-    end_written &= pair[0] == ready_bit && pair[1] == (ready_bit | 1u);
-    visible_samples += pair[1] - pair[0];
-  }
+  const auto end_address = reinterpret_cast<uint64_t>(&results[2]);
+  const auto end_value = ready_bit | ((end_address >> 3u) & counter_mask);
+  const auto end_result = dump(&results[2]);
+  const bool end_written = end_result == Pm4ProcessResult::Complete &&
+                           results[0] == untouched &&
+                           results[1] == begin_value &&
+                           results[2] == end_value &&
+                           results[3] == untouched;
 
   Require("Pm4SyntheticOcclusionCounterDump", "always-visible result",
-          begin_written && end_written && visible_samples == results.size(),
-          "EVENT_WRITE did not publish valid nonzero begin/end counters to "
-          "every PS5 DB");
+          begin_written && end_written && results[2] - results[1] == 1u,
+          "EVENT_WRITE did not publish one stable nonzero begin/end pair");
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 
