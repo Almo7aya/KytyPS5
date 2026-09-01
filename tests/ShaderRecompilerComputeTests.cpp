@@ -24146,7 +24146,7 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   CommandProcessor processor(renderer, 0);
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
-  constexpr uint64_t counter_mask = ready_bit - 1u;
+  constexpr uint64_t visible_stride = 1ull << 18u;
   alignas(16) std::array<uint64_t, 4> results;
   results.fill(untouched);
 
@@ -24161,7 +24161,7 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   };
 
   const auto begin_address = reinterpret_cast<uint64_t>(&results[1]);
-  const auto begin_value = ready_bit | ((begin_address >> 3u) & counter_mask);
+  const auto begin_value = ready_bit | ((begin_address >> 3u) * visible_stride);
   const auto begin_result = dump(&results[1]);
   const bool begin_written = begin_result == Pm4ProcessResult::Complete &&
                              results[0] == untouched &&
@@ -24170,7 +24170,7 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
                              results[3] == untouched;
 
   const auto end_address = reinterpret_cast<uint64_t>(&results[2]);
-  const auto end_value = ready_bit | ((end_address >> 3u) & counter_mask);
+  const auto end_value = ready_bit | ((end_address >> 3u) * visible_stride);
   const auto end_result = dump(&results[2]);
   const bool end_written = end_result == Pm4ProcessResult::Complete &&
                            results[0] == untouched &&
@@ -24179,8 +24179,9 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
                            results[3] == untouched;
 
   Require("Pm4SyntheticOcclusionCounterDump", "always-visible result",
-          begin_written && end_written && results[2] - results[1] == 1u,
-          "EVENT_WRITE did not publish one stable nonzero begin/end pair");
+          begin_written && end_written &&
+              results[2] - results[1] == visible_stride,
+          "EVENT_WRITE did not publish one stable always-visible begin/end pair");
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 

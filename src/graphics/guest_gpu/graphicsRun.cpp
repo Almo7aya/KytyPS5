@@ -1527,11 +1527,17 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			}
 
 			// Deriving the synthetic counter from the slot keeps each begin/end pair stable across
-			// asynchronous reads.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              result       = reinterpret_cast<volatile uint64_t*>(event_address);
-			*result = ready_bit | ((event_address >> 3u) & counter_mask);
+			// asynchronous reads. Keep a sizeable distance between adjacent slots instead of reporting
+			// exactly one sample: one was enough for the first visibility path found in this title, but
+			// it is not an honest "always visible" result for callers that apply a minimum-sample
+			// threshold. Event addresses are 48-bit and 8-byte aligned, so shifting their slot index by
+			// 18 remains below the ready bit without wrapping. A conventional adjacent begin/end pair
+			// therefore reports 262144 visible samples while retaining the address-only, frame-stable
+			// property that removed the original model flicker.
+			constexpr uint64_t ready_bit      = 1ull << 63u;
+			constexpr uint64_t visible_stride = 1ull << 18u;
+			auto*              result         = reinterpret_cast<volatile uint64_t*>(event_address);
+			*result = ready_bit | ((event_address >> 3u) * visible_stride);
 			break;
 		}
 		case 0x0000003a: // PIXEL_PIPE_STAT_RESET
