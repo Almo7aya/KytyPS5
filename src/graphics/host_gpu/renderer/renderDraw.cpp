@@ -751,6 +751,27 @@ static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer
 	                           : buffer.num_records);
 }
 
+// Some games under-report num_records even though the draw fetches vertices beyond the declared
+// footprint. The requested range controls how much guest memory the stream and cached paths copy or
+// synchronize, so the undeclared tail can otherwise contain stale data. Extend small requests only
+// through the contiguous guest mapping, with a conservative 64 KiB bound. Empty descriptors retain
+// their null-buffer behavior.
+uint64_t ResolveVertexBufferRequestSize(const GpuResourceManager&       resources,
+                                        const ShaderVertexInputBuffer& vertex) {
+	const auto nominal = VertexBufferDescriptorSize(vertex);
+	if (vertex.addr == 0 || nominal == 0) {
+		return nominal;
+	}
+
+	constexpr uint64_t fetch_cap = 64ull * 1024ull;
+	if (nominal >= fetch_cap || vertex.addr > UINT64_MAX - fetch_cap) {
+		return nominal;
+	}
+
+	const auto mapped = resources.MappedExtent(vertex.addr, fetch_cap);
+	return std::max(nominal, mapped);
+}
+
 struct VertexBufferRange {
 	uint64_t                     base_address  = 0;
 	uint64_t                     requested_end = 0;
@@ -778,7 +799,8 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex);
+		const auto  size = ResolveVertexBufferRequestSize(
+		    buffer.GetContext().GetGpuResources(), vertex);
 		if (size == 0) {
 			continue;
 		}
