@@ -511,7 +511,21 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
 	// no guest DCC state, so materialize the deferred value when the surface is next bound.
 	const auto metadata_address = target.desc.info.metadata.range.address;
-	uint32_t   metadata_value   = 0xffffffffu;
+
+	// A fill that arrived before anything claimed this address was parked without its code, because
+	// the dispatch had not run yet. It has now, so read the code out of the allocation - here rather
+	// than inside the cache, whose lock a faulting guest read could re-enter. Happens at most once per
+	// parked fill.
+	if (cache.TakeParkedMetaProbe(metadata_address)) {
+		uint32_t parked = 0;
+		uint8_t  code   = 0;
+		if (Libs::LibKernel::Memory::TryReadBacking(metadata_address, &parked, sizeof(parked)) &&
+		    DecodeDccFillCode(parked, code) && code != DCC_CODE_UNCOMPRESSED) {
+			(void)cache.ClearMeta(metadata_address, code);
+		}
+	}
+
+	uint32_t metadata_value = 0xffffffffu;
 	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
 		return false;
 	}
