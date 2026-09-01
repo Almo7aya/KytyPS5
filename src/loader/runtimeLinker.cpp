@@ -23,6 +23,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
+#include <Zydis/Zydis.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -1156,23 +1157,32 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 		EXIT_IF(Jit::Call9::GetSize() != 9);
 
 		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
-		auto* end_ptr   = start_ptr + size - Jit::Call9::GetSize();
+		auto* end_ptr   = start_ptr + size;
 
-		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
+		ZydisDecoder decoder {};
+		EXIT_IF(ZYAN_FAILED(
+		    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)));
+
+		for (auto* ptr = start_ptr; ptr < end_ptr;) {
+			ZydisDecodedInstruction instruction {};
+			const auto              remaining = static_cast<size_t>(end_ptr - ptr);
+			if (ZYAN_FAILED(ZydisDecoderDecodeInstruction(&decoder, nullptr, ptr, remaining,
+			                                              &instruction))) {
+				++ptr;
+				continue;
+			}
+
 			auto*  inst_ptr     = ptr;
 			size_t prefix_count = 0;
-			while (prefix_count < 3 && inst_ptr < start_ptr + size && *inst_ptr == 0x66) {
+			while (prefix_count < 3 && inst_ptr < end_ptr && *inst_ptr == 0x66) {
 				inst_ptr++;
 				prefix_count++;
 			}
 
-			const size_t inst_size = prefix_count + Jit::Call9::GetSize();
-			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
-				break;
-			}
-
-			const uint8_t modrm = inst_ptr[3];
-			if (memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
+			const size_t  inst_size = prefix_count + Jit::Call9::GetSize();
+			const uint8_t modrm = inst_ptr + Jit::Call9::GetSize() <= end_ptr ? inst_ptr[3] : 0xff;
+			if (instruction.length == inst_size && inst_ptr + Jit::Call9::GetSize() <= end_ptr &&
+			    memcmp(inst_ptr, tls_pattern, 3) == 0 && (modrm & 0xc7u) == 0x04u &&
 			    inst_ptr[4] == tls_pattern[4] &&
 			    *reinterpret_cast<const uint32_t*>(inst_ptr + 5) == 0) {
 				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(ptr));
@@ -1188,7 +1198,9 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 					std::memset(ptr + Jit::Call9::GetSize(), 0x90,
 					            inst_size - Jit::Call9::GetSize());
 				}
-				ptr += inst_size - 1;
+				ptr += inst_size;
+			} else {
+				ptr += instruction.length;
 			}
 		}
 	}
