@@ -285,6 +285,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
 		m_surface_metas.erase(image->info.metadata.range.address);
+		m_parked_meta_probes.erase(image->info.metadata.range.address);
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1874,19 +1875,22 @@ void TextureCache::ParkMetaFill(uint64_t address) {
 	if (m_surface_metas.find(address) != m_surface_metas.end()) {
 		return;
 	}
-	m_surface_metas.emplace(address,
-	                        MetaDataInfo {.type             = MetaDataInfo::Type::PendingDcc,
-	                                      .probe_after_claim = true});
+	m_surface_metas.emplace(address, MetaDataInfo {.type = MetaDataInfo::Type::PendingDcc});
+	m_parked_meta_probes.insert(address);
 }
 
 bool TextureCache::TakeParkedMetaProbe(uint64_t address) {
 	std::scoped_lock lock {m_lock};
-	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || !found->second.probe_after_claim ||
-	    found->second.type == MetaDataInfo::Type::PendingDcc) {
+	const auto       parked = m_parked_meta_probes.find(address);
+	if (parked == m_parked_meta_probes.end()) {
 		return false;
 	}
-	found->second.probe_after_claim = false;
+	// Only once a surface has claimed the address, so the probe reads a code the claim can use.
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc) {
+		return false;
+	}
+	m_parked_meta_probes.erase(parked);
 	return true;
 }
 
@@ -1975,6 +1979,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	const auto       end = address + size;
 	for (auto metadata = m_surface_metas.lower_bound(address);
 	     metadata != m_surface_metas.end() && metadata->first < end;) {
+		m_parked_meta_probes.erase(metadata->first);
 		metadata = m_surface_metas.erase(metadata);
 	}
 	auto images = FindImagesInRegion(address, size, false);
