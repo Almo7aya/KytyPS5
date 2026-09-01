@@ -128,6 +128,74 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// Bytes to bind for a shader buffer descriptor, resolved against the ranges the guest mapped for
+// GPU access. Zero means bind nothing at all.
+//
+// A GNM descriptor's num_records is routinely over-provisioned - commonly close to UINT32_MAX -
+// because the shader bounds-checks its own accesses. The nominal footprint is therefore not a claim
+// that any of it is resident, and binding it whole asks the buffer cache to stage, track and map
+// memory the guest never mapped. The extent comes from the ranges the guest mapped for GPU access
+// rather than from host commit state: that is the question actually being asked, it costs a map
+// probe instead of a kernel transition on a path that runs for every buffer of every draw, and it
+// does not mistake a GPU-owned page or a reserved-but-uncommitted one for an absent mapping.
+//
+// num_records is likewise not a reliable *lower* bound on what a shader reads. A skinned mesh
+// fetches its bone matrices through one descriptor indexed by bone number, and the descriptor it is
+// given routinely describes fewer records than the mesh indexes - so binding exactly
+// stride * num_records leaves every bone past the end reading zero under robust access. Zero
+// matrices collapse their vertices onto the origin while the rest stay correctly posed, which is a
+// mesh torn between two positions with stretched triangles scattering fragments across the screen,
+// not one that is simply missing. Only skinned and movable meshes show it; the static world reads no
+// such buffer and is untouched.
+//
+// So such a descriptor is given the mapped extent even when its record footprint is smaller, and a
+// zero record count - the same under-reporting at its limit - does not short-circuit to nothing.
+// This can only grow a binding, never shrink one, and it stays inside memory the guest mapped for
+// the GPU.
+//
+// Kept as narrow as the symptom allows, on two axes. Only a read-only descriptor with a stride
+// qualifies - a stride is what makes a fetch indexed by record - so raw byte buffers and every
+// written buffer keep the footprint they ask for. Whether the fetch is format-converted makes no
+// difference to the bound and is deliberately not part of the test. And the growth is capped well
+// below the mapping, because ObtainBuffer does not merely bind this range: it tracks it, which
+// write-protects the guest pages underneath. Reaching further than the resource needs puts unrelated
+// game data behind that protection, which is a good deal worse than a short binding. Sixty-four
+// kilobytes is a thousand-odd matrices - far past any real mesh - while staying inside a handful of
+// the buffer cache's own pages.
+//
+// Compute is deliberately included. Skinning does not only happen in the draw path - a skin-cache
+// pass reads the same bone matrices in compute and writes the posed vertices out - so excluding it
+// puts that pass straight back on the short binding and the tear returns.
+static uint64_t StorageBufferExtent(RenderContext&                              context,
+                                    const ShaderBufferResource&                 descriptor,
+                                    const ShaderRecompiler::IR::BufferResource& resource) {
+	const auto address = descriptor.Base48();
+	if (address == 0) {
+		return 0;
+	}
+	const auto stride  = descriptor.Stride();
+	const auto records = descriptor.NumRecords();
+	if (stride != 0 && records > UINT64_MAX / stride) {
+		EXIT("storage buffer descriptor footprint overflow\n");
+	}
+	const auto nominal = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
+
+	constexpr uint64_t IndexedFetchCap = 64ull * 1024ull;
+	const bool         indexed_fetch   = resource.read && !resource.written && stride != 0;
+	if (nominal == 0 && !indexed_fetch) {
+		return 0;
+	}
+	const auto max_range = static_cast<uint64_t>(
+	    context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	const auto read_extent = std::min(max_range, IndexedFetchCap);
+	const auto requested =
+	    indexed_fetch && nominal < read_extent ? read_extent : std::min(nominal, max_range);
+
+	// A base that maps nothing binds the null buffer rather than faulting; reads then return zero,
+	// which is the same answer robust access gives past the end of a short binding.
+	return context.GetGpuResources().MappedExtent(address, requested);
+}
+
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -137,39 +205,33 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	buffer_offset = 0;
 
 	const auto address = descriptor.Base48();
-	const auto stride  = descriptor.Stride();
-	const auto records = descriptor.NumRecords();
-	if (stride != 0 && records > UINT64_MAX / stride) {
-		EXIT("storage buffer descriptor footprint overflow\n");
-	}
-	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-	if (address == 0 || requested_size == 0) {
-		BindNullStorageBuffer(context, result);
-		return result;
-	}
-	const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+	const auto size    = StorageBufferExtent(context, descriptor, resource);
 	if (size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
-	if (alignment == 0 ||
-	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
-		EXIT("storage buffer range or device alignment is unsupported\n");
+	if (alignment == 0) {
+		EXIT("storage buffer device alignment is unsupported\n");
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
-	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
+	const auto max_range =
+	    static_cast<uint64_t>(graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
+	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	result.buffer = buffer->Handle();
-	result.offset = aligned_offset;
-	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
+	// Aligning the offset down puts `adjustment` bytes in front of the binding, so the described
+	// range has to leave room for them inside the device limit. Trimming the tail is safe for the
+	// same reason the clamp in StorageBufferExtent is.
+	const auto bound_size = std::min(size, max_range - adjustment);
+	buffer_offset         = static_cast<uint32_t>(adjustment);
+	result.buffer         = buffer->Handle();
+	result.offset         = aligned_offset;
+	result.range          = static_cast<vk::DeviceSize>(bound_size + adjustment);
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -899,21 +961,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	prepared.buffer_sources.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-		const auto address = descriptor.Base48();
-		const auto stride  = descriptor.Stride();
-		const auto records = descriptor.NumRecords();
-		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
-		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
-			continue;
-		}
-		const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		// Must resolve the same extent NativeStorageBuffer will bind, or the buffer this looks up is
+		// not the one the descriptor ends up describing.
+		const auto size = StorageBufferExtent(m_context, descriptor, program.info.buffers[i]);
 		if (size == 0) {
 			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
 			continue;
 		}
-		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(address, size));
+		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(descriptor.Base48(), size));
 	}
 
 }
