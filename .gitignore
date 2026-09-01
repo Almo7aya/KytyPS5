@@ -1,4 +1,5 @@
 # Visual Studio 2015 cache/options directory
+build-kyty.bat
 .vs/
 .idea/
 build/

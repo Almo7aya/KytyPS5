@@ -1,23 +1,61 @@
-# KytyPS5
+# KytyPS5: Fran's Version
 
-[![Build KytyPS5 (Windows)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
-[![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
-[![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
+<p align="center">
+  <img src="./docs/assets/fran.png" width="160" alt="KytyPS5">
+</p>
+
+<p align="center">
+  KytyPS5 Fork maintained by FranGameTv.
+</p>
+
+<p align="center">
+  <a href="https://github.com/frangametv/sharpemu/releases">
+    <img src="https://img.shields.io/badge/Download-GitHub%20Releases-2EA44F?style=for-the-badge&logo=github&logoColor=white" alt="Download from GitHub Releases">
+  </a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Discord-%40FranGameTv-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord @FranGameTv">
+</p>
+
+> [!NOTE]
+> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
+> not distribute games or copyrighted system software. Use only game files that you have obtained
+> legally.
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
 [Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
 compatibility is limited and behavior may change significantly between builds.
 
-> [!IMPORTANT]
-> KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
-> not distribute games or copyrighted system software. Use only game files that you have obtained
-> legally.
+## About this Fork
 
-## Current Status
+This repository is an unofficial development fork of
+[KytyPS5](https://github.com/KytyPS5/KytyPS5), maintained with the goal of contributing useful, 
+reviewable improvements back to the upstream project.
+
+The `main` branch is the active integration branch and is intended to provide the best generally 
+usable build available in this fork at any given time. Experimental code, diagnostics, 
+and game-specific investigations may initially be developed there while a problem is being studied.
+
+Once a change is understood and ready for review, the temporary instrumentation is removed and the
+resulting fix is extracted into a dedicated branch based on the current upstream `main`. This keeps
+each contribution isolated, testable, and suitable for submission as a focused pull request without
+including unrelated changes from this fork.
+
+The work in this fork has two main goals:
+
+- Study and improve game compatibility, including differences between regional releases and
+  revisions of the same title. The European version of **Grand Theft Auto V** is one current
+  compatibility target.
+- Design and develop a better KytyPS5 user interface, with a focus on usability, configuration,
+  game management, and clear feedback when a title fails to boot or run correctly.
+
+The development approach is practical and evidence-driven: reproduce a problem, investigate it,
+identify its general cause, implement the smallest maintainable fix, verify it, and submit it as an
+independent pull request.
+
+## Current Status of KytyPS5
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
 4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
