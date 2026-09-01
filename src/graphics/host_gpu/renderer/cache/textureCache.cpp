@@ -1250,6 +1250,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc);
 	}
+	(void)MaterializeDccMetaClear(id, image, desc);
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -1293,6 +1294,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		} else if (!inserted && metadata->second.type != MetaDataInfo::Type::Dcc) {
 			EXIT("TextureCache: color target reuses non-DCC metadata\n");
 		}
+		metadata->second.color_clear_value           = desc.metadata_clear_value;
+		metadata->second.color_clear_supported       = desc.metadata_clear_supported;
+		metadata->second.fixed_color_clear_supported = desc.metadata_fixed_clear_supported;
 	}
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
@@ -1857,6 +1861,97 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	} else {
 		found->second.clear_mask &= ~(1u << slice);
 	}
+	return true;
+}
+
+bool TextureCache::ResolveDccMetaClearLocked(uint64_t address, uint32_t base_layer,
+                                             uint32_t layer_count,
+                                             vk::ClearColorValue& clear_value, bool consume) {
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type != MetaDataInfo::Type::Dcc ||
+	    layer_count == 0 || base_layer >= 32 || layer_count > 32 - base_layer) {
+		return false;
+	}
+	const uint32_t layer_mask =
+	    layer_count == 32 ? UINT32_MAX : ((1u << layer_count) - 1u) << base_layer;
+	if ((found->second.clear_mask & layer_mask) != layer_mask) {
+		return false;
+	}
+
+	clear_value = {};
+	switch (static_cast<uint8_t>(found->second.fill_value)) {
+		case 0x00: break;
+		case 0x20:
+			if (!found->second.color_clear_supported) {
+				return false;
+			}
+			clear_value = found->second.color_clear_value;
+			break;
+		case 0x40:
+			if (!found->second.fixed_color_clear_supported) {
+				return false;
+			}
+			clear_value.float32[3] = 1.0f;
+			break;
+		case 0x80:
+			if (!found->second.fixed_color_clear_supported) {
+				return false;
+			}
+			clear_value.float32[0] = 1.0f;
+			clear_value.float32[1] = 1.0f;
+			clear_value.float32[2] = 1.0f;
+			break;
+		case 0xc0:
+			if (!found->second.fixed_color_clear_supported) {
+				return false;
+			}
+			clear_value.float32[0] = 1.0f;
+			clear_value.float32[1] = 1.0f;
+			clear_value.float32[2] = 1.0f;
+			clear_value.float32[3] = 1.0f;
+			break;
+		default: return false;
+	}
+	if (consume) {
+		found->second.clear_mask &= ~layer_mask;
+	}
+	return true;
+}
+
+bool TextureCache::ResolveDccMetaClear(uint64_t address, uint32_t base_layer,
+                                       uint32_t layer_count,
+                                       vk::ClearColorValue& clear_value) {
+	std::scoped_lock lock {m_lock};
+	return ResolveDccMetaClearLocked(address, base_layer, layer_count, clear_value, true);
+}
+
+bool TextureCache::MaterializeDccMetaClear(ImageId id, Image& image, const ImageDesc& desc) {
+	const auto& metadata = image.info.metadata;
+	if (metadata.kind != ImageMetadataKind::Dcc) {
+		return false;
+	}
+	vk::ClearColorValue clear_value {};
+	if (!ResolveDccMetaClearLocked(metadata.range.address, desc.view_info.base_layer,
+	                               desc.view_info.layer_count, clear_value, false)) {
+		return false;
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	              ImageSubresourceRange {desc.view_info.base_level, desc.view_info.level_count,
+	                                     desc.view_info.base_layer, desc.view_info.layer_count},
+	              command.Handle());
+	const vk::ImageSubresourceRange range {
+	    vk::ImageAspectFlagBits::eColor, desc.view_info.base_level, desc.view_info.level_count,
+	    desc.view_info.base_layer, desc.view_info.layer_count};
+	command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                                 &clear_value, 1, &range);
+	if (!ResolveDccMetaClearLocked(metadata.range.address, desc.view_info.base_layer,
+	                               desc.view_info.layer_count, clear_value, true)) {
+		EXIT("TextureCache: failed to consume materialized DCC clear\n");
+	}
+	CommitGpuWrite(image);
+	TrackImageDownload(id, image);
 	return true;
 }
 
