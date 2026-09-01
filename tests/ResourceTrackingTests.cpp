@@ -1001,6 +1001,43 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
+void TestDynamicScalarBufferUsesDma() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &base = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U32));
+  const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                 {Value(&base), Value(16u)}, 0, loop);
+  base.AddPhiOperand(entry, fixture.UserData(0));
+  base.AddPhiOperand(loop, next);
+  const auto descriptor = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(&base), Value(0x12340000u), Value(0u), Value(0u)},
+      MemoryFlags{0, 0x93c}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarBuffer;
+  const auto flags = fixture.AddMemory(memory, 0x93c);
+  fixture.Emit(ValueOpcode::ReadConstBuffer, {descriptor, Value(8u)}, flags,
+               loop);
+
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.buffers.empty() && fixture.program.info.uses_dma &&
+            fixture.program.memory_info[flags.index].kind ==
+                ResourceKind::ScalarAddress,
+        "dynamic scalar descriptor was not lowered to DMA");
+  const auto lowered = std::ranges::find_if(*loop, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::LoadAddressU32;
+  });
+  Check(lowered != loop->end() && lowered->Arg(0).ResolveInstruction() != nullptr &&
+            lowered->Arg(0).ResolveInstruction()->GetOpcode() ==
+                ValueOpcode::GetAddressResource,
+        "dynamic scalar load did not retain an address resource");
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -1342,6 +1379,7 @@ int main() {
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("dynamic scalar buffer DMA", TestDynamicScalarBufferUsesDma);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);

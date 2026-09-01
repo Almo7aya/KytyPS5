@@ -3,6 +3,8 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <cinttypes>
+
 namespace Libs::Graphics {
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
@@ -16,7 +18,10 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 	create_info.pNext = &type_info;
 
 	const auto result = m_graphics.device.createSemaphore(&create_info, nullptr, &m_semaphore);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || m_semaphore == nullptr);
+	if (result != vk::Result::eSuccess || m_semaphore == nullptr) {
+		EXIT("MasterSemaphore::MasterSemaphore: createSemaphore failed: %s",
+		     vk::to_string(result).c_str());
+	}
 }
 
 MasterSemaphore::~MasterSemaphore() {
@@ -28,7 +33,10 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("MasterSemaphore::Refresh: getSemaphoreCounterValue failed: %s",
+		     vk::to_string(result).c_str());
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -53,7 +61,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("MasterSemaphore::Wait: waitSemaphores tick=%" PRIu64 " failed: %s", tick,
+		     vk::to_string(result).c_str());
+	}
 	Refresh();
 }
 

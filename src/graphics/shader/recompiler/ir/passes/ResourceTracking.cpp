@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
@@ -109,6 +110,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		LowerDynamicScalarBuffers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -211,6 +213,78 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static bool ContainsPhi(Value value, std::vector<const Inst*>& visited) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+			return false;
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return true;
+		}
+		visited.push_back(inst);
+		for (uint32_t index = 0; index < inst->NumArgs(); index++) {
+			if (ContainsPhi(inst->Arg(index), visited)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void LowerDynamicScalarBuffers() {
+		for (auto* block: m_program.blocks) {
+			for (auto inst = block->begin(); inst != block->end(); ++inst) {
+				if (inst->GetOpcode() != ValueOpcode::ReadConstBuffer) {
+					continue;
+				}
+				const auto flags = inst->Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					Fail(flags.pc,
+					     fmt::format("memory metadata index {} is out of range", flags.index));
+				}
+				auto& memory = m_program.memory_info[flags.index];
+				if (memory.kind != ResourceKind::ScalarBuffer || inst->NumArgs() != 2u) {
+					continue;
+				}
+				auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    handle->NumArgs() != 4u) {
+					continue;
+				}
+				DescriptorSource descriptor;
+				MakeSource(*handle, 4u, false, false, descriptor, flags.pc);
+				uint32_t bad_dword = 0;
+				if (ValidateSource(descriptor, bad_dword)) {
+					continue;
+				}
+				std::vector<const Inst*> visited;
+				const bool dynamic_phi = bad_dword == 0u &&
+				                         descriptor.dwords[0].Resolve().GetType() == Type::U32 &&
+				                         ContainsPhi(descriptor.dwords[0], visited) &&
+				                         ValidateRuntimeValue(m_program, descriptor.dwords[1]) &&
+				                         ValidateRuntimeValue(m_program, descriptor.dwords[2]) &&
+				                         ValidateRuntimeValue(m_program, descriptor.dwords[3]);
+				if (!dynamic_phi) {
+					continue;
+				}
+
+				// Scalar loads only need the descriptor base. Preserve a phi-mediated base in
+				// shader IR and route it through the existing guest-address BDA translation.
+				const auto high = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::BitwiseAnd32, {handle->Arg(1), Value(0xffffu)}));
+				const auto address = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::GetAddressResource, {handle->Arg(0), high}));
+				uint64_t load_flags = 0;
+				std::memcpy(&load_flags, &flags, sizeof(flags));
+				const auto load = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::LoadAddressU32,
+				    {address, inst->Arg(1), Value(0u), Value(true)}, load_flags));
+				inst->ReplaceUsesWith(load);
+				memory.kind = ResourceKind::ScalarAddress;
+			}
+		}
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {
@@ -652,6 +726,24 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			if (handle != nullptr && handle->GetOpcode() == ValueOpcode::GetBufferResource) {
+				DescriptorSource diagnostic;
+				MakeSource(*handle, 4u, false, false, diagnostic, flags.pc);
+				uint32_t bad_dword = 0;
+				if (!ValidateSource(diagnostic, bad_dword)) {
+					const auto value = diagnostic.dwords[bad_dword].Resolve();
+					const auto* root = value.TryInstruction();
+					Fail(flags.pc,
+					     fmt::format("{} kind={} bits={} dwords={} formatted={} typed={} uses "
+					                 "GetBufferResource dword {} rooted at {} which is not a valid "
+					                 "runtime value",
+					                 ValueOpcodeName(op), static_cast<uint32_t>(memory.kind),
+					                 memory.data_bits, memory.data_dwords, memory.formatted,
+					                 memory.typed, bad_dword,
+					                 root != nullptr ? ValueOpcodeName(root->GetOpcode()) : "literal"));
+				}
+			}
 			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
