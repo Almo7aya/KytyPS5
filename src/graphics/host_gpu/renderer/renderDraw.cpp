@@ -527,21 +527,7 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
 	// no guest DCC state, so materialize the deferred value when the surface is next bound.
 	const auto metadata_address = target.desc.info.metadata.range.address;
-
-	// A fill that arrived before anything claimed this address was parked without its code, because
-	// the dispatch had not run yet. It has now, so read the code out of the allocation - here rather
-	// than inside the cache, whose lock a faulting guest read could re-enter. Happens at most once per
-	// parked fill.
-	if (cache.TakeParkedMetaProbe(metadata_address)) {
-		uint32_t parked = 0;
-		uint8_t  code   = 0;
-		if (Libs::LibKernel::Memory::TryReadBacking(metadata_address, &parked, sizeof(parked)) &&
-		    DecodeDccFillCode(parked, code) && code != DCC_CODE_UNCOMPRESSED) {
-			(void)cache.ClearMeta(metadata_address, code);
-		}
-	}
-
-	uint32_t metadata_value = 0xffffffffu;
+	uint32_t   metadata_value   = 0xffffffffu;
 	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
 		return false;
 	}
@@ -626,6 +612,22 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = target.image_view;
 		attachment.image_layout = layout;
 		attachment.clear_value  = target.color_clear_value.uint32;
+		// A fill that arrived before anything claimed this address was parked without its code,
+		// because the dispatch had not run yet. It has now, so read the code out of the allocation and
+		// record it before the clear is resolved below. Deliberately here rather than inside the
+		// texture cache: TryReadBacking on GPU-protected guest memory faults into HandleGpuFault and
+		// TextureCache::InvalidateMemory, which takes the same non-recursive lock. Happens at most
+		// once per parked fill.
+		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		    cache.TakeParkedMetaProbe(target.desc.info.metadata.range.address)) {
+			const auto parked_address = target.desc.info.metadata.range.address;
+			uint32_t   parked         = 0;
+			uint8_t    code           = 0;
+			if (Libs::LibKernel::Memory::TryReadBacking(parked_address, &parked, sizeof(parked)) &&
+			    DecodeDccFillCode(parked, code) && code != DCC_CODE_UNCOMPRESSED) {
+				(void)cache.ClearMeta(parked_address, code);
+			}
+		}
 		vk::ClearColorValue metadata_clear_value {};
 		const bool          metadata_clear =
 		    ResolveDccAttachmentClear(cache, target, view, metadata_clear_value);
