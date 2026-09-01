@@ -79,19 +79,56 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		return false;
 	}
 
-	uint8_t clear_code = DCC_CODE_UNCOMPRESSED;
+	// DCC_CODE_UNCOMPRESSED doubles as this function's "no code found" fallback and as the guest's
+	// real uncompressed code, so failing to recover a value is indistinguishable from the guest
+	// asking for a decompress - and silently not a clear. Both sources below therefore have to be
+	// tried before settling for it.
+	uint8_t  clear_code = DCC_CODE_UNCOMPRESSED;
+	bool     recovered  = false;
+	uint32_t scanned    = 0;
+
+	// A two-buffer fill splats a dword sourced from a companion read-only buffer. The guest value
+	// sits at that descriptor's base address; the index the recompiled shader applies is only Kyty's
+	// own host alignment adjustment on top of guest offset 0. A DCC clear code is byte-replicated by
+	// construction, which is what makes that test sufficient.
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (program.info.buffers[i].written) {
 			continue;
 		}
 		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 		uint32_t   value      = 0;
+		scanned++;
 		if (LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value)) &&
 		    DecodeDccFillCode(value, clear_code)) {
+			recovered = true;
 			break;
 		}
 		clear_code = DCC_CODE_UNCOMPRESSED;
 	}
+
+	// A single-buffer fill carries its code as a literal compiled into the shader, so there is
+	// nothing in the dispatch to decode: user data holds four dwords and all four are the written
+	// buffer's own descriptor. Its IR is a bare `StoreBufferU32 <resource>, <linear index>,
+	// 0x00000000`, and because the constant is compiled in, a different code would be a different
+	// shader.
+	//
+	// The value is still observable in the one place the shader puts it - the metadata allocation
+	// itself. This shape is not recognized before the surface registers its metadata, because it
+	// fails ResolveComputeImageClear's stride==16 / R32G32B32A32_UINT gates, so the fill executes for
+	// real at least once and leaves its code in guest memory. Reading it back models DCC honestly:
+	// the metadata *is* guest memory the shader wrote.
+	//
+	// Requiring a byte-replicated value other than the uncompressed code stops this inventing a clear
+	// out of an allocation that merely reads zero-initialised, and DecodeDccConstantClear still has to
+	// accept the result downstream.
+	if (!recovered && scanned == 0) {
+		uint32_t present = 0;
+		if (!LibKernel::Memory::TryReadBacking(meta_address, &present, sizeof(present)) ||
+		    !DecodeDccFillCode(present, clear_code) || clear_code == DCC_CODE_UNCOMPRESSED) {
+			clear_code = DCC_CODE_UNCOMPRESSED;
+		}
+	}
+
 	return cache.ClearMeta(meta_address, clear_code);
 }
 
