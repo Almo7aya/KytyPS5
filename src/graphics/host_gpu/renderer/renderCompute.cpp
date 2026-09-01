@@ -35,6 +35,33 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// The metadata fill this title uses: one written buffer, no other resources, and a user data that is
+// nothing but that buffer's own descriptor. Deliberately strict, because matching it lets a dispatch
+// register a speculative metadata address, and a generic "fill a dword buffer" shader must not.
+template <typename Program, typename Resources>
+static bool IsSingleBufferFillShape(const Program& program, const Resources& resources) {
+	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
+	    program.info.has_bitwise_xor || program.user_data_base != 0 ||
+	    resources.user_data.size() != 4) {
+		return false;
+	}
+	const auto& resource = program.info.buffers.front();
+	if (!resource.written || resource.read || resource.atomic || resource.scalar) {
+		return false;
+	}
+	const auto& raw = resources.buffers.front();
+	if (raw.dword_count != 4) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != resources.user_data[i]) {
+			return false;
+		}
+	}
+	return DecodeNativeDescriptor<ShaderBufferResource>(raw).Stride() == sizeof(uint32_t);
+}
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -78,6 +105,19 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 	if (meta_address == 0) {
+		// Nothing has claimed this address as metadata yet, so the fill cannot be applied - but
+		// discarding it means a surface bound later never learns it was cleared. Measured: four
+		// 1024x1024 surfaces were filled at frame 2, first bound at frame 871, and stayed uncleared
+		// for the remaining 150 frames because the guest never re-filled them.
+		//
+		// Park it instead, matching what TryConsumeDccFill does for the other fill path, and return
+		// false so the dispatch still runs. Restricted to the exact shape of the single-buffer fill
+		// (its whole user data is the written descriptor, stride 4, no other resources) so an ordinary
+		// buffer-writing dispatch cannot plant a speculative metadata entry.
+		if (IsSingleBufferFillShape(program, resources)) {
+			cache.ParkMetaFill(
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers.front()).Base48());
+		}
 		return false;
 	}
 

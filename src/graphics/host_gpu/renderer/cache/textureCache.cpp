@@ -1863,6 +1863,33 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
+// A fill aimed at an address no surface has claimed yet used to be dropped on the floor, so a surface
+// first bound long afterwards never received its clear - measured on four 1024x1024 surfaces filled at
+// frame 2 and bound from frame 871, which then stayed uncleared for the rest of the run. Park the fact
+// that a fill happened, the way TryConsumeDccFill already does for the other fill path. The code is
+// deliberately not recorded: the caller lets the dispatch execute, so it only lands in the allocation
+// afterwards, and TakeParkedMetaProbe hands the read back to a caller that can do it safely.
+void TextureCache::ParkMetaFill(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	if (m_surface_metas.find(address) != m_surface_metas.end()) {
+		return;
+	}
+	m_surface_metas.emplace(address,
+	                        MetaDataInfo {.type             = MetaDataInfo::Type::PendingDcc,
+	                                      .probe_after_claim = true});
+}
+
+bool TextureCache::TakeParkedMetaProbe(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || !found->second.probe_after_claim ||
+	    found->second.type == MetaDataInfo::Type::PendingDcc) {
+		return false;
+	}
+	found->second.probe_after_claim = false;
+	return true;
+}
+
 bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
