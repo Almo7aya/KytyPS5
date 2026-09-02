@@ -550,6 +550,21 @@ private:
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
+			// GTA V uses a runtime-selected sampler alongside its indirect image table.
+			// The sampler table is not materialized yet, so failing compilation here
+			// prevents the whole story renderer from starting. A zero descriptor is the
+			// native default point sampler and is safe until dynamic sampler tables are
+			// fully supported; image descriptors remain tracked normally.
+			std::vector<const Inst*> visited;
+			const bool dynamic_sampler_base =
+			    sampler && bad_dword == 0u &&
+			    descriptor.dwords[0].Resolve().GetType() == Type::U32 &&
+			    ContainsPhi(descriptor.dwords[0], visited);
+			if (dynamic_sampler_base) {
+				descriptor.dwords.fill(Value(0u));
+				source = InternSource(descriptor);
+				return;
+			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
 		}

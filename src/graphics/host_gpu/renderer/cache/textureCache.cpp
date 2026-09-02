@@ -894,9 +894,23 @@ void TextureCache::PrepareStorageSampledOverlap(const ImageDesc& desc) {
 		}
 	}
 
-	// Keep both incompatible owners alive. FindImage and ResolveOverlap exclude the
-	// mismatched owner, allowing storage and sampled descriptors in the same binding
-	// set to retain valid, independently registered images.
+	// Once the storage bytes have been published, discard the incompatible owner.
+	// The next lookup creates a correctly formatted image and uploads from the
+	// invalidated backing range. Keeping both owners registered leaves the sampled
+	// owner stale (notably the R8 glyph atlas) and can also make the range tracker
+	// select the wrong image.
+	std::scoped_lock lock {m_lock};
+	for (const auto id: candidates) {
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered) {
+			continue;
+		}
+		if (image->IsGpuModified()) {
+			EXIT("TextureCache: cannot separate storage/sampled image without readback at "
+			     "0x%016" PRIx64 "\n", image->info.data.address);
+		}
+		FreeImage(id);
+	}
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
