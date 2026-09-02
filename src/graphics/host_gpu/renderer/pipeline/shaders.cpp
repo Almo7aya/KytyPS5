@@ -424,7 +424,8 @@ void CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
     const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache) {
+    const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, GraphicsPipelineLibraryCache* library_cache) {
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(vertex_module == nullptr || (ps_active && pixel_module == nullptr));
 
@@ -803,35 +804,39 @@ void CreatePipelineInternal(
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
 	}
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
-	constexpr auto GraphicsStages =
-	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-	const vk::PushConstantRange push_constants {GraphicsStages, 0,
-	                                            ShaderRecompiler::IR::NativePushConstantSize};
+	if (library_cache != nullptr) {
+		library_cache->PrepareLayout(pipeline, descriptor_bindings);
+	} else {
+		CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+		constexpr auto GraphicsStages =
+		    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+		const vk::PushConstantRange push_constants {GraphicsStages, 0,
+		                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
-	pipeline_layout_info.pNext                  = nullptr;
-	pipeline_layout_info.flags                  = {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
-	pipeline_layout_info.pushConstantRangeCount = 1;
-	pipeline_layout_info.pPushConstantRanges    = &push_constants;
+		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+		pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
+		pipeline_layout_info.pNext                  = nullptr;
+		pipeline_layout_info.flags                  = {};
+		pipeline_layout_info.setLayoutCount         = 1;
+		pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
-	EXIT_IF(pipeline.pipeline_layout != nullptr);
+		EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
-		     " set_layouts=1 push_constants=%" PRIu32 "\n",
-		     pipeline.vs_shader_id, pipeline.ps_shader_id, 1u);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreatePipelineLayout begin VS=%" PRIu64 " PS=%" PRIu64
+			     " set_layouts=1 push_constants=%" PRIu32 "\n",
+			     pipeline.vs_shader_id, pipeline.ps_shader_id, 1u);
+		}
+		result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+		                                              &pipeline.pipeline_layout);
+		if (graphics_debug_dump_enabled()) {
+			LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
+			     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
+		}
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	}
-	result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                              &pipeline.pipeline_layout);
-	if (graphics_debug_dump_enabled()) {
-		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
-		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
-	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
@@ -934,8 +939,18 @@ void CreatePipelineInternal(
 		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
 		     scissor.extent.width, scissor.extent.height);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	const auto  pre_raster_stage_count = shader_stage_count - (ps_active ? 1u : 0u);
+	const auto* fragment_stage = ps_active ? &shader_stages[shader_stage_count - 1] : nullptr;
+	const bool  library_created =
+	    library_cache != nullptr &&
+	    library_cache->CreatePipeline(pipeline, rendering, static_params, pipeline_info,
+	                                  pre_raster_stage_count, fragment_stage);
+	if (!library_created) {
+		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	} else {
+		result = vk::Result::eSuccess;
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     VulkanToString(result).c_str(), static_cast<void*>(pipeline.pipeline));

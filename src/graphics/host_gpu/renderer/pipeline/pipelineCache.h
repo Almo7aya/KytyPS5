@@ -22,6 +22,7 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class GraphicsPipelineLibraryCache;
 
 namespace HW {
 class Context;
@@ -131,6 +132,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    owns_layout           = true;
 	};
 
 	struct GraphicsPipeline: Pipeline {
@@ -244,6 +246,7 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	std::unique_ptr<GraphicsPipelineLibraryCache> m_graphics_library_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
@@ -256,13 +259,34 @@ private:
 	void InitializeDriverCache();
 };
 
+class GraphicsPipelineLibraryCache {
+public:
+	GraphicsPipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache);
+	~GraphicsPipelineLibraryCache();
+	KYTY_CLASS_NO_COPY(GraphicsPipelineLibraryCache);
+
+	void PrepareLayout(PipelineCache::GraphicsPipeline&                pipeline,
+	                   std::span<const vk::DescriptorSetLayoutBinding> bindings);
+	bool CreatePipeline(PipelineCache::GraphicsPipeline&         pipeline,
+	                    const PipelineRenderingState&            rendering,
+	                    const PipelineStaticParameters&          static_params,
+	                    const vk::GraphicsPipelineCreateInfo&    pipeline_info,
+	                    uint32_t                                 pre_raster_stage_count,
+	                    const vk::PipelineShaderStageCreateInfo* fragment_stage);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m_impl;
+};
+
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
     const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache);
+    const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, GraphicsPipelineLibraryCache* library_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
