@@ -2216,11 +2216,20 @@ bool Structurize(Graph& graph) {
 
 	Graph failed_graph      = std::move(graph);
 	graph                   = std::move(original);
-	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
+	// Retrying once per block repeatedly copies and recomputes CFG analyses that ultimately need
+	// the dispatcher fallback. Preserve the useful repair for one shared arm in a small graph, but
+	// keep speculative repair work bounded so more complex failures cannot block a frame.
+	constexpr uint32_t MaxRouteAttempts = 1;
+	constexpr uint32_t MaxRepairBlocks  = 16;
+	const auto         route_budget =
+	    graph.blocks.size() <= MaxRepairBlocks
+	        ? std::min(static_cast<uint32_t>(graph.blocks.size()), MaxRouteAttempts)
+	        : 0u;
 	// Apply one route at a time and retry. Eagerly routing every matching diamond can
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
-		if (!RouteSharedSelectionArm(graph, route_variable)) {
+		const bool routed_selection = RouteSharedSelectionArm(graph, route_variable);
+		if (!routed_selection) {
 			break;
 		}
 		Graph routed = graph;
