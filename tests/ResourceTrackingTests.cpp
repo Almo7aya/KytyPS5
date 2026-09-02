@@ -663,6 +663,49 @@ void TestSampleAdjustSamplerScratch() {
             descriptor.dwords[3] == 0x80000abcu,
         "SampleAdjust canonicalization lost sampler border fields");
 
+  Fixture phi_fixture(ShaderType::Pixel);
+  auto *left = phi_fixture.block;
+  auto *right = phi_fixture.AddBlock();
+  auto *join = phi_fixture.AddBlock();
+  left->AddBranch(join);
+  right->AddBranch(join);
+  const auto phi_active = phi_fixture.Emit(ValueOpcode::WqmMask, {Value(true)}, 0, left);
+  const auto phi_lane = phi_fixture.Emit(ValueOpcode::SelectU32,
+                                         {phi_active, Value(1u), Value(0u)}, 0, left);
+  const auto phi_scratch = phi_fixture.Emit(
+      ValueOpcode::ShiftLeftLogical32,
+      {phi_fixture.Emit(ValueOpcode::BitwiseAnd32, {phi_lane, Value(0xffu)}, 0, left),
+       Value(12u)},
+      0, left);
+  auto &phi_reserved = join->AppendNewInst(ValueOpcode::Phi, {},
+                                            static_cast<uint64_t>(Type::U32));
+  phi_reserved.AddPhiOperand(left, phi_scratch);
+  phi_reserved.AddPhiOperand(right, Value(0u));
+  phi_fixture.block = join;
+  const auto phi_word3 = phi_fixture.Emit(ValueOpcode::BitwiseOr32,
+                                          {phi_fixture.UserData(3), Value(&phi_reserved)}, 0,
+                                          join);
+  const auto phi_image = phi_fixture.Image(
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)},
+      0x1fc);
+  const auto phi_sampler = phi_fixture.Sampler(
+      {phi_fixture.UserData(0), phi_fixture.UserData(1), phi_fixture.UserData(2), phi_word3},
+      0x1fc);
+  MemoryInfo phi_memory;
+  phi_memory.kind = ResourceKind::Image;
+  phi_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  phi_memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  phi_fixture.Emit(ValueOpcode::ImageSampleRaw,
+                   {phi_image, phi_sampler, phi_fixture.ImageAddress()},
+                   phi_fixture.AddMemory(phi_memory, 0x1fc), join);
+  phi_fixture.PlanAndTrack();
+  const auto phi_source = phi_fixture.program.info.samplers[0].source;
+  Check(phi_fixture.program.descriptor_sources[phi_source].dwords[3]
+            .Resolve()
+            .TryInstruction()
+            ->GetOpcode() == ValueOpcode::GetUserData,
+        "SampleAdjust reserved Phi scratch remained in sampler identity");
+
   const auto CheckRejected = [](uint32_t flags, uint32_t shift,
                                 const char *message) {
     Fixture rejected(ShaderType::Pixel);
@@ -1038,6 +1081,39 @@ void TestDynamicScalarBufferUsesDma() {
         "dynamic scalar load did not retain an address resource");
 }
 
+void TestDynamicScalarDescriptorTupleUsesDma() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  std::array<Inst *, 4> words{};
+  for (uint32_t index = 0; index < words.size(); index++) {
+    auto &word = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                   {Value(&word), Value(16u + index)}, 0, loop);
+    word.AddPhiOperand(entry, fixture.UserData(index));
+    word.AddPhiOperand(loop, next);
+    words[index] = &word;
+  }
+  const auto descriptor = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(words[0]), Value(words[1]), Value(words[2]), Value(words[3])},
+      MemoryFlags{0, 0x950}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarBuffer;
+  const auto flags = fixture.AddMemory(memory, 0x950);
+  fixture.Emit(ValueOpcode::ReadConstBuffer, {descriptor, Value(8u)}, flags, loop);
+
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.buffers.empty() && fixture.program.info.uses_dma &&
+            fixture.program.memory_info[flags.index].kind ==
+                ResourceKind::ScalarAddress,
+        "dynamic scalar descriptor tuple was not lowered to DMA");
+}
+
 void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
@@ -1380,6 +1456,7 @@ int main() {
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("dynamic scalar buffer DMA", TestDynamicScalarBufferUsesDma);
+    Run("dynamic scalar descriptor tuple DMA", TestDynamicScalarDescriptorTupleUsesDma);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);

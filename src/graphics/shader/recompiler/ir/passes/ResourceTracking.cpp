@@ -16,28 +16,50 @@ namespace {
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
-uint32_t PossibleU32Bits(Value value) {
+uint32_t PossibleU32BitsImpl(Value value, std::vector<const Inst*>& visiting) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
 		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
 	}
 	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) {
+	if (inst == nullptr || std::ranges::find(visiting, inst) != visiting.end()) {
 		return UINT32_MAX;
 	}
+	visiting.push_back(inst);
+	const auto possible = [&](Value operand) { return PossibleU32BitsImpl(operand, visiting); };
+	uint32_t result = UINT32_MAX;
 	switch (inst->GetOpcode()) {
 		case ValueOpcode::BitwiseAnd32:
-			return PossibleU32Bits(inst->Arg(0)) & PossibleU32Bits(inst->Arg(1));
+			result = possible(inst->Arg(0)) & possible(inst->Arg(1));
+			break;
 		case ValueOpcode::BitwiseOr32:
-			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
+			result = possible(inst->Arg(0)) | possible(inst->Arg(1));
+			break;
 		case ValueOpcode::ShiftLeftLogical32: {
 			const auto shift = inst->Arg(1).Resolve();
-			return shift.IsImmediate() && shift.GetType() == Type::U32
-			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
-			           : UINT32_MAX;
+			result = shift.IsImmediate() && shift.GetType() == Type::U32
+			             ? possible(inst->Arg(0)) << (shift.U32() & 31u)
+			             : UINT32_MAX;
+			break;
 		}
-		default: return UINT32_MAX;
+		case ValueOpcode::SelectU32:
+			result = possible(inst->Arg(1)) | possible(inst->Arg(2));
+			break;
+		case ValueOpcode::Phi:
+			result = 0u;
+			for (uint32_t index = 0; index < inst->NumArgs(); index++) {
+				result |= possible(inst->Arg(index));
+			}
+			break;
+		default: break;
 	}
+	visiting.pop_back();
+	return result;
+}
+
+uint32_t PossibleU32Bits(Value value) {
+	std::vector<const Inst*> visiting;
+	return PossibleU32BitsImpl(value, visiting);
 }
 
 Value CanonicalizeSampleAdjustDword3(Value value) {
@@ -260,18 +282,18 @@ private:
 					continue;
 				}
 				std::vector<const Inst*> visited;
-				const bool dynamic_phi = bad_dword == 0u &&
-				                         descriptor.dwords[0].Resolve().GetType() == Type::U32 &&
-				                         ContainsPhi(descriptor.dwords[0], visited) &&
-				                         ValidateRuntimeValue(m_program, descriptor.dwords[1]) &&
-				                         ValidateRuntimeValue(m_program, descriptor.dwords[2]) &&
-				                         ValidateRuntimeValue(m_program, descriptor.dwords[3]);
+				const bool all_dwords_are_u32 = std::ranges::all_of(
+				    std::span(descriptor.dwords).first(descriptor.dword_count),
+				    [](Value dword) { return dword.Resolve().GetType() == Type::U32; });
+				const bool dynamic_phi = bad_dword == 0u && all_dwords_are_u32 &&
+				                         ContainsPhi(descriptor.dwords[0], visited);
 				if (!dynamic_phi) {
 					continue;
 				}
 
-				// Scalar loads only need the descriptor base. Preserve a phi-mediated base in
-				// shader IR and route it through the existing guest-address BDA translation.
+				// Scalar loads only need the descriptor base. A descriptor selected as a complete
+				// tuple by control flow (as in GTA V) remains coherent when its low/high address
+				// words are passed through the existing guest-address BDA translation.
 				const auto high = Value(&*block->PrependNewInst(
 				    inst, ValueOpcode::BitwiseAnd32, {handle->Arg(1), Value(0xffffu)}));
 				const auto address = Value(&*block->PrependNewInst(
