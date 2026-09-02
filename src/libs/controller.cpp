@@ -39,10 +39,41 @@ struct PadControllerInformation {
 	uint8_t  reserve[8];
 };
 
+struct PadLightBarParam {
+	uint8_t r;
+	uint8_t g;
+	uint8_t b;
+	uint8_t reserve;
+};
+
 struct PadVibrationParam {
 	uint8_t large_motor;
 	uint8_t small_motor;
 };
+
+struct PadTriggerEffectCommand {
+	uint32_t mode;
+	uint8_t  reserve[4];
+	uint8_t  data[48];
+};
+
+struct PadTriggerEffectParam {
+	uint8_t                 trigger_mask;
+	uint8_t                 reserve[7];
+	PadTriggerEffectCommand command[2];
+};
+
+static_assert(sizeof(PadTriggerEffectCommand) == 56);
+static_assert(sizeof(PadTriggerEffectParam) == 120);
+
+struct DualSenseEffects {
+	uint8_t enable_bits;
+	uint8_t reserve[9];
+	uint8_t right_trigger[11];
+	uint8_t left_trigger[11];
+};
+
+static_assert(sizeof(DualSenseEffects) == 32);
 
 struct ControllerState {
 	struct Touch {
@@ -73,6 +104,8 @@ public:
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
+	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -123,6 +156,92 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
+}
+
+static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, uint8_t type,
+                                 uint8_t frequency = 0) {
+	uint16_t active = 0;
+	uint32_t packed = 0;
+	for (int i = 0; i < 10; i++) {
+		if (strengths[i] > 8) {
+			return false;
+		}
+		if (strengths[i] != 0) {
+			active |= static_cast<uint16_t>(1u << i);
+			packed |= static_cast<uint32_t>(strengths[i] - 1u) << (3 * i);
+		}
+	}
+
+	effect[0] = active != 0 && (type != 0x26 || frequency != 0) ? type : 0x05;
+	effect[1] = static_cast<uint8_t>(active);
+	effect[2] = static_cast<uint8_t>(active >> 8u);
+	effect[3] = static_cast<uint8_t>(packed);
+	effect[4] = static_cast<uint8_t>(packed >> 8u);
+	effect[5] = static_cast<uint8_t>(packed >> 16u);
+	effect[6] = static_cast<uint8_t>(packed >> 24u);
+	effect[9] = frequency;
+	return true;
+}
+
+static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect) {
+	std::memset(effect, 0, 11);
+	effect[0] = 0x05;
+
+	uint8_t strengths[10] = {};
+	switch (command.mode) {
+		case 0: return true;
+		case 1:
+			if (command.data[0] > 9 || command.data[1] > 8) {
+				return false;
+			}
+			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
+			return trigger_effect_zones(effect, strengths, 0x21);
+		case 2: {
+			const auto start    = command.data[0];
+			const auto end      = command.data[1];
+			const auto strength = command.data[2];
+			if (start < 2 || start > 7 || end <= start || end > 8 || strength > 8) {
+				return false;
+			}
+			if (strength == 0) {
+				return true;
+			}
+			const uint16_t zones = static_cast<uint16_t>((1u << start) | (1u << end));
+			effect[0]            = 0x25;
+			effect[1]            = static_cast<uint8_t>(zones);
+			effect[2]            = static_cast<uint8_t>(zones >> 8u);
+			effect[3]            = strength - 1u;
+			return true;
+		}
+		case 3:
+			if (command.data[0] > 9 || command.data[1] > 8) {
+				return false;
+			}
+			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
+			return trigger_effect_zones(effect, strengths, 0x26, command.data[2]);
+		case 4: return trigger_effect_zones(effect, command.data, 0x21);
+		case 5: {
+			const int start          = command.data[0];
+			const int end            = command.data[1];
+			const int start_strength = command.data[2];
+			const int end_strength   = command.data[3];
+			if (start > 8 || end <= start || end > 9 || start_strength < 1 || start_strength > 8 ||
+			    end_strength < 1 || end_strength > 8) {
+				return false;
+			}
+			for (int i = start; i < 10; i++) {
+				const int delta  = (end_strength - start_strength) * (i - start);
+				const int length = end - start;
+				strengths[i]     = static_cast<uint8_t>(
+				    i >= end ? end_strength
+				             : start_strength +
+				                   (delta + (delta < 0 ? -length / 2 : length / 2)) / length);
+			}
+			return trigger_effect_zones(effect, strengths, 0x21);
+		}
+		case 6: return trigger_effect_zones(effect, command.data + 1, 0x26, command.data[0]);
+		default: return false;
+	}
 }
 
 void Initialize() {
@@ -304,6 +423,44 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	}
 }
 
+void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
+	Common::LockGuard lock(m_mutex);
+	if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	    pad != nullptr) {
+		(void)SDL_GameControllerSetLED(pad, r, g, b);
+	}
+}
+
+bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+	if ((param.trigger_mask & ~0x03u) != 0) {
+		return false;
+	}
+
+	DualSenseEffects effect {};
+	if ((param.trigger_mask & 0x01u) != 0) {
+		effect.enable_bits |= 0x08;
+		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger)) {
+			return false;
+		}
+	}
+	if ((param.trigger_mask & 0x02u) != 0) {
+		effect.enable_bits |= 0x04;
+		if (!trigger_effect_to_dualsense(param.command[1], effect.right_trigger)) {
+			return false;
+		}
+	}
+	if (effect.enable_bits == 0) {
+		return true;
+	}
+
+	Common::LockGuard lock(m_mutex);
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
+		(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
+	}
+	return true;
+}
+
 void GameController::GetConnectionInfo(bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -358,44 +515,31 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
-void ControllerConnect(int id) {
-	EXIT_IF(g_controller == nullptr);
-
+void Connect(int id) {
 	g_controller->Connect(id);
 }
 
-void ControllerDisconnect(int id) {
-	EXIT_IF(g_controller == nullptr);
-
+void Disconnect(int id) {
 	g_controller->Disconnect(id);
 }
 
-void ControllerButton(int id, uint32_t button, bool down) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetButton(int id, uint32_t button, bool down) {
 	g_controller->Button(id, button, down);
 }
 
-void ControllerAxis(int id, Axis axis, int value) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetAxis(int id, Axis axis, int value) {
 	g_controller->Axis(id, axis, value);
 }
 
-void ControllerRightStick(int id, int x, int y) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetRightStick(int id, int x, int y) {
 	g_controller->RightStick(id, x, y);
 }
 
-void ControllerTouchPad(int id, int finger, bool down, float x, float y) {
-	EXIT_IF(g_controller == nullptr);
-
+void SetTouchPad(int id, int finger, bool down, float x, float y) {
 	g_controller->TouchPad(id, finger, down, x, y);
 }
 
-void ControllerResetInputState() {
-	EXIT_IF(g_controller == nullptr);
+void ResetInputState() {
 	g_controller->ResetInputState();
 }
 
@@ -490,8 +634,6 @@ int KYTY_SYSV_ABI PadResetOrientation(int handle) {
 int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info) {
 	PRINT_NAME();
 
-	EXIT_IF(g_controller == nullptr);
-
 	int  connected_count = 0;
 	bool connected       = false;
 
@@ -529,8 +671,6 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_controller == nullptr);
-
 	int             connected_count = 0;
 	bool            connected       = false;
 	ControllerState state;
@@ -554,8 +694,6 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	}
 
 	std::memset(data, 0, sizeof(PadData) * static_cast<size_t>(num));
-
-	EXIT_IF(g_controller == nullptr);
 
 	int             connected_count = 0;
 	bool            connected       = false;
@@ -591,7 +729,6 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	     "\t small_motor = %d\n",
 	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
 
-	EXIT_IF(g_controller == nullptr);
 	g_controller->SetVibration(param->large_motor, param->small_motor);
 
 	return OK;
@@ -617,7 +754,22 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
+	g_controller->SetLightBar(param->r, param->g, param->b);
+
 	return OK;
+}
+
+int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
+	PRINT_NAME();
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (param == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
 }
 
 } // namespace Libs::Controller
