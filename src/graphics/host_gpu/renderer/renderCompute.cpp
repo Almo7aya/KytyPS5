@@ -333,10 +333,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
-		const bool prefetched =
-		    m_context.GetGpuResources().PrepareBdaPointers(bindings.user_data) ||
+		const bool user_data_prefetched =
+		    m_context.GetGpuResources().PrepareBdaPointers(bindings.user_data);
+		const bool flattened_srt_prefetched =
 		    m_context.GetGpuResources().PrepareBdaPointers(bindings.flattened_srt);
-		if (!prefetched) {
+		if (!user_data_prefetched && !flattened_srt_prefetched) {
 			m_context.GetGpuResources().PrepareBda();
 		}
 	}
