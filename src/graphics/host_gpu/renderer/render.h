@@ -174,11 +174,12 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
-	                                                       const ShaderStageRuntime& pixel,
-	                                                       bool                      pixel_active);
+	[[nodiscard]] GraphicsBindings& PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+	                                                        const ShaderStageRuntime& pixel,
+	                                                        bool                      pixel_active);
 	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderColorInfo& target, uint32_t render_target_slice_offset = 0,
 	                              uint32_t render_target_slot = UINT32_MAX,
@@ -211,6 +212,7 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	GraphicsBindings                      m_graphics_bindings;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

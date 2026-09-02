@@ -167,7 +167,7 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 // pass reads the same bone matrices in compute and writes the posed vertices out - so excluding it
 // puts that pass straight back on the short binding and the tear returns.
 static uint64_t StorageBufferExtent(RenderContext&                              context,
-                                    const ShaderBufferResource&                 descriptor,
+	                                const ShaderBufferResource&                 descriptor,
                                     const ShaderRecompiler::IR::BufferResource& resource) {
 	const auto address = descriptor.Base48();
 	if (address == 0) {
@@ -200,12 +200,11 @@ static BufferView NativeStorageBuffer(RenderContext&                            
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
                                       ShaderType stage, uint32_t slot, uint32_t& buffer_offset,
-                                      BufferId id) {
+                                      uint64_t size, BufferId id) {
 	BufferView result;
 	buffer_offset = 0;
 
 	const auto address = descriptor.Base48();
-	const auto size    = StorageBufferExtent(context, descriptor, resource);
 	if (size == 0) {
 		BindNullStorageBuffer(context, result);
 		return result;
@@ -919,14 +918,28 @@ void RenderExecutor::ResetBindings() {
 }
 
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+	PreparedBindings prepared;
+	PrepareBindings(runtime, prepared);
+	return prepared;
+}
+
+void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
+                                     PreparedBindings&         prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
-	PreparedBindings prepared;
+	auto& descriptors = prepared.resources;
+	descriptors.buffers.clear();
+	descriptors.images.clear();
+	descriptors.samplers.clear();
+	descriptors.gds           = {};
+	descriptors.flattened_srt = {};
+	descriptors.shader_data   = {};
+	prepared.buffer_bindings.clear();
+	prepared.shader_data.clear();
 	prepared.program  = runtime.program;
 	prepared.snapshot = &runtime.resources;
-	auto& descriptors = prepared.resources;
 	descriptors.buffers.reserve(program.info.buffers.size());
 	descriptors.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -940,14 +953,15 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	}
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+		const auto index = reg - program.user_data_base;
+		EXIT_IF(index >= snapshot.user_data.size());
+		prepared.shader_data.push_back(snapshot.user_data[index]);
 	}
 	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		descriptors.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
-	return prepared;
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -956,21 +970,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	const auto& program  = *prepared.program;
 	const auto& snapshot = *prepared.snapshot;
 	auto&       cache    = m_context.GetBufferCache();
-
-	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
+	prepared.buffer_bindings.clear();
+	prepared.buffer_bindings.reserve(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-		// Must resolve the same extent NativeStorageBuffer will bind, or the buffer this looks up is
-		// not the one the descriptor ends up describing.
-		const auto size = StorageBufferExtent(m_context, descriptor, program.info.buffers[i]);
-		if (size == 0) {
-			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
-			continue;
+		auto& buffer = prepared.buffer_bindings.emplace_back();
+		buffer.descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+		buffer.extent = StorageBufferExtent(m_context, buffer.descriptor, program.info.buffers[i]);
+		if (buffer.extent != 0) {
+			buffer.id = cache.FindBuffer(buffer.descriptor.Base48(), buffer.extent);
 		}
-		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(descriptor.Base48(), size));
 	}
-
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -980,7 +989,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
+	EXIT_IF(prepared.buffer_bindings.size() != program.info.buffers.size());
 
 	resources.buffers.clear();
 	resources.buffers.reserve(program.info.buffers.size());
@@ -993,11 +1002,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[dword] |= offset << shift;
 	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto& [descriptor, buffer_id] = prepared.buffer_sources[i];
-		uint32_t buffer_offset = 0;
-		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
+		const auto& buffer        = prepared.buffer_bindings[i];
+		uint32_t    buffer_offset = 0;
+		resources.buffers.push_back(NativeStorageBuffer(m_context, buffer.descriptor,
 		                                                program.info.buffers[i], program.stage, i,
-		                                                buffer_offset, buffer_id));
+		                                                buffer_offset, buffer.extent, buffer.id));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
@@ -1059,14 +1068,18 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
-RenderExecutor::GraphicsBindings
+RenderExecutor::GraphicsBindings&
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	auto& bindings = m_graphics_bindings;
+	PrepareBindings(vertex, bindings.vertex);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		if (!bindings.pixel) {
+			bindings.pixel.emplace();
+		}
+		PrepareBindings(pixel, *bindings.pixel);
+	} else {
+		bindings.pixel.reset();
 	}
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {

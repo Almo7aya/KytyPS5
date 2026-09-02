@@ -53,11 +53,12 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = vs_input_info.stage.resources;
+	const auto& user_data = resources.user_data;
 	if (program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
 		    static_cast<uint32_t>(program.info.vertex_offset_sgpr) - program.user_data_base;
-		if (index < resources.user_data.size()) {
-			return static_cast<int32_t>(resources.user_data[index]);
+		if (index < user_data.size()) {
+			return static_cast<int32_t>(user_data[index]);
 		}
 	}
 
@@ -1185,8 +1186,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
-	                                        state.ps_active);
+	auto& bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
+	                                         state.ps_active);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
 	state.rendering =
