@@ -830,10 +830,6 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
-	}
-
 	(void)count_in_dwords;
 
 	switch (op) {
@@ -842,6 +838,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			const auto predicate_address = reinterpret_cast<uint64_t>(address);
+			auto&      buffer_cache      = m_renderer.GetBufferCache();
+			const bool predicate_gpu_dirty =
+			    buffer_cache.HasGpuDirtyBytes(predicate_address, sizeof(uint64_t)) ||
+			    buffer_cache.IsRegionGpuModified(predicate_address, sizeof(uint64_t));
+			if (wait_op != 0 && predicate_gpu_dirty) {
+				BufferFlushAndWait();
+			}
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 
