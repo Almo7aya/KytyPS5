@@ -315,6 +315,11 @@ struct TextureCacheTestAccess {
     cache.DeleteImage(id);
   }
 
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
   static const Image *Owner(const TextureCache &cache, ImageId id) {
     return cache.m_slot_images.try_get(id);
   }
@@ -4197,6 +4202,32 @@ public:
                   complete_owner->IsDefinitelyCpuDirty(),
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
+
+      constexpr uint64_t range_growth_offset = 0x720000;
+      auto narrow_range = sampled;
+      narrow_range.info.data = {base + range_growth_offset, 0x1000};
+      const auto narrow_range_id = texture_cache.FindImage(narrow_range);
+      const auto narrow_range_view =
+          texture_cache.FindTexture(narrow_range_id, narrow_range);
+      texture_cache.MarkGpuWritten(narrow_range_id);
+
+      auto expanded_range = narrow_range;
+      expanded_range.info.data.size = 0x2000;
+      const auto expanded_range_id = texture_cache.FindImage(expanded_range);
+      const auto expanded_range_owner =
+          TextureCacheTestAccess::Owner(texture_cache, expanded_range_id);
+      Require(name, "equal-layout guest-range growth",
+              narrow_range_view != nullptr && expanded_range_id &&
+                  expanded_range_id != narrow_range_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    narrow_range_id) &&
+                  expanded_range_owner != nullptr &&
+                  expanded_range_owner->info.data == expanded_range.info.data &&
+                  expanded_range_owner->backing.extent == narrow_range.info.extent &&
+                  expanded_range_owner->IsGpuModified(),
+              "a larger guest range for the same image layout was not expanded "
+              "while preserving native GPU contents");
+      TextureCacheTestAccess::FreeImage(texture_cache, expanded_range_id);
 
       ImageInfo chain = sampled.info;
       chain.data = {0x10000, 0x8000};

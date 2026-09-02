@@ -803,6 +803,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// A texture can retain the same native layout while a later descriptor reveals more of its
+		// mapped allocation. Re-register the full range and preserve any newer native contents.
+		const bool compatible_range_growth =
+		    requested.data.size > cached.info.data.size &&
+		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
+		    requested.pixel_format == cached.info.pixel_format &&
+		    requested.guest_format == cached.info.guest_format &&
+		    requested.extent.width >= cached.info.extent.width &&
+		    requested.extent.height >= cached.info.extent.height &&
+		    requested.extent.depth >= cached.info.extent.depth && !requested.HasStencil() &&
+		    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
+		if (compatible_range_growth) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
