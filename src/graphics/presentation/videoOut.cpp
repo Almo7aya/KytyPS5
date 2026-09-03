@@ -1123,6 +1123,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
+	KYTY_PROFILER_FRAME_MARK;
 	Graphics::RenderDocOnGuestFlip();
 
 	m_mutex.Lock();

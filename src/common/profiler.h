@@ -82,4 +82,13 @@ struct Lifecycle {
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
 
+// FrameMark touches the profiler instance unconditionally; with TRACY_MANUAL_LIFETIME that
+// instance only exists after StartupProfiler(), so guard it like ScopedBlock does.
+#define KYTY_PROFILER_FRAME_MARK                                                                   \
+	do {                                                                                           \
+		if (tracy::ProfilerAvailable()) {                                                          \
+			FrameMark;                                                                             \
+		}                                                                                          \
+	} while (false)
+
 #endif /* KYTY_COMMON_PROFILER_H_ */
