@@ -1200,10 +1200,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	auto* pipeline_ptr = m_context.GetPipelineCache().CreateGraphicsPipeline(
+	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
+	    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+	    primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+	if (pipeline_ptr == nullptr) {
+		// The pipeline is still compiling on a worker; this draw is dropped for the frame.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1375,6 +1380,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// A shader is still being translated on a worker; drop this draw for the frame.
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);
@@ -1461,6 +1471,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// A shader is still being translated on a worker; drop this draw for the frame.
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&

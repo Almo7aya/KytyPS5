@@ -72,6 +72,8 @@ static void PrintUsage() {
 	::printf("  --profiler-direction <value>         None or Network.\n");
 	::printf("  --hot-pages <true|false>             Keep frequently rewritten GPU-visible pages\n"
 	         "                                       writable instead of faulting. Default: true.\n");
+	::printf("  --async-shaders <true|false>         Build graphics pipelines on worker threads and\n"
+	         "                                       skip draws until ready. Default: true.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
@@ -298,6 +300,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--profiler-direction") {
 			if (!ParseEnum(value, options.config.profiler_direction)) {
 				::printf("invalid profiler direction: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--async-shaders") {
+			if (!ParseBool(value, options.config.async_shaders)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--hot-pages") {

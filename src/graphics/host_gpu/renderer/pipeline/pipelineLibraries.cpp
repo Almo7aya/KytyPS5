@@ -6,7 +6,9 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -138,10 +140,16 @@ struct GraphicsPipelineLibraryCache::Impl {
 	Impl(GraphicContext& graphics, vk::PipelineCache driver_cache)
 	    : graphics(graphics), driver_cache(driver_cache) {}
 
+	// Callable from several pipeline-builder threads at once: the map is consulted under a lock,
+	// the (slow) driver compile runs outside it, and a duplicate produced by a racing thread is
+	// discarded in favour of the one already registered.
 	vk::Pipeline CreateLibrary(LibraryMap& libraries, const LibraryKey& key,
 	                           const vk::GraphicsPipelineCreateInfo& create_info) {
-		if (const auto iter = libraries.find(key); iter != libraries.end()) {
-			return iter->second;
+		{
+			std::lock_guard lock(libraries_mutex);
+			if (const auto iter = libraries.find(key); iter != libraries.end()) {
+				return iter->second;
+			}
 		}
 		vk::Pipeline pipeline = nullptr;
 		const auto   result = graphics.device.createGraphicsPipelines(driver_cache, 1, &create_info,
@@ -155,13 +163,20 @@ struct GraphicsPipelineLibraryCache::Impl {
 			failed = true;
 			return nullptr;
 		}
-		libraries.emplace(key, pipeline);
+		std::lock_guard lock(libraries_mutex);
+		const auto [iter, inserted] = libraries.emplace(key, pipeline);
+		if (!inserted) {
+			graphics.device.destroyPipeline(pipeline, nullptr);
+			return iter->second;
+		}
 		return pipeline;
 	}
 
 	GraphicContext&                                      graphics;
 	vk::PipelineCache                                    driver_cache = nullptr;
-	bool                                                 failed       = false;
+	std::atomic<bool>                                    failed       = false;
+	std::mutex                                           libraries_mutex;
+	std::mutex                                           layouts_mutex;
 	std::unordered_map<LayoutKey, Layout, LayoutKeyHash> layouts;
 	LibraryMap                                           vertex_input_libraries;
 	LibraryMap                                           pre_raster_libraries;
@@ -195,6 +210,7 @@ void GraphicsPipelineLibraryCache::PrepareLayout(
     PipelineCache::GraphicsPipeline&                pipeline,
     std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	const LayoutKey key {pipeline.vs_shader_id, pipeline.ps_shader_id};
+	std::lock_guard layout_lock(m_impl->layouts_mutex);
 	auto            iter = m_impl->layouts.find(key);
 	if (iter == m_impl->layouts.end()) {
 		Impl::Layout layout {};

@@ -168,7 +168,9 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	GraphicsPipeline&
+	// Returns null while the pipeline is still being built on a worker thread (async mode); the
+	// caller skips the draw and retries on a later frame.
+	GraphicsPipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
@@ -176,6 +178,9 @@ public:
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);
+	// The vertex-layout part of a graphics pipeline key, derived from the bound vertex buffers.
+	[[nodiscard]] static PipelineVertexInputState
+	BuildVertexInputState(const ShaderVertexInputInfo& vs_input_info);
 
 private:
 	struct ProgramCache;
@@ -267,7 +272,28 @@ private:
 	              m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Asynchronous graphics pipeline construction. Keys being built live in m_pending_pipelines
+	// (GPU thread only); finished pipelines wait in m_completed_pipelines until the GPU thread
+	// drains them at its next lookup.
+	struct CompletedPipeline {
+		GraphicsPipelineKey               key;
+		std::unique_ptr<GraphicsPipeline> pipeline;
+	};
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
+	std::mutex                                                       m_completed_mutex;
+	std::vector<CompletedPipeline>                                   m_completed_pipelines;
+	std::mutex                                                       m_job_mutex;
+	std::condition_variable                                          m_job_available;
+	std::deque<std::function<void()>>                                m_jobs;
+	std::vector<std::jthread>                                        m_workers;
+	bool                                                             m_stop_workers = false;
+	bool                                                             m_async        = false;
+
 	void InitializeDriverCache();
+	void StartWorkers();
+	void StopWorkers();
+	void EnqueueJob(std::function<void()> job);
+	void DrainCompletedPipelines();
 };
 
 class GraphicsPipelineLibraryCache {
