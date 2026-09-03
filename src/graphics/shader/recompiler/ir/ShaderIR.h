@@ -482,6 +482,8 @@ struct CompiledShaderInfo {
 	BindingLayout                 bindings;
 };
 
+struct CompiledSrt;
+
 // Immutable runtime resource analysis retained by the shader cache. It owns only the native
 // value graph reachable from descriptors/SRT reads, rather than the translated shader CFG.
 struct ResourcePlan {
@@ -503,6 +505,13 @@ struct ResourcePlan {
 	std::vector<uint32_t>               materialization_sources;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<uint8_t>                clean_flat_slots;
+	// Number of values carrying an eval slot (see Inst::GetEvalSlot); 0 when not numbered.
+	uint32_t                            eval_slot_count                = 0;
+	// Lazily built flat evaluation program (SrtWalker.cpp). Null until the first evaluation;
+	// a failed compile is remembered so the interpreter is used without retrying.
+	mutable std::shared_ptr<CompiledSrt> compiled_srt;
+	mutable bool                         compiled_srt_attempted   = false;
+	mutable uint32_t                     compiled_srt_verify_left = 32;
 	bool                                requires_specialization_memory = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

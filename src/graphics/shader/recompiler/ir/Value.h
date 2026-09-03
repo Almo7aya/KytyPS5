@@ -144,12 +144,19 @@ public:
 		std::memcpy(&flags, &value, sizeof(value));
 	}
 
+	// Dense index assigned to the values of an extracted ResourcePlan so per-draw evaluation can
+	// memoize in a flat array. Unset (NoEvalSlot) for ordinary program instructions.
+	static constexpr uint32_t NoEvalSlot = 0xffffffffu;
+	[[nodiscard]] uint32_t    GetEvalSlot() const { return eval_slot; }
+	void                      SetEvalSlot(uint32_t slot) { eval_slot = slot; }
+
 private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	uint32_t            eval_slot = NoEvalSlot;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;
