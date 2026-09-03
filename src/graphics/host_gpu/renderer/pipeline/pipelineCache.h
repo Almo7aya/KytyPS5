@@ -9,12 +9,22 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -199,10 +209,9 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
+			// The struct is packed with no padding, so hashing its bytes in one pass is exact;
+			// this runs once per draw.
+			Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -245,6 +254,8 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	GraphicsPipelineKey           m_last_graphics_key {};
+	GraphicsPipeline*             m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	std::unique_ptr<GraphicsPipelineLibraryCache> m_graphics_library_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
