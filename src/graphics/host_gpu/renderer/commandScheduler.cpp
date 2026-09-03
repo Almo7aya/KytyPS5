@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -217,6 +218,30 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
+	// Called before every draw and dispatch. Querying the timeline semaphore is a driver round
+	// trip, so only do it when something is actually waiting on an unknown tick, and then no more
+	// often than every quarter millisecond; waits and submits refresh the tick anyway.
+	bool front_known_free = false;
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_pending_operations.empty()) {
+			return;
+		}
+		front_known_free = m_master.IsFree(m_pending_operations.front().tick);
+	}
+	if (front_known_free) {
+		PopPendingOperations(false);
+		return;
+	}
+	const auto now = Common::Timer::QueryPerformanceCounter();
+	if (m_refresh_interval_qpc == 0) {
+		m_refresh_interval_qpc = Common::Timer::QueryPerformanceFrequency() / 4000;
+	}
+	if (now - m_last_refresh_qpc < m_refresh_interval_qpc) {
+		PopPendingOperations(false);
+		return;
+	}
+	m_last_refresh_qpc = now;
 	PopPendingOperations(true);
 }
 
