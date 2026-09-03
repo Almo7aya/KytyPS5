@@ -712,8 +712,14 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	static_params.depth_write_enable = (depth.depth_write_enable && !depth.depth_clear_enable);
 	static_params.depth_compare_op   = depth.depth_compare_op;
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
+#if defined(__APPLE__)
+	static_params.depth_min_bounds = depth.depth_min_bounds;
+	static_params.depth_max_bounds = depth.depth_max_bounds;
+#else
+	// The bounds themselves are dynamic state (see SetGraphicsDynamicParams); keep the key stable.
+	static_params.depth_min_bounds = 0.0f;
+	static_params.depth_max_bounds = 1.0f;
+#endif
 	static_params.stencil_test_enable      = depth.stencil_test_enable;
 	static_params.stencil_front            = depth.stencil_static_front;
 	static_params.stencil_back             = depth.stencil_static_back;

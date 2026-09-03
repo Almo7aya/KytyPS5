@@ -395,6 +395,10 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
 
+#if !defined(__APPLE__)
+	vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+#endif
+
 	if (depth.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
 		                                depth.stencil_dynamic_front.compareMask);

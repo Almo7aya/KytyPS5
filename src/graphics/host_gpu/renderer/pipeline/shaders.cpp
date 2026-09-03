@@ -876,6 +876,9 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eStencilWriteMask,
 	    vk::DynamicState::eBlendConstants,
 #if !defined(__APPLE__)
+	    // Depth bounds change per draw in UE4 titles; baking them into the pipeline key created a
+	    // new pipeline every few draws. MoltenVK disables depth bounds testing entirely.
+	    vk::DynamicState::eDepthBounds,
 	    // Keep last so depth-only pipelines can omit this dynamic state.
 	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
 #endif
