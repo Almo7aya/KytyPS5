@@ -264,6 +264,23 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
+	// Every download here costs a full GPU drain. A CPU that touches one dword of a GPU-written
+	// buffer usually goes on to touch the rest of it (polling several counters, clearing a
+	// buffer page by page), so hand the whole owning buffer back to the CPU in one drain instead
+	// of one drain per 4 KB page. Downloading more than was asked for is always safe.
+	constexpr uint64_t MaxWidenedReadback = 8ull * 1024 * 1024;
+	Buffer*            hot_owner          = nullptr;
+	if (const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	    owner != nullptr && *owner) {
+		auto& buffer = m_slot_buffers[*owner];
+		if (!buffer.is_deleted && buffer.IsInBounds(vaddr, 1) &&
+		    buffer.Size() <= MaxWidenedReadback) {
+			const auto end = std::max(vaddr + size, buffer.CpuAddress() + buffer.Size());
+			vaddr          = buffer.CpuAddress();
+			size           = end - vaddr;
+			hot_owner      = &buffer;
+		}
+	}
 	std::vector<DownloadCopy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size,
@@ -301,7 +318,38 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		return;
 	}
-	DownloadBufferMemory(copies);
+	// A buffer the CPU keeps reading back (GPU counters, query results) gets a host-visible
+	// shadow recorded at the end of every slice that writes it. When that shadow is at least as
+	// new as the last GPU write, the read only has to wait for a tick that usually finished long
+	// ago instead of draining the whole GPU.
+	constexpr uint64_t MaxHotReadbackSize = 1024 * 1024;
+	const auto overlaps_recent_write = [&](const DownloadCopy& copy) {
+		return std::ranges::any_of(hot_owner->writes_since_shadow, [&](const auto& write) {
+			return copy.address < write.address + write.size &&
+			       write.address < copy.address + copy.size;
+		});
+	};
+	const bool shadow_usable =
+	    hot_owner != nullptr && hot_owner->readback_hot && hot_owner->shadow_valid &&
+	    hot_owner->writes_since_shadow.size() < 64 &&
+	    m_scheduler.CurrentTick() - hot_owner->shadow_tick < 64 &&
+	    std::ranges::all_of(copies, [&](const DownloadCopy& copy) {
+		    return copy.buffer == hot_owner && !overlaps_recent_write(copy);
+	    });
+	if (shadow_usable) {
+		m_scheduler.Wait(hot_owner->shadow_tick);
+		m_download_buffer.Invalidate(hot_owner->shadow_offset, hot_owner->Size());
+		const auto* shadow = m_download_buffer.Mapped().data() + hot_owner->shadow_offset;
+		for (const auto& copy: copies) {
+			Libs::LibKernel::Memory::WriteBacking(copy.address, shadow + copy.source_offset,
+			                                      copy.size);
+		}
+	} else {
+		if (hot_owner != nullptr && hot_owner->Size() <= MaxHotReadbackSize) {
+			hot_owner->readback_hot = true;
+		}
+		DownloadBufferMemory(copies);
+	}
 	// The enumeration above covered whole dirty pages and every exact interval on them.
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	if (is_write) {
@@ -467,8 +515,84 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		buffer->last_gpu_write_tick = m_scheduler.CurrentTick();
+		if (buffer->readback_hot) {
+			if (buffer->writes_since_shadow.size() < 64) {
+				buffer->writes_since_shadow.push_back({vaddr, size});
+			}
+			if (!buffer->shadow_pending) {
+				buffer->shadow_pending = true;
+				m_hot_written.push_back(id);
+			}
+		}
 	}
 	return {buffer, buffer->Offset(vaddr)};
+}
+
+void BufferCache::RecordHotShadows() {
+	if (m_hot_written.empty()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	for (const auto id: m_hot_written) {
+		auto* buffer = m_slot_buffers.try_get(id);
+		if (buffer == nullptr || buffer->is_deleted) {
+			continue;
+		}
+		buffer->shadow_pending = false;
+		const auto [mapped, offset] = m_download_buffer.Map(buffer->Size(), DOWNLOAD_ALIGNMENT);
+		if (mapped == nullptr) {
+			buffer->shadow_valid = false;
+			continue;
+		}
+		m_download_buffer.CopyFrom(command, *buffer, 0, offset, buffer->Size(),
+		                           vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
+		                           vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+		                           vk::AccessFlagBits::eHostRead);
+		m_download_buffer.Commit();
+		buffer->shadow_offset = offset;
+		buffer->shadow_tick   = m_scheduler.CurrentTick();
+		buffer->shadow_valid  = true;
+		buffer->writes_since_shadow.clear();
+		// Once the GPU has produced this shadow, push it into guest memory proactively. A CPU
+		// poll that arrives afterwards then reads current data without faulting at all.
+		const auto tick = buffer->shadow_tick;
+		m_scheduler.DeferOperation([this, id, tick] { WriteBackShadow(id, tick); });
+	}
+	m_hot_written.clear();
+}
+
+void BufferCache::WriteBackShadow(BufferId id, uint64_t tick) {
+	auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer == nullptr || buffer->is_deleted || !buffer->readback_hot || !buffer->shadow_valid ||
+	    buffer->shadow_tick != tick || !buffer->writes_since_shadow.empty()) {
+		return;
+	}
+	const auto                base = buffer->CpuAddress();
+	const auto                size = buffer->Size();
+	std::vector<DownloadCopy> copies;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    base, size,
+	    [](uint64_t, uint64_t) noexcept {},
+	    [&](uint64_t address, uint64_t bytes) noexcept {
+		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
+			    const auto start = std::max(range.address, base);
+			    const auto end   = std::min(range.address + range.size, base + size);
+			    if (start < end) {
+				    copies.push_back({buffer, start - base, start, end - start});
+			    }
+		    }
+	    });
+	if (copies.empty()) {
+		return;
+	}
+	m_download_buffer.Invalidate(buffer->shadow_offset, size);
+	const auto* shadow = m_download_buffer.Mapped().data() + buffer->shadow_offset;
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(copy.address, shadow + copy.source_offset, copy.size);
+		m_gpu_modified_ranges.Subtract(copy.address, copy.size);
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(base, size);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -686,6 +810,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	RecordHotShadows();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
