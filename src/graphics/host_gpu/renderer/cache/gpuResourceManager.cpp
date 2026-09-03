@@ -98,6 +98,7 @@ void GpuResourceManager::PrepareBda() {
 }
 
 void GpuResourceManager::RunGarbageCollector() {
+	RegionManager::AdvanceGeneration();
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();

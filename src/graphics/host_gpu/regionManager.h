@@ -2,12 +2,17 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <utility>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -91,12 +96,43 @@ public:
 		return RegionBits(bits, start, end).Any();
 	}
 
-	template <DirtySource source, bool enable>
+	// How an upload treats pages that the CPU rewrites every frame ("hot"). A hot page is left
+	// dirty and writable so it never faults again; instead it is re-uploaded at most once per
+	// submission. A GPU write to the page ends that regime because GPU-dirty and CPU-dirty are
+	// mutually exclusive states.
+	enum class HotPolicy { Preserve, ClearAll, ClearAndUnhot };
+
+	// Global submission generation; advanced once per completed GPU submission.
+	static void AdvanceGeneration() noexcept {
+		s_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// Forget hot state for pages leaving the cache or joining a new host buffer. The stored
+	// content hashes must go too: a new buffer needs every dirty page uploaded regardless.
+	void ClearHot(uint64_t vaddr, uint64_t size) {
+		if (!m_hot_any && !m_hot_hash) {
+			return;
+		}
+		const auto [start, end] = GetPageRange(vaddr, size);
+		m_hot.UnsetRange(start, end);
+		m_hot_uploaded.UnsetRange(start, end);
+		m_faulted_recently.UnsetRange(start, end);
+		if (m_hot_hash) {
+			std::fill(m_hot_hash->begin() + static_cast<std::ptrdiff_t>(start),
+			          m_hot_hash->begin() + static_cast<std::ptrdiff_t>(end), 0);
+		}
+		m_hot_any = m_hot.Any();
+	}
+
+	template <DirtySource source, bool enable, bool from_fault = false>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
+			}
+			if constexpr (from_fault) {
+				NoteCpuFault(start, end);
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
@@ -118,16 +154,61 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
+	                          HotPolicy policy = HotPolicy::ClearAll) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		RegionBits mask(GetBits<source>(), start, end);
-		if constexpr (clear) {
-			GetBits<source>().UnsetRange(start, end);
-		}
 		if constexpr (source == DirtySource::Cpu && clear) {
+			if (policy == HotPolicy::Preserve && m_hot_any) {
+				RefreshHotUploads();
+				const RegionBits hot_in_range(m_hot, start, end);
+				if (hot_in_range.Any()) {
+					// Hot pages already uploaded this submission drop out of the upload set; the
+					// rest stay dirty (and writable) but are recorded as uploaded.
+					mask &= ~(hot_in_range & m_hot_uploaded);
+					m_hot_uploaded |= hot_in_range;
+					// A hot page is often bound in every submission but rewritten only once per
+					// frame. Hash its contents and upload only when they actually changed.
+					const auto candidates = mask & hot_in_range;
+					if (candidates.Any()) {
+						if (!m_hot_hash) {
+							m_hot_hash =
+							    std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
+							m_hot_hash->fill(0);
+						}
+						for (const auto [first, last]: candidates) {
+							for (auto page = first; page < last; page++) {
+								const auto hash = XXH3_64bits(
+								    reinterpret_cast<const void*>(m_cpu_addr +
+								                                  page * TRACKER_PAGE_SIZE),
+								    TRACKER_PAGE_SIZE);
+								if (hash == (*m_hot_hash)[page]) {
+									mask.Unset(page);
+								} else {
+									(*m_hot_hash)[page] = hash;
+								}
+							}
+						}
+					}
+					auto to_clear = mask & ~m_hot;
+					m_cpu_dirty &= ~to_clear;
+					UpdateCpuProtection<true>();
+					ForEachRange(mask, std::forward<Func>(func));
+					return;
+				}
+			}
+			GetBits<source>().UnsetRange(start, end);
+			if (policy == HotPolicy::ClearAndUnhot && m_hot_any) {
+				m_hot.UnsetRange(start, end);
+				m_hot_uploaded.UnsetRange(start, end);
+				m_hot_any = m_hot.Any();
+			}
 			UpdateCpuProtection<true>();
 			ForEachRange(mask, std::forward<Func>(func));
 			return;
+		}
+		if constexpr (clear) {
+			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Gpu && clear) {
 			UpdateGpuProtection<false>();
@@ -198,12 +279,55 @@ private:
 		}
 	}
 
+	// A page that faults twice within FaultWindow submissions is hot. The window is a coarse
+	// generation stamp: the "faulted recently" set is wiped whenever it is older than the window.
+	// Wider windows (128) turned once-per-frame rewrites hot too, but hashing those pages every
+	// submission cost more than their faults did.
+	static constexpr uint64_t FaultWindow = 16;
+
+	void NoteCpuFault(size_t start, size_t end) {
+		if (!Config::HotPageTrackingEnabled()) {
+			return;
+		}
+		const auto generation = s_generation.load(std::memory_order_relaxed);
+		if (generation - m_fault_generation >= FaultWindow) {
+			m_faulted_recently.Clear();
+			m_fault_generation = generation;
+		}
+		const RegionBits range_recent(m_faulted_recently, start, end);
+		if (range_recent.Any()) {
+			const auto newly_hot = range_recent & ~m_hot;
+			if (newly_hot.Any()) {
+				m_hot |= newly_hot;
+				m_hot_any = true;
+			}
+		}
+		m_faulted_recently.SetRange(start, end);
+	}
+
+	void RefreshHotUploads() {
+		const auto generation = s_generation.load(std::memory_order_relaxed);
+		if (generation != m_upload_generation) {
+			m_hot_uploaded.Clear();
+			m_upload_generation = generation;
+		}
+	}
+
+	inline static std::atomic_uint64_t s_generation {0};
+
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	RegionBits   m_hot;
+	RegionBits   m_hot_uploaded;
+	RegionBits   m_faulted_recently;
+	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_hot_hash;
+	uint64_t     m_fault_generation  = 0;
+	uint64_t     m_upload_generation = 0;
+	bool         m_hot_any           = false;
 };
 
 } // namespace Libs::Graphics

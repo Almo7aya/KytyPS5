@@ -132,6 +132,7 @@ void MemoryTracker::UntrackMemoryImpl(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 	locks.clear();

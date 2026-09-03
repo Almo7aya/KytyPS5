@@ -25,10 +25,34 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// One locked pass answering "CPU-dirty somewhere and GPU-dirty nowhere", the fast-path test
+	// ObtainBuffer makes for every small read-only binding.
+	[[nodiscard]] bool IsRegionCpuModifiedAndGpuClean(uint64_t vaddr, uint64_t size) {
+		CheckNotInUploadCallback();
+		bool cpu_any = false;
+		bool gpu_any = false;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+				gpu_any = true;
+				return true;
+			}
+			cpu_any |= manager->IsModified<DirtySource::Cpu>(offset, bytes);
+			return false;
+		});
+		return !gpu_any && cpu_any;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Drops hot-page state for a range that now belongs to a new host buffer.
+	void ClearHotPages(uint64_t vaddr, uint64_t size) {
+		Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -45,7 +69,8 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				manager->ChangeState<DirtySource::Cpu, true, true>(manager->GetCpuAddr() + offset,
+				                                                   bytes);
 				return false;
 			}();
 			if (should_flush) {
@@ -112,8 +137,10 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+			    manager->GetCpuAddr() + offset, bytes, range_func,
+			    is_written ? RegionManager::HotPolicy::ClearAndUnhot
+			               : RegionManager::HotPolicy::Preserve);
 			if (!is_written) {
 				manager->lock.unlock();
 			}

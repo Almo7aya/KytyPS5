@@ -251,6 +251,35 @@ public:
 		return result;
 	}
 
+	constexpr BitArray& operator&=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			m_data[word] &= other.m_data[word];
+		}
+		return *this;
+	}
+
+	[[nodiscard]] constexpr BitArray operator&(const BitArray& other) const {
+		auto result = *this;
+		result &= other;
+		return result;
+	}
+
+	constexpr BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			m_data[word] |= other.m_data[word];
+		}
+		return *this;
+	}
+
+	// Number of set bits.
+	[[nodiscard]] constexpr size_t Count() const {
+		size_t total = 0;
+		for (const auto word: m_data) {
+			total += static_cast<size_t>(std::popcount(word));
+		}
+		return total;
+	}
+
 private:
 	std::array<uint64_t, WORD_COUNT> m_data {};
 };

@@ -70,6 +70,8 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profiler-direction <value>         None or Network.\n");
+	::printf("  --hot-pages <true|false>             Keep frequently rewritten GPU-visible pages\n"
+	         "                                       writable instead of faulting. Default: true.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
@@ -296,6 +298,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--profiler-direction") {
 			if (!ParseEnum(value, options.config.profiler_direction)) {
 				::printf("invalid profiler direction: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--hot-pages") {
+			if (!ParseBool(value, options.config.hot_page_tracking)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
 		} else if (arg == "--spirv-debug-printf") {

@@ -127,6 +127,10 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool HotPageTrackingEnabled() {
+	return g_config->hot_page_tracking;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;
