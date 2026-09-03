@@ -70,6 +70,21 @@ public:
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted = false;
 	size_t lru_id     = 0;
+	// Hot-readback tracking: once the CPU has read this buffer after a GPU write, every slice
+	// that writes it records a host-visible shadow copy so later CPU reads avoid a GPU drain.
+	bool     readback_hot        = false;
+	bool     shadow_pending      = false;
+	bool     shadow_valid        = false;
+	uint64_t last_gpu_write_tick = 0;
+	uint64_t shadow_tick         = 0;
+	uint64_t shadow_offset       = 0;
+	// GPU writes recorded since the last shadow; a CPU read overlapping one of them cannot use
+	// the shadow. Cleared when a new shadow is recorded.
+	struct HotWrite {
+		uint64_t address = 0;
+		uint64_t size    = 0;
+	};
+	std::vector<HotWrite> writes_since_shadow;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

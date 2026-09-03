@@ -70,6 +70,9 @@ public:
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// Records host-visible shadows of hot readback buffers written since the last call. Call
+	// before every submit so a CPU read never has to drain the GPU for data already produced.
+	void RecordHotShadows();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -96,6 +99,7 @@ private:
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	void WriteBackShadow(BufferId id, uint64_t tick);
 	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
 	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
@@ -109,6 +113,7 @@ private:
 	std::map<uint64_t, BufferId>                      m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	std::vector<BufferId>                             m_hot_written;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
