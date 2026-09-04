@@ -5,4 +5,8 @@ build/
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
+_DownloadData/
 _PipelineCache/
+_SaveData/
+_TempData/
+_logs/
