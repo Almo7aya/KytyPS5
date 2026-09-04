@@ -435,8 +435,6 @@ static void ZCheck(const HW::DepthRenderTarget& z, const HW::DepthControl& dc,
 
 	if (z.z_info.format != Prospero::DepthFormat::kInvalid ||
 	    z.stencil_info.format != Prospero::StencilFormat::kInvalid) {
-		EXIT_NOT_IMPLEMENTED(z.shading_rate_encoding != 0);
-
 		if (z.depth_view.current_mip_level != 0x00000000) {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -490,7 +488,7 @@ static void ClipCheck(const HW::ClipControl& c) {
 	// dx_linear_attr_clip_enable preserves linear (noperspective) attributes at clip-generated
 	// vertices, which Vulkan provides as part of clipping and interpolation.
 	EXIT_NOT_IMPLEMENTED(c.user_clip_planes != 0 || c.user_clip_plane_mode != 0 ||
-	                     c.vertex_kill_any || c.user_clip_plane_negate_y || c.clip_disable ||
+	                     c.vertex_kill_any || c.user_clip_plane_negate_y ||
 	                     c.user_clip_plane_cull_only || c.cull_on_clipping_error_disable ||
 	                     c.force_viewport_index_from_vs_enable);
 }
@@ -1079,7 +1077,7 @@ void hw_check(const CommandBuffer& buffer) {
 	AaCheck(aa, ac);
 	log_phase("done");
 
-	if (RenderTargetMaskHasBoundMrt(buffer)) {
+	if (graphics_debug_dump_enabled() && RenderTargetMaskHasBoundMrt(buffer)) {
 		LOGF("MRT render target mask: 0x%08" PRIx32 "\n", hw.GetRenderTargetMask());
 		for (uint32_t i = 0; i < 8; i++) {
 			const auto& mrt = hw.GetRenderTarget(i);

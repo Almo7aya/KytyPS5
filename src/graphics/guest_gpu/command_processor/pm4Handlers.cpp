@@ -136,7 +136,6 @@ static HW::ColorControl DecodeColorControl(uint32_t value) {
 
 static HW::DepthControl DecodeDepthControl(uint32_t value) {
 	HW::DepthControl r {};
-	EXIT_NOT_IMPLEMENTED((value & 0xc0000000u) != 0);
 
 	r.stencil_enable      = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, STENCIL_ENABLE) != 0;
 	r.z_enable            = KYTY_PM4_GET(value, DB_DEPTH_CONTROL, Z_ENABLE) != 0;
@@ -598,17 +597,6 @@ static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint3
 	auto  target                    = ctx.GetDepthRenderTarget();
 	target.shading_rate_encoding    = static_cast<uint8_t>(shading_rate_encoding);
 	ctx.SetDepthRenderTarget(target);
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetDepthShadingRateEncoding) {
-	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
-
-	EXIT_NOT_IMPLEMENTED(num_values != 1);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_SHADING_RATE_ENCODING);
-
-	HwCtxSetDepthShadingRateEncodingRegister(cp, buffer[0]);
-
-	return num_values;
 }
 
 static HW::EqaaControl ParseEqaaControl(uint32_t value) {
@@ -1619,15 +1607,15 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		auto*    index_addr =
 		    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u));
 		uint32_t max_instance_count = buffer[3];
-		auto*    object_ids =
-		    reinterpret_cast<void*>(buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u));
-		uint32_t instance_count = buffer[6];
-		uint32_t flags          = buffer[7];
+		uint32_t instance_count     = buffer[6];
+		uint32_t flags              = buffer[7];
 
 		EXIT_NOT_IMPLEMENTED(instance_count > max_instance_count);
 		EXIT_NOT_IMPLEMENTED((flags & ~0xa0u) != 0);
 
-		cp.DrawIndex(index_count, index_addr, 0, 1, instance_count, object_ids);
+		cp.DrawIndex({.index_count    = index_count,
+		              .index_addr     = index_addr,
+		              .instance_count = instance_count});
 
 		return 8;
 	}
@@ -1642,7 +1630,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndex) {
 		EXIT_NOT_IMPLEMENTED(index_count > max_index_count);
 		EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
 
-		cp.DrawIndex(index_count, index_addr, 0, 1);
+		cp.DrawIndex({.index_count = index_count, .index_addr = index_addr});
 
 		return 5;
 	}
@@ -1701,7 +1689,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexOffset) {
 	EXIT_NOT_IMPLEMENTED(index_count > max_index_size);
 	EXIT_NOT_IMPLEMENTED((flags & ~0x20u) != 0);
 
-	cp.DrawIndexOffset(index_offset, index_count, 0);
+	cp.DrawIndexOffset(index_offset, index_count);
 
 	return 4;
 }
@@ -1716,7 +1704,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndexAuto) {
 
 	EXIT_NOT_IMPLEMENTED((flags & ~0x22u) != 0);
 
-	cp.DrawIndexAuto(index_count, 0);
+	cp.DrawIndexAuto({.vertex_count = index_count});
 
 	return 2;
 }

@@ -351,26 +351,26 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
-		Controller::ControllerConnect(id);
+		Controller::Connect(id);
 	}
 
 	if (f.removed) {
-		Controller::ControllerDisconnect(f.id);
+		Controller::Disconnect(f.id);
 		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
 	}
 
 	if (f.down || f.up) {
 		const auto button = ControllerButtonToPadButton(f.button);
 		if (button != 0) {
-			Controller::ControllerButton(f.id, button, f.down);
+			Controller::SetButton(f.id, button, f.down);
 		}
 	}
 
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::ControllerAxis(f.id, axis,
-			                           ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis,
+			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -708,9 +708,9 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_CONTROLLERTOUCHPADMOTION:
 		case SDL_CONTROLLERTOUCHPADUP:
 			if (event->ctouchpad.touchpad == 0) {
-				Controller::ControllerTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
-				                               event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
-				                               event->ctouchpad.x, event->ctouchpad.y);
+				Controller::SetTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
+				                        event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
+				                        event->ctouchpad.x, event->ctouchpad.y);
 			}
 			break;
 
@@ -814,6 +814,8 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 #endif
@@ -898,6 +900,7 @@ void WindowRun() {
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
+		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
 }

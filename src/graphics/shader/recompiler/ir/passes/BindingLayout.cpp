@@ -10,11 +10,6 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr auto     FirstImageBinding = DescriptorBindingKind::Sampled1D;
-constexpr uint32_t ImageBindingCount =
-    static_cast<uint32_t>(DescriptorBindingKind::StorageAtomic3D) -
-    static_cast<uint32_t>(FirstImageBinding) + 1u;
-
 [[noreturn]] void BindingFail(const char* message) {
 	EXIT("shader binding layout failed: %s", message);
 	std::abort();
@@ -74,24 +69,18 @@ bool UsesGds(const Program& program) {
 
 } // namespace
 
-void AllocateBindings(Program& program, uint32_t push_constant_offset) {
+void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
 	}
-	if (push_constant_offset > NativePushConstantSize ||
-	    push_constant_offset % sizeof(uint32_t) != 0) {
-		EXIT("shader binding layout failed: push-constant offset %u exceeds the Vulkan minimum "
-		     "guarantee or is unaligned",
-		     push_constant_offset);
-	}
-
 	BindingLayout next;
-	next.push_constant_offset = push_constant_offset;
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.push_data_start_dword =
+	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!program.info.buffers.empty()) {
 		std::vector<uint32_t> resources(program.info.buffers.size());
@@ -107,7 +96,7 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);
 		}
-		const auto group = static_cast<uint32_t>(*kind) - static_cast<uint32_t>(FirstImageBinding);
+		const auto group = ImageBindingIndex(*kind);
 		if (group >= image_groups.size()) {
 			EXIT("shader binding layout failed: image %u has an unmapped binding class", i);
 		}
@@ -122,10 +111,8 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {
-			AddBinding(
-			    next,
-			    static_cast<DescriptorBindingKind>(static_cast<uint32_t>(FirstImageBinding) + i),
-			    std::move(image_groups[i]));
+			AddBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i),
+			           std::move(image_groups[i]));
 		}
 	}
 
@@ -146,17 +133,14 @@ void AllocateBindings(Program& program, uint32_t push_constant_offset) {
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_mapping_capacity != 0u;
+		    return image.indirect_search_iterations != 0u;
 	    });
 	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 
-	const auto push_dwords = (NativePushConstantSize - push_constant_offset) / sizeof(uint32_t);
-	if (next.ShaderDataDwords() <= push_dwords) {
-		next.push_constant_size = next.ShaderDataDwords() * sizeof(uint32_t);
-	} else {
-		AddBinding(next, DescriptorBindingKind::UserData);
+	if (next.ShaderDataDwords() != 0 && !next.UsesPushData()) {
+		AddBinding(next, DescriptorBindingKind::ShaderData);
 	}
 
 	program.bindings                = std::move(next);

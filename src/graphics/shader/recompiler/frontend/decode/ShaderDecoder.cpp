@@ -479,6 +479,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_FLBIT_I32_B32:
 		case Opcode::S_FF1_I32_B32:
 		case Opcode::S_FF1_I32_B64:
+		case Opcode::S_BITSET0_B64:
+		case Opcode::S_BITSET1_B64:
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B64:
 		case Opcode::S_QUADMASK_B64:
@@ -505,6 +507,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
 		case Opcode::S_SLEEP:
+		case Opcode::S_SETPRIO:
 		case Opcode::S_TRAP:
 		case Opcode::S_SENDMSG:
 		case Opcode::S_TTRACEDATA:
@@ -532,6 +535,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
+		case Opcode::IMAGE_ATOMIC_SWAP:
 		case Opcode::IMAGE_ATOMIC_ADD:
 		case Opcode::IMAGE_ATOMIC_UMIN:
 		case Opcode::IMAGE_ATOMIC_UMAX:
@@ -588,6 +592,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_ATOMIC_SWAP:
+		case Opcode::BUFFER_ATOMIC_CMPSWAP:
+		case Opcode::BUFFER_ATOMIC_SWAP_X2:
 		case Opcode::BUFFER_ATOMIC_ADD:
 		case Opcode::BUFFER_ATOMIC_SUB:
 		case Opcode::BUFFER_ATOMIC_SMIN:
@@ -596,6 +602,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_UMAX:
 		case Opcode::BUFFER_ATOMIC_AND:
 		case Opcode::BUFFER_ATOMIC_OR:
+		case Opcode::BUFFER_ATOMIC_OR_X2:
 		case Opcode::BUFFER_ATOMIC_XOR:
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:
