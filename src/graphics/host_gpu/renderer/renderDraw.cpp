@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/occlusionQuery.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1294,6 +1295,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
 	                         state.depth_info);
 
+	// Z-pass counting for guest occlusion queries: the query slot is prepared before the render
+	// pass instance is (re)opened and brackets exactly this draw.
+	auto& occlusion = m_context.GetOcclusionQueries();
+	occlusion.PrepareDraw(buffer);
+
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
@@ -1303,7 +1309,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	occlusion.BeginDraw(buffer);
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	occlusion.EndDraw(buffer);
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1344,7 +1352,12 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	// From here on the packet is a real draw the hardware would have Z-pass counted; if any path
+	// below drops it, the open occlusion queries are reported visible instead of zero.
+	OcclusionQueryEmulator::DrawScope occlusion_scope(m_context.GetOcclusionQueries());
+
 	if (ConsumeMetadataColorOperation(buffer)) {
+		occlusion_scope.Dismiss();
 		ResetBindings();
 		return;
 	}
@@ -1481,7 +1494,10 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
+	OcclusionQueryEmulator::DrawScope occlusion_scope(m_context.GetOcclusionQueries());
+
 	if (ConsumeMetadataColorOperation(buffer)) {
+		occlusion_scope.Dismiss();
 		ResetBindings();
 		return;
 	}

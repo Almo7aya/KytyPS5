@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/occlusionQuery.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -46,6 +47,7 @@ public:
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
+	OcclusionQueryEmulator& GetOcclusionQueries() { return m_occlusion_queries; }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -61,6 +63,9 @@ private:
 	Common::Mutex             m_mutex;
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
+	// Declared after the scheduler: it queues operations on it, and its query pool must outlive
+	// every deferred operation, which the scheduler's shutdown drains first.
+	OcclusionQueryEmulator    m_occlusion_queries;
 	DescriptorHeap            m_descriptor_heap;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;

@@ -25011,9 +25011,12 @@ void CheckVertexBufferMappedExtent(RenderContext &renderer) {
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
+  // A begin/end dump pair with no draw between them. The emulator publishes the begin at once,
+  // and with nothing to read back the end is published at once as well; both carry the valid
+  // bit, the difference is positive (reported visible, since a title always brackets a draw and
+  // an empty pair means one was dropped) and the neighbouring slots stay untouched.
   constexpr uint64_t untouched = 0x1122334455667788ull;
   constexpr uint64_t ready_bit = 1ull << 63u;
-  constexpr uint64_t visible_stride = 1ull << 18u;
   alignas(16) std::array<uint64_t, 4> results;
   results.fill(untouched);
 
@@ -25027,28 +25030,30 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
     return processor.Process(execution, packet);
   };
 
-  const auto begin_address = reinterpret_cast<uint64_t>(&results[1]);
-  const auto begin_value = ready_bit | ((begin_address >> 3u) * visible_stride);
   const auto begin_result = dump(&results[1]);
+  const auto begin_value = results[1];
   const bool begin_written = begin_result == Pm4ProcessResult::Complete &&
                              results[0] == untouched &&
-                             results[1] == begin_value &&
+                             (begin_value & ready_bit) != 0 &&
+                             begin_value != untouched &&
                              results[2] == untouched &&
                              results[3] == untouched;
 
-  const auto end_address = reinterpret_cast<uint64_t>(&results[2]);
-  const auto end_value = ready_bit | ((end_address >> 3u) * visible_stride);
   const auto end_result = dump(&results[2]);
+  const auto end_value = results[2];
   const bool end_written = end_result == Pm4ProcessResult::Complete &&
                            results[0] == untouched &&
                            results[1] == begin_value &&
-                           results[2] == end_value &&
+                           (end_value & ready_bit) != 0 &&
+                           end_value != untouched &&
                            results[3] == untouched;
 
-  Require("Pm4SyntheticOcclusionCounterDump", "always-visible result",
-          begin_written && end_written &&
-              results[2] - results[1] == visible_stride,
-          "EVENT_WRITE did not publish one stable always-visible begin/end pair");
+  const uint64_t begin_count = begin_value & ~ready_bit;
+  const uint64_t end_count = end_value & ~ready_bit;
+  Require("Pm4SyntheticOcclusionCounterDump", "visible empty pair",
+          begin_written && end_written && end_count > begin_count,
+          "EVENT_WRITE did not publish a valid begin/end pair with a positive "
+          "difference for an empty occlusion query");
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
 }
 

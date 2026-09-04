@@ -670,6 +670,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 
+	// Occlusion-query emulation (renderer/occlusionQuery.cpp). Host query resets let a query slot
+	// be recycled without breaking the render pass instance, and precise queries give the guest
+	// real sample counts. Both are optional: without them the emulation records the resets in the
+	// command buffer and reports boolean results.
+	features12.hostQueryReset             = supported_features12.hostQueryReset;
+	graphics.host_query_reset_enabled     = supported_features12.hostQueryReset == VK_TRUE;
+	device_features.occlusionQueryPrecise = supported_features2.features.occlusionQueryPrecise;
+	graphics.occlusion_query_precise_enabled =
+	    supported_features2.features.occlusionQueryPrecise == VK_TRUE;
+	LOGF("Vulkan occlusion queries: hostQueryReset=%s occlusionQueryPrecise=%s\n",
+	     graphics.host_query_reset_enabled ? "true" : "false",
+	     graphics.occlusion_query_precise_enabled ? "true" : "false");
+
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 #if defined(__APPLE__)

@@ -35,6 +35,8 @@ struct GraphicContext {
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               graphics_pipeline_library_enabled      = false;
 	bool                               graphics_pipeline_library_fast_linking = false;
+	bool                               host_query_reset_enabled              = false;
+	bool                               occlusion_query_precise_enabled       = false;
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;

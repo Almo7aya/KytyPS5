@@ -863,6 +863,9 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			if (wait_op != 0 && predicate_gpu_dirty) {
 				BufferFlushAndWait();
 			}
+			// The predicate may be an end-of-pipe label whose write is still queued behind
+			// outstanding occlusion results.
+			SynchronizeEndOfPipeWrites();
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 
@@ -1234,10 +1237,14 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
+	// Guest-visible end-of-pipe values are published through the occlusion-query emulator so they
+	// cannot overtake query results the guest expects to find complete once it sees the label.
+	auto& end_of_pipe = m_renderer.GetOcclusionQueries();
+
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		end_of_pipe.WriteEndOfPipeValue(reinterpret_cast<uint64_t>(dst), data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1287,7 +1294,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					end_of_pipe.WriteEndOfPipeValue(reinterpret_cast<uint64_t>(dst), value,
+					                                sizeof(uint64_t));
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1377,7 +1385,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
-				std::memcpy(dst, &clock, sizeof(clock));
+				end_of_pipe.WriteEndOfPipeValue(reinterpret_cast<uint64_t>(dst), clock,
+				                                sizeof(clock));
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1513,31 +1522,15 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			break;
 		case 0x00000038: // PIXEL_PIPE_STAT_CONTROL
 			break;
-		case 0x00000039: {
-			static std::once_flag warning_once;
-			std::call_once(warning_once, [] {
-				std::printf("Warning: game uses occlusion queries, which are currently treated as "
-				            "always visible; GPU usage may be higher and FPS may be lower.\n");
-			});
-
+		case 0x00000039: { // PIXEL_PIPE_STAT_DUMP
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {
 				EXIT("invalid occlusion-counter dump: index=0x%08" PRIx32
 				     ", address=0x%016" PRIx64 "\n",
 				     event_index, event_address);
 			}
-
-			// Deriving the synthetic counter from the slot keeps each begin/end pair stable across
-			// asynchronous reads. Keep a sizeable distance between adjacent slots instead of reporting
-			// exactly one sample: one was enough for the first visibility path found in this title, but
-			// it is not an honest "always visible" result for callers that apply a minimum-sample
-			// threshold. Event addresses are 48-bit and 8-byte aligned, so shifting their slot index by
-			// 18 remains below the ready bit without wrapping. A conventional adjacent begin/end pair
-			// therefore reports 262144 visible samples while retaining the address-only, frame-stable
-			// property that removed the original model flicker.
-			constexpr uint64_t ready_bit      = 1ull << 63u;
-			constexpr uint64_t visible_stride = 1ull << 18u;
-			auto*              result         = reinterpret_cast<volatile uint64_t*>(event_address);
-			*result = ready_bit | ((event_address >> 3u) * visible_stride);
+			// Z-pass counter sample: see OcclusionQueryEmulator for the guest contract and how host
+			// occlusion queries stand in for the hardware counters.
+			m_renderer.GetOcclusionQueries().Dump(event_address);
 			break;
 		}
 		case 0x0000003a: // PIXEL_PIPE_STAT_RESET
@@ -1572,7 +1565,8 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetOcclusionQueries().WriteEndOfPipeValue(reinterpret_cast<uint64_t>(dst_gpu_addr),
+	                                                     value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1598,7 +1592,8 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
-	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetOcclusionQueries().WriteEndOfPipeValue(reinterpret_cast<uint64_t>(dst_gpu_addr),
+	                                                     value, sizeof(value));
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1626,6 +1621,10 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 
 void CommandProcessor::SynchronizeGpu() {
 	GetScheduler().Finish();
+}
+
+void CommandProcessor::SynchronizeEndOfPipeWrites() {
+	m_renderer.GetOcclusionQueries().WaitForPendingEndOfPipeWrites();
 }
 
 bool GuestGpu::IsGpuThread() noexcept {
