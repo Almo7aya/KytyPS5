@@ -413,6 +413,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	r.export_mapping           = target_format.export_mapping;
 	r.color_clear_enable       = false;
 	ResolveDccClearInfo(r, rt, target_format.format, has_dcc);
+	r.desc.metadata_clear_value     = r.color_clear_value;
+	r.desc.metadata_clear_supported = r.metadata_clear_supported;
 	BindRenderTarget(r.image_id);
 }
 

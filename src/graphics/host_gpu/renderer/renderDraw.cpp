@@ -528,37 +528,8 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 	if (target.desc.info.metadata.kind != ImageMetadataKind::Dcc) {
 		return false;
 	}
-
-	// A DCC fast clear may update metadata only and leave the color allocation stale. Vulkan has
-	// no guest DCC state, so materialize the deferred value when the surface is next bound.
-	const auto metadata_address = target.desc.info.metadata.range.address;
-	uint32_t   metadata_value   = 0xffffffffu;
-	if (!cache.IsMetaCleared(metadata_address, view.base_layer, &metadata_value)) {
-		return false;
-	}
-
-	// Constant codes carry their colour directly. The register code selects the clear-word
-	// registers, while anything else (notably 0xff, which means uncompressed) is not a clear.
-	const auto clear_code = static_cast<uint8_t>(metadata_value);
-	clear_value           = {};
-	bool materialize      = DecodeDccConstantClear(clear_code, clear_value);
-	if (clear_code == DCC_CLEAR_CODE_REGISTER && target.metadata_clear_supported) {
-		clear_value = target.color_clear_value;
-		materialize = true;
-	}
-
-	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
-		if (!cache.IsMetaCleared(metadata_address, view.base_layer + layer)) {
-			return false;
-		}
-	}
-	// Consume only after every layer in this Vulkan view can be materialized together.
-	for (uint32_t layer = 0; layer < view.layer_count; layer++) {
-		if (!cache.TouchMeta(metadata_address, view.base_layer + layer, false)) {
-			EXIT("failed to consume DCC clear state\n");
-		}
-	}
-	return materialize;
+	return cache.ResolveDccMetaClear(target.desc.info.metadata.range.address, view.base_layer,
+	                                 view.layer_count, clear_value);
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
