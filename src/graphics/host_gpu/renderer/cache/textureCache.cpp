@@ -19,6 +19,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -31,6 +32,65 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+constexpr uint32_t ColorGradingLutSize     = 32;
+
+bool IsEmptyColorGradingLut(const ImageInfo& info) {
+	if (info.pixel_format != vk::Format::eA2B10G10R10UnormPack32 ||
+	    info.type != Prospero::ImageType::kColor3D ||
+	    info.extent !=
+	        vk::Extent3D {ColorGradingLutSize, ColorGradingLutSize, ColorGradingLutSize} ||
+	    info.resources.levels != 1 || info.resources.layers != 1 || info.samples != 1 ||
+	    info.bytes_per_block != sizeof(uint32_t) || info.data.Empty() ||
+	    info.data.size > std::numeric_limits<size_t>::max()) {
+		return false;
+	}
+
+	std::array<uint8_t, 4096> chunk {};
+	for (uint64_t offset = 0; offset < info.data.size;) {
+		const auto count = std::min<uint64_t>(info.data.size - offset, chunk.size());
+		if (!LibKernel::Memory::TryReadBacking(info.data.address + offset, chunk.data(), count) ||
+		    std::any_of(chunk.data(), chunk.data() + count, [](uint8_t byte) { return byte != 0; })) {
+			return false;
+		}
+		offset += count;
+	}
+	return true;
+}
+
+float DecodeUnrealLogColor(float encoded) {
+	constexpr float LinearRange = 14.0f;
+	constexpr float LinearGrey  = 0.18f;
+	constexpr float LogGrey     = 444.0f / 1023.0f;
+	const float     black       = std::exp2(-LogGrey * LinearRange) * LinearGrey;
+	return std::max(std::exp2((encoded - LogGrey) * LinearRange) * LinearGrey - black, 0.0f);
+}
+
+float NeutralFilmicToSrgb(float linear) {
+	const float mapped = std::clamp(
+	    linear * (2.51f * linear + 0.03f) / (linear * (2.43f * linear + 0.59f) + 0.14f), 0.0f,
+	    1.0f);
+	return mapped <= 0.0031308f ? mapped * 12.92f
+	                            : 1.055f * std::pow(mapped, 1.0f / 2.4f) - 0.055f;
+}
+
+std::vector<uint32_t> BuildNeutralColorGradingLut() {
+	std::array<uint32_t, ColorGradingLutSize> ramp {};
+	for (uint32_t i = 0; i < ColorGradingLutSize; i++) {
+		const float encoded = static_cast<float>(i) / static_cast<float>(ColorGradingLutSize - 1u);
+		ramp[i] = static_cast<uint32_t>(
+		              std::lround(NeutralFilmicToSrgb(DecodeUnrealLogColor(encoded)) * 1023.0f)) &
+		          0x3ffu;
+	}
+
+	constexpr uint32_t Mask = ColorGradingLutSize - 1u;
+	std::vector<uint32_t> lut(static_cast<size_t>(ColorGradingLutSize) * ColorGradingLutSize *
+	                          ColorGradingLutSize);
+	for (size_t i = 0; i < lut.size(); i++) {
+		lut[i] = ramp[i & Mask] | (ramp[(i >> 5u) & Mask] << 10u) |
+		         (ramp[(i >> 10u) & Mask] << 20u) | (3u << 30u);
+	}
+	return lut;
+}
 
 [[nodiscard]] const char* BindingTypeName(TextureCache::BindingType type) {
 	switch (type) {
@@ -1041,13 +1101,32 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	bool       data_imported = false;
 	const bool upload        = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
-		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+		if (IsEmptyColorGradingLut(image.info)) {
+			auto       plan = BuildColorTransfer(image, desc.type, TransferDirection::Upload);
+			const auto lut  = BuildNeutralColorGradingLut();
+			const auto size = lut.size() * sizeof(uint32_t);
+			EXIT_NOT_IMPLEMENTED(!plan.valid ||
+			                     size != plan.layout.slice_stride * image.info.extent.depth);
+			auto&      source        = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload);
+			const auto source_offset = source.Copy(lut.data(), size, 16);
+			for (auto& copy: plan.regions) {
+				copy.bufferOffset += source_offset;
+			}
+			image.Upload(plan.regions, source.Handle(), source_offset, size);
+			LOGF("TextureCache: substituted a neutral colour-grading LUT for the zero-filled "
+			     "volume at 0x%016" PRIx64 " (binding=%u tile=%u)\n",
+			     image.info.data.address, static_cast<uint32_t>(desc.type),
+			     static_cast<uint32_t>(image.info.tile_mode));
+			data_imported = true;
+		} else {
+			const auto [source, source_offset] =
+			    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+			if (source == nullptr) {
+				EXIT("TextureCache: failed to obtain image upload source\n");
+			}
+			data_imported = true;
+			UploadImage(image, desc, *source, source_offset);
 		}
-		data_imported = true;
-		UploadImage(image, desc, *source, source_offset);
 	}
 	if (data_imported) {
 		image.ClearBufferModified();
