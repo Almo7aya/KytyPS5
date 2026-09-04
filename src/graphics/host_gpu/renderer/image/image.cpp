@@ -690,16 +690,24 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.sharingMode   = vk::SharingMode::eExclusive;
 	create.samples       = vulkan_sample_count(backing.samples);
 
-	vk::ImageFormatProperties properties {};
-	if (graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
-	                                      create.usage, create.flags,
-	                                      &properties) != vk::Result::eSuccess ||
-	    !static_cast<bool>(properties.sampleCounts & create.samples)) {
-		EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
-		     "flags=0x%x samples=%u\n",
-		     static_cast<int>(create.format), static_cast<int>(create.imageType),
-		     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
-		     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), backing.samples);
+	const auto supports_usage = [&](vk::ImageUsageFlags usage) {
+		vk::ImageFormatProperties properties {};
+		return graphics.GetImageFormatProperties(create.format, create.imageType, create.tiling,
+		                                         usage, create.flags,
+		                                         &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & create.samples);
+	};
+	if (!supports_usage(create.usage)) {
+		const auto fallback_usage = create.usage & ~vk::ImageUsageFlagBits::eStorage;
+		if (fallback_usage != create.usage && supports_usage(fallback_usage)) {
+			backing.usage = create.usage = fallback_usage;
+		} else {
+			EXIT("image format does not support required usage: format=%d type=%d usage=0x%x "
+			     "flags=0x%x samples=%u\n",
+			     static_cast<int>(create.format), static_cast<int>(create.imageType),
+			     static_cast<vk::ImageUsageFlags::MaskType>(create.usage),
+			     static_cast<vk::ImageCreateFlags::MaskType>(create.flags), backing.samples);
+		}
 	}
 
 	backing.memory.property = vk::MemoryPropertyFlagBits::eDeviceLocal;
