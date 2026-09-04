@@ -147,7 +147,11 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 		BindNullStorageBuffer(context, result);
 		return result;
 	}
-	const auto  size      = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+	const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+	if (size == 0) {
+		BindNullStorageBuffer(context, result);
+		return result;
+	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (alignment == 0 ||
@@ -904,7 +908,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		if (size == 0) {
+			prepared.buffer_sources.emplace_back(descriptor, BufferId {});
+			continue;
+		}
 		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(address, size));
 	}
 

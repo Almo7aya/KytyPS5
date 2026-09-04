@@ -136,6 +136,39 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor);
+
+bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
+                           const SrtRuntime& runtime, ShaderBufferResource& result) {
+	if (!DecodeBufferDescriptor(descriptor, result) || result.Type() != 0 ||
+	    (stage != ShaderType::Compute && result.AddTid())) {
+		return false;
+	}
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = (result.DstSelXYZW() >> (component * 3u)) & 0x7u;
+		if (selector == 2u || selector == 3u) {
+			return false;
+		}
+	}
+	if (runtime.validate_memory_range == nullptr) {
+		return true;
+	}
+	// Tracking is static, so a resource that is inactive on the current path can have undefined
+	// descriptor registers. Canonicalize those values before they affect specialization.
+	const auto size = ScalarBufferSize(result);
+	return result.Base48() != 0 && size != 0 &&
+	       runtime.validate_memory_range(runtime.userdata, result.Base48(), size);
+}
+
+bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerResource& result) {
+	if (descriptor.dword_count != std::size(result.fields)) {
+		return false;
+	}
+	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
+	return result.MaxAnisoRatio() <= static_cast<uint32_t>(Prospero::SamplerAnisoRatio::kSixteen) &&
+	       result.MipFilter() <= static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear);
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -302,6 +335,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 	auto  cursor = values.begin();
 	next.buffers.assign(cursor, cursor + program.info.buffers.size());
 	cursor += program.info.buffers.size();
+	for (auto& descriptor: next.buffers) {
+		ShaderBufferResource buffer;
+		if (!ValidBufferDescriptor(descriptor, program.stage, runtime, buffer)) {
+			descriptor.dwords.fill(0);
+		}
+	}
 	next.flattened_srt = std::move(flattened_srt);
 	next.images.resize(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
@@ -337,6 +376,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& r
 		}
 	}
 	next.samplers.assign(cursor, cursor + program.info.samplers.size());
+	for (auto& descriptor: next.samplers) {
+		ShaderSamplerResource sampler;
+		if (!ValidSamplerDescriptor(descriptor, sampler)) {
+			descriptor.dwords.fill(0);
+		}
+	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return true;
 }

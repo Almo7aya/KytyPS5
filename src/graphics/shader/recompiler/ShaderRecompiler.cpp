@@ -633,7 +633,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		ir.info.vertex_offset_sgpr   = embedded_fetch.vertex_offset_sgpr;
 		ir.info.instance_offset_sgpr = embedded_fetch.instance_offset_sgpr;
 	}
-
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
