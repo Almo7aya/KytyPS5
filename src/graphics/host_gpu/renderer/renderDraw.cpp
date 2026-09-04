@@ -532,40 +532,14 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 		return false;
 	}
 
-	// Translate recognized constant and register-backed DCC states into a host clear value.
-	clear_value = {};
-	switch (static_cast<uint8_t>(metadata_value)) {
-		case 0x00: break;
-		case 0x20:
-			if (!target.metadata_clear_supported) {
-				return false;
-			}
-			clear_value = target.color_clear_value;
-			break;
-		case 0x40:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[3] = 1.0f;
-			break;
-		case 0x80:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			break;
-		case 0xc0:
-			if (!target.metadata_fixed_clear_supported) {
-				return false;
-			}
-			clear_value.float32[0] = 1.0f;
-			clear_value.float32[1] = 1.0f;
-			clear_value.float32[2] = 1.0f;
-			clear_value.float32[3] = 1.0f;
-			break;
-		default: return false;
+	// Constant codes carry their colour directly. The register code selects the clear-word
+	// registers, while anything else (notably 0xff, which means uncompressed) is not a clear.
+	const auto clear_code = static_cast<uint8_t>(metadata_value);
+	clear_value           = {};
+	bool materialize      = DecodeDccConstantClear(clear_code, clear_value);
+	if (clear_code == DCC_CLEAR_CODE_REGISTER && target.metadata_clear_supported) {
+		clear_value = target.color_clear_value;
+		materialize = true;
 	}
 
 	for (uint32_t layer = 1; layer < view.layer_count; layer++) {
@@ -579,7 +553,7 @@ static bool ResolveDccAttachmentClear(TextureCache& cache, const RenderColorInfo
 			EXIT("failed to consume DCC clear state\n");
 		}
 	}
-	return true;
+	return materialize;
 }
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
@@ -638,6 +612,22 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_view   = target.image_view;
 		attachment.image_layout = layout;
 		attachment.clear_value  = target.color_clear_value.uint32;
+		// A fill that arrived before anything claimed this address was parked without its code,
+		// because the dispatch had not run yet. It has now, so read the code out of the allocation and
+		// record it before the clear is resolved below. Deliberately here rather than inside the
+		// texture cache: TryReadBacking on GPU-protected guest memory faults into HandleGpuFault and
+		// TextureCache::InvalidateMemory, which takes the same non-recursive lock. Happens at most
+		// once per parked fill.
+		if (target.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
+		    cache.TakeParkedMetaProbe(target.desc.info.metadata.range.address)) {
+			const auto parked_address = target.desc.info.metadata.range.address;
+			uint32_t   parked         = 0;
+			uint8_t    code           = 0;
+			if (Libs::LibKernel::Memory::TryReadBacking(parked_address, &parked, sizeof(parked)) &&
+			    DecodeDccFillCode(parked, code) && code != DCC_CODE_UNCOMPRESSED) {
+				(void)cache.ClearMeta(parked_address, code);
+			}
+		}
 		vk::ClearColorValue metadata_clear_value {};
 		const bool          metadata_clear =
 		    ResolveDccAttachmentClear(cache, target, view, metadata_clear_value);

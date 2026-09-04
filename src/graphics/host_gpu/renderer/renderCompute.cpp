@@ -21,6 +21,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -34,6 +35,33 @@
 #include <vector>
 
 namespace Libs::Graphics {
+// The metadata fill this title uses: one written buffer, no other resources, and a user data that is
+// nothing but that buffer's own descriptor. Deliberately strict, because matching it lets a dispatch
+// register a speculative metadata address, and a generic "fill a dword buffer" shader must not.
+template <typename Program, typename Resources>
+static bool IsSingleBufferFillShape(const Program& program, const Resources& resources) {
+	if (program.info.buffers.size() != 1 || resources.buffers.size() != 1 ||
+	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
+	    program.info.has_bitwise_xor || program.user_data_base != 0 ||
+	    resources.user_data.size() != 4) {
+		return false;
+	}
+	const auto& resource = program.info.buffers.front();
+	if (!resource.written || resource.read || resource.atomic || resource.scalar) {
+		return false;
+	}
+	const auto& raw = resources.buffers.front();
+	if (raw.dword_count != 4) {
+		return false;
+	}
+	for (uint32_t i = 0; i < raw.dword_count; i++) {
+		if (raw.dwords[i] != resources.user_data[i]) {
+			return false;
+		}
+	}
+	return DecodeNativeDescriptor<ShaderBufferResource>(raw).Stride() == sizeof(uint32_t);
+}
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -61,19 +89,89 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		}
 	}
 
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
+	if (program.info.has_bitwise_xor) {
+		return false;
+	}
+
+	uint64_t meta_address = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		if (cache.IsMeta(descriptor.Base48())) {
+			meta_address = descriptor.Base48();
+			break;
 		}
 	}
-	return false;
+	if (meta_address == 0) {
+		// Nothing has claimed this address as metadata yet, so the fill cannot be applied - but
+		// discarding it means a surface bound later never learns it was cleared. Measured: four
+		// 1024x1024 surfaces were filled at frame 2, first bound at frame 871, and stayed uncleared
+		// for the remaining 150 frames because the guest never re-filled them.
+		//
+		// Park it instead, matching what TryConsumeDccFill does for the other fill path, and return
+		// false so the dispatch still runs. Restricted to the exact shape of the single-buffer fill
+		// (its whole user data is the written descriptor, stride 4, no other resources) so an ordinary
+		// buffer-writing dispatch cannot plant a speculative metadata entry.
+		if (IsSingleBufferFillShape(program, resources)) {
+			cache.ParkMetaFill(
+			    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers.front()).Base48());
+		}
+		return false;
+	}
+
+	// DCC_CODE_UNCOMPRESSED doubles as this function's "no code found" fallback and as the guest's
+	// real uncompressed code, so failing to recover a value is indistinguishable from the guest
+	// asking for a decompress - and silently not a clear. Both sources below therefore have to be
+	// tried before settling for it.
+	uint8_t  clear_code = DCC_CODE_UNCOMPRESSED;
+	bool     recovered  = false;
+	uint32_t scanned    = 0;
+
+	// A two-buffer fill splats a dword sourced from a companion read-only buffer. The guest value
+	// sits at that descriptor's base address; the index the recompiled shader applies is only Kyty's
+	// own host alignment adjustment on top of guest offset 0. A DCC clear code is byte-replicated by
+	// construction, which is what makes that test sufficient.
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (program.info.buffers[i].written) {
+			continue;
+		}
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		uint32_t   value      = 0;
+		scanned++;
+		if (LibKernel::Memory::TryReadBacking(descriptor.Base48(), &value, sizeof(value)) &&
+		    DecodeDccFillCode(value, clear_code)) {
+			recovered = true;
+			break;
+		}
+		clear_code = DCC_CODE_UNCOMPRESSED;
+	}
+
+	// A single-buffer fill carries its code as a literal compiled into the shader, so there is
+	// nothing in the dispatch to decode: user data holds four dwords and all four are the written
+	// buffer's own descriptor. Its IR is a bare `StoreBufferU32 <resource>, <linear index>,
+	// 0x00000000`, and because the constant is compiled in, a different code would be a different
+	// shader.
+	//
+	// The value is still observable in the one place the shader puts it - the metadata allocation
+	// itself. This shape is not recognized before the surface registers its metadata, because it
+	// fails ResolveComputeImageClear's stride==16 / R32G32B32A32_UINT gates, so the fill executes for
+	// real at least once and leaves its code in guest memory. Reading it back models DCC honestly:
+	// the metadata *is* guest memory the shader wrote.
+	//
+	// Requiring a byte-replicated value other than the uncompressed code stops this inventing a clear
+	// out of an allocation that merely reads zero-initialised, and DecodeDccConstantClear still has to
+	// accept the result downstream.
+	if (!recovered && scanned == 0) {
+		uint32_t present = 0;
+		if (!LibKernel::Memory::TryReadBacking(meta_address, &present, sizeof(present)) ||
+		    !DecodeDccFillCode(present, clear_code) || clear_code == DCC_CODE_UNCOMPRESSED) {
+			clear_code = DCC_CODE_UNCOMPRESSED;
+		}
+	}
+
+	return cache.ClearMeta(meta_address, clear_code);
 }
 
 bool ResolveComputeImageClear(const ShaderComputeInputInfo& input, uint32_t group_x,

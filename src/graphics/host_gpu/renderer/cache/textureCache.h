@@ -68,10 +68,19 @@ public:
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
+	// Records that a metadata fill targeted an address no surface has claimed yet, without the code:
+	// the caller lets the dispatch run, so the value only exists in the allocation afterwards.
+	// No-op when anything is already tracked there.
+	void ParkMetaFill(uint64_t address);
+	// True once per parked fill, after a surface has claimed the address. The caller then reads the
+	// code from the allocation - which must happen outside this cache's lock, because a guest read can
+	// fault into the very invalidation paths that hold it.
+	[[nodiscard]] bool TakeParkedMetaProbe(uint64_t address);
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice,
 	                                 uint32_t* fill_value = nullptr);
-	[[nodiscard]] bool ClearMeta(uint64_t address);
+	[[nodiscard]] bool ClearMeta(uint64_t address,
+	                             uint8_t clear_code = DCC_CODE_UNCOMPRESSED);
 	// Returns true when registered DCC absorbed the fill and the caller may skip the dispatch.
 	// False may still record PendingDcc state, but the guest dispatch must execute.
 	[[nodiscard]] bool TryConsumeDccFill(uint64_t address, uint64_t size, uint32_t fill_value);
@@ -171,6 +180,10 @@ private:
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	// Metadata addresses whose fill was parked before its code could be observed. Held beside
+	// m_surface_metas rather than inside MetaDataInfo because it is transient repair bookkeeping, not
+	// durable metadata state, and it is erased wherever the metadata entry is.
+	std::unordered_set<uint64_t>                      m_parked_meta_probes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

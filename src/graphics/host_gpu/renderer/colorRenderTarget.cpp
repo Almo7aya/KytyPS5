@@ -16,43 +16,48 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
+#include <limits>
 
 namespace Libs::Graphics {
 
 static std::atomic<uint32_t> g_render_color_log_count = 0;
 
-static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool has_dcc,
-                                uint32_t packed_clear) {
-	// Register-backed DCC clears use the target's packed clear value. Decode one-word guest
-	// formats here; unsupported encodings remain tracked without unsafe materialization.
-	info.metadata_clear_supported =
-	    has_dcc && DecodePackedColorClear(format, packed_clear, info.color_clear_value);
-	switch (format) {
-		case vk::Format::eR8Unorm:
-		case vk::Format::eR8G8Unorm:
-		case vk::Format::eR8G8B8A8Unorm:
-		case vk::Format::eR8G8B8A8Srgb:
-		case vk::Format::eB8G8R8A8Unorm:
-		case vk::Format::eB8G8R8A8Srgb:
-		case vk::Format::eA2B10G10R10UnormPack32:
-		case vk::Format::eA2R10G10B10UnormPack32:
-		case vk::Format::eR5G6B5UnormPack16:
-		case vk::Format::eA1R5G5B5UnormPack16:
-		case vk::Format::eR4G4B4A4UnormPack16:
-		case vk::Format::eR16Unorm:
-		case vk::Format::eR16G16Unorm:
-		case vk::Format::eR16G16B16A16Unorm:
-		case vk::Format::eR16Sfloat:
-		case vk::Format::eR16G16Sfloat:
-		case vk::Format::eR16G16B16A16Sfloat:
-		case vk::Format::eR32Sfloat:
-		case vk::Format::eR32G32Sfloat:
-		case vk::Format::eR32G32B32A32Sfloat:
-		case vk::Format::eB10G11R11UfloatPack32:
-			info.metadata_fixed_clear_supported = has_dcc;
-			break;
-		default: info.metadata_fixed_clear_supported = false; break;
+static float ColorClearF16(uint32_t value) {
+	const uint32_t sign     = (value >> 15u) & 0x1u;
+	const uint32_t exponent = (value >> 10u) & 0x1fu;
+	const uint32_t mantissa = value & 0x3ffu;
+	const float    sign_mul = sign != 0 ? -1.0f : 1.0f;
+
+	if (exponent == 0) {
+		return mantissa == 0 ? sign_mul * 0.0f
+		                     : sign_mul * std::ldexp(static_cast<float>(mantissa), -24);
 	}
+	if (exponent == 0x1fu) {
+		return mantissa == 0 ? sign_mul * std::numeric_limits<float>::infinity()
+		                     : std::numeric_limits<float>::quiet_NaN();
+	}
+	return sign_mul *
+	       std::ldexp(static_cast<float>(0x400u | mantissa), static_cast<int>(exponent) - 25);
+}
+
+static bool DecodeColorClear(const HW::RenderTarget& rt, vk::Format format,
+	                         vk::ClearColorValue& color) {
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		const uint32_t c0 = rt.clear_word0.word0;
+		const uint32_t c1 = rt.clear_word1.word1;
+		color.float32[0]  = ColorClearF16(c0);
+		color.float32[1]  = ColorClearF16(c0 >> 16u);
+		color.float32[2]  = ColorClearF16(c1);
+		color.float32[3]  = ColorClearF16(c1 >> 16u);
+		return true;
+	}
+	return DecodePackedColorClear(format, rt.clear_word0.word0, color);
+}
+
+static void ResolveDccClearInfo(RenderColorInfo& info, const HW::RenderTarget& rt,
+	                            vk::Format format, bool has_dcc) {
+	info.metadata_clear_supported = has_dcc && DecodeColorClear(rt, format, info.color_clear_value);
 	if (!info.metadata_clear_supported) {
 		info.color_clear_value = {};
 	}
@@ -105,9 +110,8 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 		r.samples                        = 1;
 		r.export_mapping                 = {};
 		r.color_clear_enable             = false;
-		r.metadata_clear_supported       = false;
-		r.metadata_fixed_clear_supported = false;
-		r.color_clear_value              = {};
+		r.metadata_clear_supported = false;
+		r.color_clear_value        = {};
 		return;
 	}
 	const auto samples = render_sample_count(rt.attrib.num_fragments);
@@ -408,7 +412,7 @@ void RenderExecutor::ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer&
 	r.samples                  = samples;
 	r.export_mapping           = target_format.export_mapping;
 	r.color_clear_enable       = false;
-	ResolveDccClearInfo(r, target_format.format, has_dcc, rt.clear_word0.word0);
+	ResolveDccClearInfo(r, rt, target_format.format, has_dcc);
 	BindRenderTarget(r.image_id);
 }
 

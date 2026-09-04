@@ -285,6 +285,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	m_download_images.erase(id);
 	if (image->info.HasMetadata()) {
 		m_surface_metas.erase(image->info.metadata.range.address);
+		m_parked_meta_probes.erase(image->info.metadata.range.address);
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -1863,16 +1864,47 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fil
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
-bool TextureCache::ClearMeta(uint64_t address) {
+// A fill aimed at an address no surface has claimed yet used to be dropped on the floor, so a surface
+// first bound long afterwards never received its clear - measured on four 1024x1024 surfaces filled at
+// frame 2 and bound from frame 871, which then stayed uncleared for the rest of the run. Park the fact
+// that a fill happened, the way TryConsumeDccFill already does for the other fill path. The code is
+// deliberately not recorded: the caller lets the dispatch execute, so it only lands in the allocation
+// afterwards, and TakeParkedMetaProbe hands the read back to a caller that can do it safely.
+void TextureCache::ParkMetaFill(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	if (m_surface_metas.find(address) != m_surface_metas.end()) {
+		return;
+	}
+	m_surface_metas.emplace(address, MetaDataInfo {.type = MetaDataInfo::Type::PendingDcc});
+	m_parked_meta_probes.insert(address);
+}
+
+bool TextureCache::TakeParkedMetaProbe(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       parked = m_parked_meta_probes.find(address);
+	if (parked == m_parked_meta_probes.end()) {
+		return false;
+	}
+	// Only once a surface has claimed the address, so the probe reads a code the claim can use.
+	const auto found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc) {
+		return false;
+	}
+	m_parked_meta_probes.erase(parked);
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint8_t clear_code) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    found->second.type == MetaDataInfo::Type::Dcc) {
-		// Preserve the broad metadata-clear operation for CMask/FMask/HTile. DCC requires a
-		// validated fill value, so an arbitrary compute write must not clear it.
+	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	if (found->second.type == MetaDataInfo::Type::Dcc) {
+		found->second.fill_value = static_cast<uint32_t>(clear_code) * 0x01010101u;
+		found->second.fill_size  = 0;
+	}
 	return true;
 }
 
@@ -1947,6 +1979,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	const auto       end = address + size;
 	for (auto metadata = m_surface_metas.lower_bound(address);
 	     metadata != m_surface_metas.end() && metadata->first < end;) {
+		m_parked_meta_probes.erase(metadata->first);
 		metadata = m_surface_metas.erase(metadata);
 	}
 	auto images = FindImagesInRegion(address, size, false);
