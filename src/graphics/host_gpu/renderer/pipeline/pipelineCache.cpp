@@ -224,10 +224,16 @@ struct PipelineCache::ProgramCache {
 	}
 
 	struct SourceEntry {
-		explicit SourceEntry(ShaderRecompiler::IR::ResourcePlan plan)
-		    : resource_plan(std::move(plan)) {}
+		explicit SourceEntry(
+		    ShaderRecompiler::IR::ResourcePlan               plan,
+		    std::optional<ShaderRecompiler::TranslateResult> initial_translation = std::nullopt)
+		    : resource_plan(std::move(plan)), initial_translation(std::move(initial_translation)) {}
 
 		ShaderRecompiler::IR::ResourcePlan resource_plan;
+		// The first async pass already translated the complete shader to extract resource_plan.
+		// Preserve that move-only IR until the first specialization is known instead of decoding
+		// and translating the same source again in the compilation continuation.
+		std::optional<ShaderRecompiler::TranslateResult> initial_translation;
 		// A deque keeps every Permutation at a stable address: draw state and pipeline jobs hold
 		// pointers to permutation.program while new permutations are still being appended.
 		std::deque<Permutation> permutations;
@@ -367,6 +373,7 @@ struct PipelineCache::ProgramCache {
 		std::vector<uint32_t>                        user_data;
 		InputInfo                                    input_info {};
 		bool                                         has_entry = false;
+		std::optional<ShaderRecompiler::TranslateResult> translated;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		uint32_t                                     push_data_cursor = 0;
 	};
@@ -375,6 +382,7 @@ struct PipelineCache::ProgramCache {
 		ProgramKey                                        key;
 		uint64_t                                          tag = 0;
 		std::optional<ShaderRecompiler::IR::ResourcePlan> plan;
+		std::optional<ShaderRecompiler::TranslateResult>  translated;
 		std::optional<Permutation>                        permutation;
 	};
 
@@ -383,10 +391,12 @@ struct PipelineCache::ProgramCache {
 		constexpr ShaderType stage = StageOf<InputInfo>();
 		const auto         options = MakeOptions<InputInfo>(job.input_info, job.user_data, job.hash);
 		const ShaderParams params {.code = job.code, .user_data = job.user_data, .hash = job.hash};
-		auto               translated = ShaderRecompiler::TranslateProgram(job.code, options);
+		auto translated = job.translated ? std::move(*job.translated)
+		                                 : ShaderRecompiler::TranslateProgram(job.code, options);
 		AsyncResult        result {.key = job.key, .tag = job.tag};
 		if (!job.has_entry) {
 			result.plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+			result.translated = std::move(translated);
 		} else {
 			result.permutation = CompilePermutation<stage>(params, options, std::move(translated),
 			                                               std::move(job.specialization),
@@ -406,10 +416,13 @@ struct PipelineCache::ProgramCache {
 		for (auto& result: done) {
 			auto entry = programs.find(result.key);
 			if (entry == programs.end()) {
-				if (!result.plan) {
+				if (!result.plan || !result.translated) {
 					continue;
 				}
-				entry = programs.try_emplace(result.key, std::move(*result.plan)).first;
+				entry = programs
+				            .try_emplace(result.key, std::move(*result.plan),
+				                         std::move(result.translated))
+				            .first;
 			}
 			if (result.permutation) {
 				entry->second.permutations.push_back(std::move(*result.permutation));
@@ -489,6 +502,8 @@ struct PipelineCache::ProgramCache {
 			job->has_entry        = has_entry;
 			job->push_data_cursor = push_data_cursor;
 			if (has_entry) {
+				job->translated = std::move(entry->second.initial_translation);
+				entry->second.initial_translation.reset();
 				job->specialization = std::move(specialization);
 			}
 			enqueue([this, job] { RunAsyncJob<InputInfo>(*job); });
@@ -559,7 +574,7 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 
 void PipelineCache::StartWorkers() {
 	const auto hardware = std::thread::hardware_concurrency();
-	const auto count    = std::clamp<uint32_t>(hardware > 2 ? hardware / 2 : 1, 1, 8);
+	const auto count    = hardware > 2 ? hardware / 2 : 1;
 	for (uint32_t i = 0; i < count; i++) {
 		m_workers.emplace_back([this] {
 			for (;;) {
