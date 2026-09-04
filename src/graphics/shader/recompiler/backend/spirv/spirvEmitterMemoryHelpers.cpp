@@ -134,13 +134,8 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			EXIT("physical address memory must use the BDA emitter\n");
 		case IR::ResourceKind::ScalarBuffer:
 		case IR::ResourceKind::Buffer: {
-			access = PrepareStorageBufferResourceAccess(
+			return PrepareStorageBufferResourceAccess(
 			    state, mem, state.storage_buffer_variable, TypeStorageBufferPointer(state));
-			access.index_offset =
-			    EmitBinaryU32(state, OpShiftRightLogical, access.byte_offset,
-			                  ConstantU32(state, 2u));
-			access.add_index_offset = true;
-			return access;
 		}
 		default: EXIT("unsupported memory resource kind: %u\n", static_cast<unsigned>(mem.kind));
 	}
@@ -148,11 +143,6 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 	state.builder.AddFunction(
 	    {OpArrayLength, TypeU32(state), access.length, access.object_pointer, 0});
 	return access;
-}
-
-uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
-                                uint32_t raw_index) {
-	return access.add_index_offset ? EmitAddU32(state, raw_index, access.index_offset) : raw_index;
 }
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,

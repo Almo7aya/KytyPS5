@@ -510,11 +510,33 @@ struct DrawRenderState {
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	uint32_t              color_count                              = 0;
 	bool                  ps_active                                = true;
+	bool                  allow_async_compile                      = true;
 	RenderState           rendering;
 	ShaderVertexInputInfo vs_input_info;
 	ShaderPixelInputInfo  ps_input_info;
 	PipelineCache::GraphicsPrograms programs;
 };
+
+static bool CanSkipDrawWhileCompiling(CommandBuffer& buffer, const DrawRenderState& state) {
+	auto&      cache             = buffer.GetContext().GetTextureCache();
+	const auto persistent_target = [&](ImageId id) {
+		if (!id) {
+			return false;
+		}
+		const auto& info = cache.GetImage(id).info;
+		// Layered/mipped targets commonly hold baked probes, lookup tables, or other results that
+		// are produced once and consumed many frames later. Small targets have the same pattern.
+		// Dropping their first-use draw leaves the clear/sentinel value permanently cached.
+		return info.resources.layers > 1 || info.resources.levels > 1 ||
+		       std::max(info.extent.width, info.extent.height) <= 512;
+	};
+	for (uint32_t i = 0; i < state.color_count; i++) {
+		if (persistent_target(state.color_info[i].image_id)) {
+			return false;
+		}
+	}
+	return !persistent_target(state.depth_info.image_id);
+}
 
 struct DrawCallInfo {
 	const char*          name           = nullptr;
@@ -1049,7 +1071,8 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 		m_render_state_cache.depth_info = state.depth_info;
 	}
 
-	state.ps_active       = DrawHasActivePixelShader(buffer);
+	state.ps_active = DrawHasActivePixelShader(buffer);
+	state.allow_async_compile = CanSkipDrawWhileCompiling(buffer, state);
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
 	                         static_cast<bool>(state.depth_info.image_id));
 	if (state.color_count == 0 && !with_depth && !state.ps_active) {
@@ -1084,7 +1107,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	}
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, target_export_mapping,
-	    state.ps_active, state.vs_input_info, state.ps_input_info);
+	    state.ps_active, state.allow_async_compile, state.vs_input_info, state.ps_input_info);
 }
 
 static PreparedVertexBuffers PrepareVertexBuffers(uint64_t submit_id, CommandBuffer& buffer,
@@ -1247,14 +1270,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		pipeline_ptr = m_context.GetPipelineCache().CreateGraphicsPipeline(
 		    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
 		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
-		    primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+		    primitive_restart_enable, state.programs.vertex, state.programs.pixel,
+		    state.allow_async_compile);
 		if (pipeline_ptr != nullptr) {
 			m_pipeline_pointer_cache.key      = pipeline_key;
 			m_pipeline_pointer_cache.pipeline = pipeline_ptr;
 		}
 	}
 	if (pipeline_ptr == nullptr) {
-		// The pipeline is still compiling on a worker; this draw is dropped for the frame.
+		// The pipeline is still compiling on a worker; only retry-safe frame targets reach here.
 		return;
 	}
 	auto& pipeline = *pipeline_ptr;

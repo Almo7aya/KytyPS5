@@ -163,19 +163,21 @@ public:
 	    const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
 	    const HW::ShaderRegisters& sh, const HW::Context& context,
 	    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info);
+	    bool pixel_active, bool allow_async, ShaderVertexInputInfo& vertex_info,
+	    ShaderPixelInputInfo& pixel_info);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	// Returns null while the pipeline is still being built on a worker thread (async mode); the
-	// caller skips the draw and retries on a later frame.
+	// Returns null while the pipeline is being built on a worker when allow_async is true. Callers
+	// use the synchronous path for persistent targets whose first draw cannot be discarded.
 	GraphicsPipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
 	                       vk::PrimitiveTopology topology, bool primitive_restart_enable,
-	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
+	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
+	                       bool allow_async);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);
 	// The vertex-layout part of a graphics pipeline key, derived from the bound vertex buffers.
@@ -281,6 +283,7 @@ private:
 	};
 	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
 	std::mutex                                                       m_completed_mutex;
+	std::condition_variable                                          m_pipeline_completed;
 	std::vector<CompletedPipeline>                                   m_completed_pipelines;
 	std::mutex                                                       m_job_mutex;
 	std::condition_variable                                          m_job_available;

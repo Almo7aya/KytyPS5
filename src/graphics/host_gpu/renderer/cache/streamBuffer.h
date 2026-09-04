@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
@@ -85,6 +86,23 @@ public:
 		uint64_t size    = 0;
 	};
 	std::vector<HotWrite> writes_since_shadow;
+
+	// Read-only ranges recently found fully synchronized, with the tracker generations that
+	// guarantee it. A repeat request for the same range under the same generations needs no
+	// tracker walk at all. Titles rebind the same handful of ranges thousands of times a frame.
+	struct CleanRange {
+		uint64_t                   address = 0;
+		uint64_t                   size    = 0;
+		MemoryTracker::RegionStamp stamp;
+	};
+	static constexpr size_t   CleanRangeSlots = 8;
+	CleanRange                clean_ranges[CleanRangeSlots];
+	uint8_t                   clean_range_cursor = 0;
+	// The whole buffer was found free of CPU-dirty pages under this stamp; any sub-range request
+	// is then served without a tracker walk. Vertex and index requests vary in size and offset
+	// with every draw, so exact-range entries alone miss on them.
+	bool                       whole_clean_valid = false;
+	MemoryTracker::RegionStamp whole_clean_stamp;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

@@ -621,12 +621,10 @@ void EmitMemoryOffsets(EmitterState& state);
 uint32_t LdsDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
-	IR::ResourceKind kind             = IR::ResourceKind::None;
-	uint32_t         object_pointer   = 0;
-	uint32_t         length           = 0;
-	uint32_t         index_offset     = 0;
-	uint32_t         byte_offset      = 0;
-	bool             add_index_offset = false;
+	IR::ResourceKind kind           = IR::ResourceKind::None;
+	uint32_t         object_pointer = 0;
+	uint32_t         length         = 0;
+	uint32_t         byte_offset    = 0;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
@@ -635,9 +633,6 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
                                                          const IR::MemoryInfo& mem,
                                                          uint32_t variable,
                                                          uint32_t pointer_type);
-
-uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
-                                uint32_t raw_index);
 
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);

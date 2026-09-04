@@ -93,6 +93,7 @@ public:
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
+		generation.fetch_add(1, std::memory_order_release);
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
@@ -122,6 +123,12 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		RegionBits mask(GetBits<source>(), start, end);
 		if constexpr (clear) {
+			if (mask.None()) {
+				// Nothing to clear: the protection state is already what it would become, so skip
+				// the page-watcher update and leave the generation untouched.
+				return;
+			}
+			generation.fetch_add(1, std::memory_order_release);
 			GetBits<source>().UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
@@ -136,6 +143,11 @@ public:
 	}
 
 	TrackingSpinLock lock;
+
+	// Advances on every dirty-state change in this region. Readers that saw a range clean at a
+	// given generation know it is still clean while the generation is unchanged, without taking
+	// the lock or walking the bitmaps.
+	std::atomic<uint64_t> generation {1};
 
 private:
 	template <bool track>

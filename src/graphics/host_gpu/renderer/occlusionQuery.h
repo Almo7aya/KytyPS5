@@ -88,8 +88,9 @@ public:
 	// unless occlusion results are outstanding, in which case the write is ordered behind them.
 	void WriteEndOfPipeValue(uint64_t address, uint64_t value, uint32_t size);
 
-	// For PM4 packets that read guest memory an end-of-pipe write may still be heading for.
-	void WaitForPendingEndOfPipeWrites();
+	// For PM4 packets that read guest memory an end-of-pipe write may still be heading for. Waits
+	// only when a queued write actually targets the given range.
+	void WaitForPendingEndOfPipeWrites(uint64_t address, uint64_t size);
 
 private:
 	static constexpr uint32_t kNoSlot            = UINT32_MAX;
@@ -157,6 +158,11 @@ private:
 	// Priority operations queued by this object that have not run yet: result publications and
 	// the end-of-pipe writes ordered behind them.
 	std::atomic<uint32_t> m_pending_operations {0};
+
+	// Destinations of queued end-of-pipe writes, so a packet that reads guest memory only has to
+	// wait when its address is actually in flight.
+	std::mutex                                m_pending_writes_mutex;
+	std::unordered_map<uint64_t, uint32_t>    m_pending_writes;
 };
 
 } // namespace Libs::Graphics

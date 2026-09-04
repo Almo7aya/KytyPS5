@@ -865,7 +865,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 			// The predicate may be an end-of-pipe label whose write is still queued behind
 			// outstanding occlusion results.
-			SynchronizeEndOfPipeWrites();
+			SynchronizeEndOfPipeWrites(predicate_address, sizeof(uint64_t));
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 
@@ -1623,8 +1623,8 @@ void CommandProcessor::SynchronizeGpu() {
 	GetScheduler().Finish();
 }
 
-void CommandProcessor::SynchronizeEndOfPipeWrites() {
-	m_renderer.GetOcclusionQueries().WaitForPendingEndOfPipeWrites();
+void CommandProcessor::SynchronizeEndOfPipeWrites(uint64_t address, uint64_t size) {
+	m_renderer.GetOcclusionQueries().WaitForPendingEndOfPipeWrites(address, size);
 }
 
 bool GuestGpu::IsGpuThread() noexcept {

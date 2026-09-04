@@ -25,6 +25,44 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+
+	// Snapshot of the dirty-state generations of every region a range touches. A range verified
+	// clean under a stamp stays clean while the stamp is current; a region that did not exist yet
+	// records 0, which no live region ever reports.
+	struct RegionStamp {
+		static constexpr size_t MaxRegions = 4;
+		uint64_t                generation[MaxRegions] = {};
+		uint8_t                 count                  = 0;
+	};
+	// Returns false when the range spans more regions than a stamp holds.
+	[[nodiscard]] bool CaptureRegionStamp(uint64_t vaddr, uint64_t size,
+	                                      RegionStamp& stamp) const noexcept {
+		const auto first = vaddr / TRACKER_REGION_SIZE;
+		const auto last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+		if (last - first + 1 > RegionStamp::MaxRegions) {
+			return false;
+		}
+		stamp.count = 0;
+		for (auto index = first; index <= last; index++) {
+			const auto* manager  = m_regions[index].load(std::memory_order_acquire);
+			stamp.generation[stamp.count++] =
+			    manager != nullptr ? manager->generation.load(std::memory_order_acquire) : 0;
+		}
+		return true;
+	}
+	[[nodiscard]] bool IsRegionStampCurrent(uint64_t vaddr, uint64_t size,
+	                                        const RegionStamp& stamp) const noexcept {
+		RegionStamp current;
+		if (!CaptureRegionStamp(vaddr, size, current) || current.count != stamp.count) {
+			return false;
+		}
+		for (uint8_t i = 0; i < stamp.count; i++) {
+			if (current.generation[i] != stamp.generation[i]) {
+				return false;
+			}
+		}
+		return true;
+	}
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);

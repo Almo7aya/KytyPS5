@@ -70,8 +70,20 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	{
+		// The kernel unmaps defensively before every mapping, so most requests cover memory the
+		// GPU never saw. Those need neither the GPU-thread round trip nor any cache work.
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
-		if (m_scheduler.Active()) {
+		// Buffers and images are retired through deferred operations that already wait for the
+		// GPU, so a full drain is only kept where cached host resources actually live in the range.
+		const bool has_buffers = m_buffer_cache.IsRegionRegistered(vaddr, size);
+		const bool has_images  = m_texture_cache.QueryRegion(vaddr, size).image_pages;
+		if (m_scheduler.Active() && (has_buffers || has_images)) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Finish();
 			m_scheduler.WaitPriorityOperations(tick);

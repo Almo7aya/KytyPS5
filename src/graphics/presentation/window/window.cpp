@@ -991,10 +991,12 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t fps_start        = Common::Timer::QueryPerformanceCounter();
+	static uint64_t title_update     = 0;
+	static uint64_t frame_num        = 0;
+	static uint64_t fps_frames       = 0;
+	static double   current_fps      = 0.0;
+	static double   current_frame_ms = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1008,19 +1010,27 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
-	if (now - fps_start >= frequency) {
+	if (now - fps_start >= frequency / 2) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
+		current_frame_ms = 1000.0 / current_fps;
 		fps_start   = now;
 		fps_frames  = 0;
 	}
+	// Updating the native window title for every present creates avoidable main-thread work. Four
+	// samples per second remain responsive while making the FPS value much easier to read.
+	if (title_update != 0 && now - title_update < frequency / 4) {
+		return;
+	}
+	title_update = now;
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.1f}, frame time: {:.2f} ms",
+	    KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, current_frame_ms);
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }

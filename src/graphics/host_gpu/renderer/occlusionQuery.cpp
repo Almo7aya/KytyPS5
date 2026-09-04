@@ -8,7 +8,6 @@
 #include "kernel/memory.h"
 
 #include <array>
-#include <cstdio>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -32,9 +31,9 @@ void OcclusionQueryEmulator::Announce() {
 	m_announced  = true;
 	m_host_reset = m_graphics.host_query_reset_enabled;
 	m_precise    = m_graphics.occlusion_query_precise_enabled;
-	std::printf("Occlusion queries: emulating PixelPipeStatDump with host occlusion queries "
-	            "(precise=%s, host reset=%s).\n",
-	            m_precise ? "yes" : "no", m_host_reset ? "yes" : "no");
+	LOGF("Occlusion queries: emulating PixelPipeStatDump with host occlusion queries "
+	     "(precise=%s, host reset=%s).\n",
+	     m_precise ? "yes" : "no", m_host_reset ? "yes" : "no");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -413,15 +412,42 @@ void OcclusionQueryEmulator::WriteEndOfPipeValue(uint64_t address, uint64_t valu
 	// overtake each other). The count includes this write, so the ordering stays sticky until the
 	// queue has drained.
 	m_pending_operations.fetch_add(1, std::memory_order_acq_rel);
+	{
+		std::lock_guard lock(m_pending_writes_mutex);
+		m_pending_writes[address]++;
+	}
 	m_scheduler.DeferPriorityOperation([this, address, value, size] {
 		WriteGuestFromDeferredOperation(address, &value, size);
+		{
+			std::lock_guard lock(m_pending_writes_mutex);
+			if (auto it = m_pending_writes.find(address); it != m_pending_writes.end()) {
+				if (--it->second == 0) {
+					m_pending_writes.erase(it);
+				}
+			}
+		}
 		m_pending_operations.fetch_sub(1, std::memory_order_acq_rel);
 	});
 }
 
-void OcclusionQueryEmulator::WaitForPendingEndOfPipeWrites() {
+void OcclusionQueryEmulator::WaitForPendingEndOfPipeWrites(uint64_t address, uint64_t size) {
 	if (m_pending_operations.load(std::memory_order_acquire) == 0 || !m_scheduler.Active()) {
 		return;
+	}
+	{
+		// Queued writes are 4 or 8 bytes, so a destination can start at most 7 bytes before the
+		// read and still overlap it.
+		std::lock_guard lock(m_pending_writes_mutex);
+		bool           targeted = false;
+		for (uint64_t probe = address >= 7 ? address - 7 : 0; probe < address + size; probe++) {
+			if (m_pending_writes.contains(probe)) {
+				targeted = true;
+				break;
+			}
+		}
+		if (!targeted) {
+			return;
+		}
 	}
 	// Everything queued so far carries a tick no later than the one this flush produces.
 	m_scheduler.FlushAndWait();

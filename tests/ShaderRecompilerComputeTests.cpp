@@ -1323,7 +1323,7 @@ CompiledShader CompileCase(const TestCase &test) {
     if (i < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[i];
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -7558,7 +7558,7 @@ public:
               color.image_id &&
                   color.desc.info.metadata.kind == ImageMetadataKind::Dcc &&
                   color.desc.info.metadata.range.address == dcc_address &&
-                  color.metadata_fixed_clear_supported &&
+                  color.metadata_clear_supported &&
                   rendering.num_color_attachments == 1 &&
                   rendering.color_attachments[0].is_clear &&
                   rendering.color_attachments[0].clear_value ==
@@ -9879,8 +9879,9 @@ public:
           const auto offset = i < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[i]
                                   : 0u;
-          info.range = static_cast<vk::DeviceSize>(
-              test.storage_buffer_range_dwords * sizeof(u32) + offset);
+          const auto byte_range =
+              test.storage_buffer_range_dwords * sizeof(u32) + offset;
+          info.range = static_cast<vk::DeviceSize>((byte_range + 3u) & ~3u);
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
@@ -17168,6 +17169,53 @@ TestCase BufferStoreDwordAppliesHostOffset() {
   return test;
 }
 
+TestCase BufferStoreDwordAppliesUnalignedHostOffset() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xabcdef01u);
+  code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreDwordAppliesUnalignedHostOffset";
+  test.code = code;
+  test.initial = {0x11111111u, 0x22222222u, 0x33333333u, 0};
+  test.expected = {0xcdef0111u, 0x222222abu, 0x33333333u, 0};
+  test.storage_buffer_range_dwords = 1;
+  test.storage_buffer_offsets = {1};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(4, 1);
+  test.has_user_data = true;
+  return test;
+}
+
+TestCase BufferLoadDwordAppliesUnalignedHostOffset() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 0, 30);
+  AppendStoreVgpr(&code, 0, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferLoadDwordAppliesUnalignedHostOffset";
+  test.code = code;
+  test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddddddddu,
+                  0xeeeeeeeeu};
+  test.expected = {0x11223344u, 0x55667788u, 0x112233ccu, 0xdddddd88u,
+                   0xeeeeeeeeu};
+  test.storage_buffer_range_dwords = 4;
+  test.storage_buffer_offsets = {1, 1};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(4, 4);
+  test.has_user_data = true;
+  return test;
+}
+
 TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   using O = ShaderOpcode;
 
@@ -21668,6 +21716,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
+  AddCase(BufferStoreDwordAppliesUnalignedHostOffset);
+  AddCase(BufferLoadDwordAppliesUnalignedHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
@@ -26003,6 +26053,12 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--unaligned-storage-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreDwordAppliesUnalignedHostOffset());
+    RunCase(&vulkan, BufferLoadDwordAppliesUnalignedHostOffset());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {

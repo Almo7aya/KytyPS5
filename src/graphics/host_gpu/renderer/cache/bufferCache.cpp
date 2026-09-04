@@ -412,7 +412,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, bool* uploaded) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -423,6 +423,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	if (uploaded != nullptr) {
+		*uploaded = static_cast<bool>(source);
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -494,6 +497,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
+	// A read-only range this buffer already served clean, with no dirty-state change in its
+	// regions since, needs neither the tracker walk nor a stream copy.
+	Buffer* cached = (is_written || is_texel_buffer) ? nullptr : m_slot_buffers.try_get(id);
+	if (cached != nullptr && !cached->is_deleted && cached->IsInBounds(vaddr, size)) {
+		if (cached->whole_clean_valid &&
+		    m_memory_tracker.IsRegionStampCurrent(cached->CpuAddress(), cached->Size(),
+		                                          cached->whole_clean_stamp)) {
+			TouchBuffer(*cached);
+			return {cached, cached->Offset(vaddr)};
+		}
+		for (const auto& clean: cached->clean_ranges) {
+			if (clean.address <= vaddr && vaddr + size <= clean.address + clean.size &&
+			    m_memory_tracker.IsRegionStampCurrent(clean.address, clean.size, clean.stamp)) {
+				TouchBuffer(*cached);
+				return {cached, cached->Offset(vaddr)};
+			}
+		}
+	}
+
 	if (!is_written && size <= CACHING_PAGESIZE &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
@@ -512,7 +534,39 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		buffer = &m_slot_buffers[id];
 	}
 	TouchBuffer(*buffer);
-	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	// The stamp is taken before the synchronization: a change that lands in between makes the
+	// stamp stale, which only costs a cache miss later, never a stale hit.
+	MemoryTracker::RegionStamp stamp;
+	const bool cacheable = !is_written && !is_texel_buffer &&
+	                       m_memory_tracker.CaptureRegionStamp(vaddr, size, stamp);
+	bool uploaded = false;
+	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer, &uploaded);
+	if (cacheable && !uploaded) {
+		// Prefer a whole-buffer stamp: static geometry buffers are entirely clean and are then
+		// served for every sub-range. The check costs one bitmap test per region and is skipped
+		// while a current whole-buffer stamp already exists.
+		const bool whole_current =
+		    buffer->whole_clean_valid &&
+		    m_memory_tracker.IsRegionStampCurrent(buffer->CpuAddress(), buffer->Size(),
+		                                          buffer->whole_clean_stamp);
+		if (!whole_current) {
+			MemoryTracker::RegionStamp whole_stamp;
+			if (m_memory_tracker.CaptureRegionStamp(buffer->CpuAddress(), buffer->Size(),
+			                                        whole_stamp) &&
+			    !m_memory_tracker.IsRegionCpuModified(buffer->CpuAddress(), buffer->Size())) {
+				buffer->whole_clean_valid = true;
+				buffer->whole_clean_stamp = whole_stamp;
+			} else {
+				buffer->whole_clean_valid = false;
+				auto& slot                = buffer->clean_ranges[buffer->clean_range_cursor];
+				slot.address              = vaddr;
+				slot.size                 = size;
+				slot.stamp                = stamp;
+				buffer->clean_range_cursor =
+				    static_cast<uint8_t>((buffer->clean_range_cursor + 1) % Buffer::CleanRangeSlots);
+			}
+		}
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer->last_gpu_write_tick = m_scheduler.CurrentTick();

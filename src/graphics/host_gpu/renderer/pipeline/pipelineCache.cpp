@@ -402,8 +402,11 @@ struct PipelineCache::ProgramCache {
 			                                               std::move(job.specialization),
 			                                               job.push_data_cursor);
 		}
-		std::lock_guard lock(completed_mutex);
-		completed.push_back(std::move(result));
+		{
+			std::lock_guard lock(completed_mutex);
+			completed.push_back(std::move(result));
+		}
+		completed_available.notify_all();
 	}
 
 	// GPU thread: adopt finished translations and permutations.
@@ -426,7 +429,6 @@ struct PipelineCache::ProgramCache {
 			}
 			if (result.permutation) {
 				entry->second.permutations.push_back(std::move(*result.permutation));
-				std::printf("Num compiled %u shaders\n", ++num_compiled);
 			}
 			if (const auto pending_it = pending.find(result.key); pending_it != pending.end()) {
 				std::erase(pending_it->second, result.tag);
@@ -484,6 +486,26 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		if (enqueue && !allow_async) {
+			const bool     has_entry = entry != programs.end();
+			const uint64_t tag =
+			    has_entry ? HashSpecialization(specialization) * 31u + push_data_cursor + 1u : 0u;
+			const auto pending_it = pending.find(lookup_key);
+			if (pending_it != pending.end() &&
+			    std::ranges::find(pending_it->second, tag) != pending_it->second.end()) {
+				const auto       awaited_key = lookup_key;
+				std::unique_lock completed_lock(completed_mutex);
+				completed_available.wait(completed_lock, [&] {
+					return std::ranges::any_of(completed, [&](const AsyncResult& result) {
+						return result.tag == tag && result.key == awaited_key;
+					});
+				});
+				completed_lock.unlock();
+				DrainCompleted();
+				return Get(params, input_info, push_data_cursor, false, translation_only);
+			}
+		}
+
 		if (enqueue && allow_async) {
 			// Hand translation (and, once the plan exists, permutation compilation) to a worker.
 			// The draw that needed this shader is skipped until the result has been adopted.
@@ -527,7 +549,6 @@ struct PipelineCache::ProgramCache {
 		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
-		std::printf("Num compiled %u shaders\n", ++num_compiled);
 		return permutation.handle;
 	}
 
@@ -556,12 +577,12 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
-	uint32_t                                                    num_compiled   = 0;
 	std::atomic<uint64_t>                                       next_shader_id = 0;
 
 	// Async translation: set by PipelineCache when workers are enabled.
 	std::function<void(std::function<void()>)>                             enqueue;
 	std::mutex                                                             completed_mutex;
+	std::condition_variable                                                completed_available;
 	std::vector<AsyncResult>                                               completed;
 	std::unordered_map<ProgramKey, std::vector<uint64_t>, ProgramKeyHash> pending;
 };
@@ -815,7 +836,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    bool pixel_active, ShaderVertexInputInfo& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    bool pixel_active, bool allow_async, ShaderVertexInputInfo& vertex_info,
+    ShaderPixelInputInfo& pixel_info) {
 	const auto vertex_params = PrepareProgram(vertex_regs, sh, vertex_info);
 	ShaderParams pixel_params;
 	if (pixel_active) {
@@ -839,15 +861,17 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor = 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, allow_async);
 		if (!result.pixel) {
 			// The vertex permutation cannot be compiled until the pixel layout establishes its
 			// push-data cursor, but its source translation is independent and can run in parallel.
-			m_program_cache->QueueSourceTranslation(vertex_params, vertex_info);
+			if (allow_async) {
+				m_program_cache->QueueSourceTranslation(vertex_params, vertex_info);
+			}
 			return result;
 		}
 	}
-	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);
+	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor, allow_async);
 	return result;
 }
 
@@ -902,7 +926,7 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program) {
+    const ShaderProgram& pixel_program, bool allow_async) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -1046,7 +1070,22 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 		m_last_graphics_pipeline = iter->second.get();
 		return iter->second.get();
 	}
-	if (m_async) {
+	if (m_async && !allow_async && m_pending_pipelines.contains(key)) {
+		std::unique_lock completed_lock(m_completed_mutex);
+		m_pipeline_completed.wait(completed_lock, [&] {
+			return std::ranges::any_of(m_completed_pipelines, [&](const CompletedPipeline& result) {
+				return result.key == key;
+			});
+		});
+		completed_lock.unlock();
+		DrainCompletedPipelines();
+		const auto iter = m_graphics_pipelines.find(key);
+		EXIT_IF(iter == m_graphics_pipelines.end());
+		m_last_graphics_key      = key;
+		m_last_graphics_pipeline = iter->second.get();
+		return iter->second.get();
+	}
+	if (m_async && allow_async) {
 		if (m_pending_pipelines.contains(key)) {
 			return nullptr;
 		}
@@ -1068,8 +1107,11 @@ PipelineCache::GraphicsPipeline* PipelineCache::CreateGraphicsPipeline(
 			                       static_params, m_driver_cache, m_graphics_library_cache.get());
 			EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 			EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
-			std::lock_guard lock(m_completed_mutex);
-			m_completed_pipelines.push_back({std::move(key), std::move(cached)});
+			{
+				std::lock_guard lock(m_completed_mutex);
+				m_completed_pipelines.push_back({std::move(key), std::move(cached)});
+			}
+			m_pipeline_completed.notify_all();
 		});
 		return nullptr;
 	}

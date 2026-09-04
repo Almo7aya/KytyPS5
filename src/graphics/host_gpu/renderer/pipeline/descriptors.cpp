@@ -220,17 +220,18 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range =
 	    static_cast<uint64_t>(graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange);
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if (adjustment >= 256) {
+		EXIT("storage buffer offset exceeds the shader binding ABI\n");
 	}
 	// Aligning the offset down puts `adjustment` bytes in front of the binding, so the described
 	// range has to leave room for them inside the device limit. Trimming the tail is safe for the
 	// same reason the clamp in StorageBufferExtent is.
 	const auto bound_size = std::min(size, max_range - adjustment);
+	const auto range_size = std::min(max_range, (bound_size + adjustment + 3u) & ~uint64_t {3});
 	buffer_offset         = static_cast<uint32_t>(adjustment);
 	result.buffer         = buffer->Handle();
 	result.offset         = aligned_offset;
-	result.range          = static_cast<vk::DeviceSize>(bound_size + adjustment);
+	result.range          = static_cast<vk::DeviceSize>(range_size);
 	if (resource.formatted && resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
