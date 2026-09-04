@@ -183,6 +183,26 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
 	emit({0x0f, 0x94, 0xc0});                 // sete al
 	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
+	while ((code.size() & 0x0f) != 0) {
+		emit({0xcc});
+	}
+	const auto frame_function_offset = code.size();
+	emit({0x55});                              // push rbp
+	emit({0x48, 0x89, 0xe5});                  // mov rbp, rsp
+	emit({0x41, 0x57, 0x41, 0x56, 0x41, 0x55, // push r15; push r14; push r13
+	      0x41, 0x54, 0x53});                  // push r12; push rbx
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                          // movabs rax, sentinel
+	emit({0x48, 0x89, 0x45, 0xc0});            // mov [rbp-0x40], rax == [rsp-0x18]
+	emit({0x48, 0x8b, 0x07});                  // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x45, 0xc0});            // mov rax, [rbp-0x40]
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                          // movabs rcx, sentinel
+	emit({0x48, 0x39, 0xc8});                  // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                  // sete al
+	emit({0x0f, 0xb6, 0xc0});                  // movzx eax, al
+	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d, 0x41, // pop rbx; pop r12; pop r13
+	      0x5e, 0x41, 0x5f, 0x5d, 0xc3});      // pop r14; pop r15; pop rbp; ret
 	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
 	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
 	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
@@ -195,20 +215,33 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 
 	using GuestFunction = uint64_t(KYTY_SYSV_ABI*)(const uint64_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
-	const bool unpatched_was_corrupted = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
-
-	DWORD old_protection = 0;
-	Check(test, VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
-	      "failed to reset fault page protection");
+	const auto frame_function =
+	    reinterpret_cast<GuestFunction>(mapping + frame_function_offset);
+	const auto reset_fault_page = [&] {
+		DWORD old_protection = 0;
+		Check(test,
+		      VirtualProtect(g_red_zone_fault_page, 0x1000, PAGE_NOACCESS, &old_protection) != FALSE,
+		      "failed to reset fault page protection");
+	};
+	const bool unpatched_was_corrupted =
+	    function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
+	reset_fault_page();
+	const bool unpatched_frame_was_corrupted =
+	    frame_function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 0;
+	reset_fault_page();
 	Loader::RegisterRedZonePatchModule(reinterpret_cast<void*>(mapping), CODE_SIZE,
 	                                   reinterpret_cast<void*>(mapping + CODE_SIZE),
 	                                   TRAMPOLINE_SIZE);
-	const std::array<uintptr_t, 1> function_starts = {static_cast<uintptr_t>(mapping)};
+	const std::array<uintptr_t, 2> function_starts = {
+	    static_cast<uintptr_t>(mapping), static_cast<uintptr_t>(mapping + frame_function_offset)};
 	const auto result = Loader::PatchRedZoneMemoryInstructions(
 	    mapping, code.size(), function_starts);
 	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
 	      "failed to flush patched test code");
 	const bool patched_preserved = function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
+	reset_fault_page();
+	const bool patched_frame_preserved =
+	    frame_function(static_cast<const uint64_t*>(g_red_zone_fault_page)) == 1;
 
 	Loader::UnregisterRedZonePatchModule(reinterpret_cast<void*>(mapping));
 	RemoveVectoredExceptionHandler(handler);
@@ -217,11 +250,15 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE);
 
 	Check(test, unpatched_was_corrupted, "test harness did not reproduce red-zone corruption");
-	Check(test, result.red_zone_function_count == 1 && result.memory_instruction_count >= 1 &&
-	                result.patched_memory_instruction_count >= 1 &&
+	Check(test, unpatched_frame_was_corrupted,
+	      "frame-pointer harness did not reproduce red-zone corruption");
+	Check(test, result.red_zone_function_count == 2 && result.memory_instruction_count >= 2 &&
+	                result.patched_memory_instruction_count >= 2 &&
 	                result.unrelocatable_memory_instruction_count == 0,
 	      "static patcher did not cover the faultable instruction");
 	Check(test, patched_preserved, "patched fault still corrupted the guest red zone");
+	Check(test, patched_frame_preserved,
+	      "patched frame-pointer fault still corrupted the guest red zone");
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }

@@ -567,6 +567,152 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	return function;
 }
 
+struct FrameState {
+	std::optional<s64> stack_delta {0};
+	std::optional<s64> frame_delta;
+};
+
+bool IsFramePointerRegister(ZydisRegister reg) {
+	return reg != ZYDIS_REGISTER_NONE &&
+	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RBP;
+}
+
+bool IsFramePointerSetup(const DecodedCodeInstruction& decoded) {
+	const auto& operands = decoded.operands;
+	return decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+	       operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       IsFramePointerRegister(operands[0].reg.value) &&
+	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       IsStackPointerRegister(operands[1].reg.value);
+}
+
+FrameState AdvanceFrameState(const DecodedCodeInstruction& decoded, FrameState state) {
+	const auto& operands = decoded.operands;
+	if (IsFramePointerSetup(decoded)) {
+		state.frame_delta = state.stack_delta;
+	} else if (WritesRegister(decoded, ZYDIS_REGISTER_RBP)) {
+		state.frame_delta.reset();
+	}
+
+	const bool restores_stack_from_frame = decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+	                                       operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	                                       IsStackPointerRegister(operands[0].reg.value) &&
+	                                       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	                                       IsFramePointerRegister(operands[1].reg.value);
+	if (restores_stack_from_frame) {
+		state.stack_delta = state.frame_delta;
+	} else if (decoded.changes_stack_pointer) {
+		if (state.stack_delta && decoded.stack_pointer_delta) {
+			*state.stack_delta += *decoded.stack_pointer_delta;
+		} else {
+			state.stack_delta.reset();
+		}
+	}
+	return state;
+}
+
+void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
+	if (!function.instructions.contains(function_start)) {
+		return;
+	}
+
+	std::map<uintptr_t, FrameState> states {{function_start, {}}};
+	std::vector<uintptr_t>          worklist {function_start};
+	for (size_t work_index = 0; work_index < worklist.size(); ++work_index) {
+		const uintptr_t address        = worklist[work_index];
+		const auto      instruction_it = function.instructions.find(address);
+		if (instruction_it == function.instructions.end()) {
+			continue;
+		}
+		const auto& decoded = instruction_it->second;
+		const auto  output  = AdvanceFrameState(decoded, states.at(address));
+
+		const auto merge_successor = [&](uintptr_t successor) {
+			if (!function.instructions.contains(successor)) {
+				return;
+			}
+			const auto [state_it, inserted] = states.emplace(successor, output);
+			if (inserted) {
+				worklist.push_back(successor);
+				return;
+			}
+
+			auto merged = state_it->second;
+			if (merged.stack_delta != output.stack_delta) {
+				merged.stack_delta.reset();
+			}
+			if (merged.frame_delta != output.frame_delta) {
+				merged.frame_delta.reset();
+			}
+			if (merged.stack_delta != state_it->second.stack_delta ||
+			    merged.frame_delta != state_it->second.frame_delta) {
+				state_it->second = merged;
+				worklist.push_back(successor);
+			}
+		};
+
+		const uintptr_t next_address  = address + decoded.instruction.length;
+		const uintptr_t branch_target = GetRelativeTarget(decoded);
+		if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+			merge_successor(next_address);
+			merge_successor(branch_target);
+		} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+			merge_successor(branch_target);
+		} else if (!IsControlFlowTerminator(decoded.instruction)) {
+			merge_successor(next_address);
+		}
+	}
+
+	for (auto& [address, decoded]: function.instructions) {
+		const auto state_it = states.find(address);
+		if (state_it == states.end() || !state_it->second.stack_delta ||
+		    !state_it->second.frame_delta) {
+			continue;
+		}
+
+		const s64 frame_from_stack = *state_it->second.frame_delta - *state_it->second.stack_delta;
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			    !IsFramePointerRegister(operand.mem.base)) {
+				continue;
+			}
+
+			decoded.uses_stack_pointer = true;
+			if (operand.mem.index != ZYDIS_REGISTER_NONE) {
+				decoded.has_unmodeled_red_zone_operand           = true;
+				function.requires_conservative_red_zone_tracking = true;
+				continue;
+			}
+
+			const s64 access_start = frame_from_stack + operand.mem.disp.value;
+			const s64 access_size  = std::max<s64>(operand.size / 8, 1);
+			const s64 range_start  = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
+			const s64 range_end    = std::min(access_start + access_size, 0LL);
+			if (range_start >= range_end) {
+				continue;
+			}
+
+			decoded.has_red_zone_operand = true;
+			function.uses_red_zone       = true;
+			if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
+				decoded.has_unmodeled_red_zone_operand           = true;
+				function.requires_conservative_red_zone_tracking = true;
+				continue;
+			}
+			for (s64 offset = range_start; offset < range_end; ++offset) {
+				const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
+				if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+					decoded.red_zone_use.set(bit);
+				}
+				if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
+					decoded.red_zone_def.set(bit);
+				}
+			}
+		}
+	}
+}
+
 RedZoneMask TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
 	RedZoneMask translated;
 	for (size_t bit = 0; bit < GuestRedZoneSize; ++bit) {
@@ -772,6 +918,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		AnalyzeFramePointerRedZone(function, function_start);
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 
