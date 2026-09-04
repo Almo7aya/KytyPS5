@@ -46,7 +46,9 @@ namespace {
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
 }
 
-[[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+[[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext&       graphics,
+                                                  const ImageInfo&      info,
+                                                  vk::ImageCreateFlags flags) {
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
 	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
@@ -60,7 +62,14 @@ namespace {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
 	if (info.samples == 1) {
-		usage |= vk::ImageUsageFlagBits::eStorage;
+		const auto candidate = usage | vk::ImageUsageFlagBits::eStorage;
+		vk::ImageFormatProperties image_properties {};
+		if (graphics.GetImageFormatProperties(
+		        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, candidate,
+		        flags, &image_properties) == vk::Result::eSuccess &&
+		    static_cast<bool>(image_properties.sampleCounts & vulkan_sample_count(info.samples))) {
+			usage = candidate;
+		}
 	}
 	return usage;
 }
@@ -665,7 +674,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	backing.mip_levels  = info.resources.levels;
 	backing.samples     = info.samples;
 	backing.flags       = ImageCreateFlags(info);
-	backing.usage       = ImageUsageFlags(graphics, info);
+	backing.usage       = ImageUsageFlags(graphics, info, backing.flags);
 
 	vk::ImageCreateInfo create {};
 	create.sType         = vk::StructureType::eImageCreateInfo;
