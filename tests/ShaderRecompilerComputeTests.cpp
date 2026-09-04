@@ -315,6 +315,11 @@ struct TextureCacheTestAccess {
     cache.DeleteImage(id);
   }
 
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
   static const Image *Owner(const TextureCache &cache, ImageId id) {
     return cache.m_slot_images.try_get(id);
   }
@@ -4197,6 +4202,32 @@ public:
                   complete_owner->IsDefinitelyCpuDirty(),
               "an exact backing with insufficient resources was expanded "
               "instead of being discarded and recreated");
+
+      constexpr uint64_t range_growth_offset = 0x720000;
+      auto narrow_range = sampled;
+      narrow_range.info.data = {base + range_growth_offset, 0x1000};
+      const auto narrow_range_id = texture_cache.FindImage(narrow_range);
+      const auto narrow_range_view =
+          texture_cache.FindTexture(narrow_range_id, narrow_range);
+      texture_cache.MarkGpuWritten(narrow_range_id);
+
+      auto expanded_range = narrow_range;
+      expanded_range.info.data.size = 0x2000;
+      const auto expanded_range_id = texture_cache.FindImage(expanded_range);
+      const auto expanded_range_owner =
+          TextureCacheTestAccess::Owner(texture_cache, expanded_range_id);
+      Require(name, "equal-layout guest-range growth",
+              narrow_range_view != nullptr && expanded_range_id &&
+                  expanded_range_id != narrow_range_id &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    narrow_range_id) &&
+                  expanded_range_owner != nullptr &&
+                  expanded_range_owner->info.data == expanded_range.info.data &&
+                  expanded_range_owner->backing.extent == narrow_range.info.extent &&
+                  expanded_range_owner->IsGpuModified(),
+              "a larger guest range for the same image layout was not expanded "
+              "while preserving native GPU contents");
+      TextureCacheTestAccess::FreeImage(texture_cache, expanded_range_id);
 
       ImageInfo chain = sampled.info;
       chain.data = {0x10000, 0x8000};
@@ -24919,6 +24950,64 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
 }
 
+void CheckVertexBufferMappedExtent(RenderContext &renderer) {
+  auto &resources = renderer.GetGpuResources();
+  constexpr uint64_t base = TRACKER_ADDRESS_SIZE - (1ull << 20u);
+  constexpr uint64_t mapped_size = 0x18000;
+  constexpr uint64_t fetch_cap = 64ull * 1024ull;
+  resources.MapMemory(base, mapped_size);
+
+  ShaderVertexInputBuffer vertex{};
+  vertex.addr = base + 0x1000;
+  vertex.stride = 16;
+  vertex.num_records = 4;
+  Require("VertexBufferMappedExtent", "under-reported descriptor",
+          ResolveVertexBufferRequestSize(resources, vertex) == fetch_cap,
+          "small vertex request did not expand to the 64 KiB mapped cap");
+
+  vertex.addr = base + 0x10000;
+  Require("VertexBufferMappedExtent", "mapped boundary",
+          ResolveVertexBufferRequestSize(resources, vertex) == 0x8000,
+          "vertex request crossed the end of its contiguous guest mapping");
+
+  vertex.addr = base + 0x17000;
+  vertex.stride = 0x100;
+  vertex.num_records = 0x20;
+  Require("VertexBufferMappedExtent", "nominal floor",
+          ResolveVertexBufferRequestSize(resources, vertex) == 0x2000,
+          "mapped extent incorrectly shrank the descriptor footprint");
+
+  vertex.addr = base;
+  vertex.num_records = 0;
+  const bool empty_unchanged =
+      ResolveVertexBufferRequestSize(resources, vertex) == 0;
+  vertex.addr = 0;
+  vertex.stride = 16;
+  vertex.num_records = 4;
+  const bool null_unchanged =
+      ResolveVertexBufferRequestSize(resources, vertex) == 64;
+  vertex.addr = base;
+  vertex.stride = 0x100;
+  vertex.num_records = 0x100;
+  const bool cap_unchanged =
+      ResolveVertexBufferRequestSize(resources, vertex) == fetch_cap;
+  vertex.num_records = 0x101;
+  const bool large_unchanged =
+      ResolveVertexBufferRequestSize(resources, vertex) == 0x10100;
+  vertex.addr = UINT64_MAX - 0x8000;
+  vertex.stride = 16;
+  vertex.num_records = 4;
+  const bool overflow_unchanged =
+      ResolveVertexBufferRequestSize(resources, vertex) == 64;
+  Require("VertexBufferMappedExtent", "bypass cases",
+          empty_unchanged && null_unchanged && cap_unchanged &&
+              large_unchanged && overflow_unchanged,
+          "an empty, capped, large, or overflow-edge request changed size");
+
+  resources.UnmapMemory(base, mapped_size);
+  std::printf("[host]    %-32s ok\n", "VertexBufferMappedExtent");
+}
+
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -25921,6 +26010,11 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuMappedRangeLifecycle();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-buffer-extent-only") == 0) {
+    VulkanHarness vulkan;
+    CheckVertexBufferMappedExtent(vulkan.RuntimeRenderer());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stream-buffer-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStreamBufferRing();
@@ -26182,6 +26276,7 @@ int main(int argc, char **argv) {
   CheckRectListShaders();
   CheckIndirectImageKeySwitch();
   CheckPs5GameExampleImageClearRuntimeShape();
+  CheckVertexBufferMappedExtent(vulkan.RuntimeRenderer());
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();

@@ -202,6 +202,20 @@ void TestRangeSet() {
             intersections[0].size == 0x90 &&
             intersections[1].address == 0x1200 && intersections[1].size == 0x20,
         "range set did not merge and intersect exact byte ranges");
+  // The two adjacent adds coalesce into one [0x1000, 0x1100) entry, so a
+  // contiguous extent may cross the seam between them but must stop at the hole
+  // that follows. A binding derived from this reads real memory for exactly as
+  // many bytes as it reports.
+  Check(ranges.ContiguousExtent(0x1010, 0x1000) == 0xf0 &&
+            ranges.ContiguousExtent(0x1000, 0x40) == 0x40 &&
+            ranges.ContiguousExtent(0x10ff, 0x1000) == 1,
+        "contiguous extent did not span coalesced ranges up to the hole");
+  Check(ranges.ContiguousExtent(0x1100, 0x100) == 0 &&
+            ranges.ContiguousExtent(0x1240, 1) == 0 &&
+            ranges.ContiguousExtent(0x0fff, 1) == 0 &&
+            ranges.ContiguousExtent(0, 0x100) == 0 &&
+            ranges.ContiguousExtent(0x1010, 0) == 0,
+        "contiguous extent reported bytes for an untracked address");
   ranges.Subtract(0x1040, 0x1e0);
   intersections = ranges.Intersections(0x1000, 0x300);
   Check(intersections.size() == 2 && intersections[0].address == 0x1000 &&
