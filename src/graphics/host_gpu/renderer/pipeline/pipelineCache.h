@@ -9,12 +9,22 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
+#include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -22,6 +32,7 @@ struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
 class CommandBuffer;
+class GraphicsPipelineLibraryCache;
 
 namespace HW {
 class Context;
@@ -131,6 +142,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    owns_layout           = true;
 	};
 
 	struct GraphicsPipeline: Pipeline {
@@ -156,7 +168,9 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	GraphicsPipeline&
+	// Returns null while the pipeline is still being built on a worker thread (async mode); the
+	// caller skips the draw and retries on a later frame.
+	GraphicsPipeline*
 	CreateGraphicsPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
 	                       const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                       const ShaderPixelInputInfo* ps_input_info,
@@ -164,6 +178,9 @@ public:
 	                       const ShaderProgram& vertex_program, const ShaderProgram& pixel_program);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);
+	// The vertex-layout part of a graphics pipeline key, derived from the bound vertex buffers.
+	[[nodiscard]] static PipelineVertexInputState
+	BuildVertexInputState(const ShaderVertexInputInfo& vs_input_info);
 
 private:
 	struct ProgramCache;
@@ -197,10 +214,9 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
+			// The struct is packed with no padding, so hashing its bytes in one pass is exact;
+			// this runs once per draw.
+			Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -243,7 +259,10 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	GraphicsPipelineKey           m_last_graphics_key {};
+	GraphicsPipeline*             m_last_graphics_pipeline = nullptr;
 	std::unique_ptr<ProgramCache> m_program_cache;
+	std::unique_ptr<GraphicsPipelineLibraryCache> m_graphics_library_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>,
@@ -253,7 +272,48 @@ private:
 	              m_compute_pipelines;
 	Common::Mutex m_mutex;
 
+	// Asynchronous graphics pipeline construction. Keys being built live in m_pending_pipelines
+	// (GPU thread only); finished pipelines wait in m_completed_pipelines until the GPU thread
+	// drains them at its next lookup.
+	struct CompletedPipeline {
+		GraphicsPipelineKey               key;
+		std::unique_ptr<GraphicsPipeline> pipeline;
+	};
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_pending_pipelines;
+	std::mutex                                                       m_completed_mutex;
+	std::vector<CompletedPipeline>                                   m_completed_pipelines;
+	std::mutex                                                       m_job_mutex;
+	std::condition_variable                                          m_job_available;
+	std::deque<std::function<void()>>                                m_jobs;
+	std::vector<std::jthread>                                        m_workers;
+	bool                                                             m_stop_workers = false;
+	bool                                                             m_async        = false;
+
 	void InitializeDriverCache();
+	void StartWorkers();
+	void StopWorkers();
+	void EnqueueJob(std::function<void()> job);
+	void DrainCompletedPipelines();
+};
+
+class GraphicsPipelineLibraryCache {
+public:
+	GraphicsPipelineLibraryCache(GraphicContext& graphics, vk::PipelineCache driver_cache);
+	~GraphicsPipelineLibraryCache();
+	KYTY_CLASS_NO_COPY(GraphicsPipelineLibraryCache);
+
+	void PrepareLayout(PipelineCache::GraphicsPipeline&                pipeline,
+	                   std::span<const vk::DescriptorSetLayoutBinding> bindings);
+	bool CreatePipeline(PipelineCache::GraphicsPipeline&         pipeline,
+	                    const PipelineRenderingState&            rendering,
+	                    const PipelineStaticParameters&          static_params,
+	                    const vk::GraphicsPipelineCreateInfo&    pipeline_info,
+	                    uint32_t                                 pre_raster_stage_count,
+	                    const vk::PipelineShaderStageCreateInfo* fragment_stage);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m_impl;
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -262,7 +322,8 @@ void CreatePipelineInternal(
     const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
     const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
     const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
-    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache);
+    const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, GraphicsPipelineLibraryCache* library_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::ComputePipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

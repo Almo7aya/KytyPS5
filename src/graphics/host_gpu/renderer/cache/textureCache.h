@@ -67,6 +67,9 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
+	// Bumps whenever an image is freed, unregistered or its guest memory invalidated. Renderer
+	// caches holding ImageIds compare it to know their ids are still current.
+	[[nodiscard]] uint64_t MutationEpoch() const noexcept { return m_mutation_epoch; }
 
 	// Records that a metadata fill targeted an address no surface has claimed yet, without the code:
 	// the caller lets the dispatch run, so the value only exists in the allocation afterwards.
@@ -190,6 +193,7 @@ private:
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
+	uint64_t         m_mutation_epoch         = 0;
 	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;

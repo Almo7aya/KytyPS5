@@ -592,15 +592,31 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+	const auto graphics_pipeline_library_ext_enabled =
+	    HasExtension(device_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	    HasExtension(device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT supported_graphics_pipeline_library {};
+	supported_graphics_pipeline_library.sType =
+	    vk::StructureType::ePhysicalDeviceGraphicsPipelineLibraryFeaturesEXT;
+	supported_graphics_pipeline_library.pNext = nullptr;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
-	supported_robustness2.pNext = nullptr;
+	supported_robustness2.pNext = graphics_pipeline_library_ext_enabled
+	                                  ? static_cast<void*>(&supported_graphics_pipeline_library)
+	                                  : nullptr;
 	if (robustness2_ext_enabled) {
 #if defined(__APPLE__)
 		supported_features12.pNext = &supported_robustness2;
 #else
 		supported_fragment_barycentric.pNext = &supported_robustness2;
+#endif
+	} else if (graphics_pipeline_library_ext_enabled) {
+#if defined(__APPLE__)
+		supported_features12.pNext = &supported_graphics_pipeline_library;
+#else
+		supported_fragment_barycentric.pNext = &supported_graphics_pipeline_library;
 #endif
 	}
 
@@ -672,24 +688,54 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
 
+	const bool graphics_pipeline_library_enabled =
+	    graphics_pipeline_library_ext_enabled &&
+	    supported_graphics_pipeline_library.graphicsPipelineLibrary == VK_TRUE;
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library {};
+	graphics_pipeline_library.sType =
+	    vk::StructureType::ePhysicalDeviceGraphicsPipelineLibraryFeaturesEXT;
+	graphics_pipeline_library.graphicsPipelineLibrary =
+	    graphics_pipeline_library_enabled ? VK_TRUE : VK_FALSE;
+
 	const bool subgroup_size_control_enabled =
 	    graphics.compute_subgroup_size_control_enabled &&
 	    supported_features13.subgroupSizeControl == VK_TRUE;
 
 	auto features13 = required_features13;
 #if defined(__APPLE__)
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
+	void* enabled_feature_chain = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
+	                                                      : static_cast<void*>(&features12);
 #else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
+	void* enabled_feature_chain = robustness2_ext_enabled
+	                                  ? static_cast<void*>(&robustness2)
+	                                  : static_cast<void*>(&fragment_barycentric);
 #endif
+	graphics_pipeline_library.pNext = enabled_feature_chain;
+	features13.pNext                = graphics_pipeline_library_enabled
+	                                      ? static_cast<void*>(&graphics_pipeline_library)
+	                                      : enabled_feature_chain;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+
+	graphics.graphics_pipeline_library_enabled      = graphics_pipeline_library_enabled;
+	graphics.graphics_pipeline_library_fast_linking = false;
+	if (graphics_pipeline_library_enabled) {
+		vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT properties {};
+		properties.sType = vk::StructureType::ePhysicalDeviceGraphicsPipelineLibraryPropertiesEXT;
+		vk::PhysicalDeviceProperties2 properties2 {};
+		properties2.sType = vk::StructureType::ePhysicalDeviceProperties2;
+		properties2.pNext = &properties;
+		physical_device.getProperties2(&properties2);
+		graphics.graphics_pipeline_library_fast_linking =
+		    properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	}
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	LOGF("Vulkan graphics pipeline library: enabled=%s fastLinking=%s\n",
+	     graphics.graphics_pipeline_library_enabled ? "true" : "false",
+	     graphics.graphics_pipeline_library_fast_linking ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
@@ -1075,6 +1121,11 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 		}
 	}
 

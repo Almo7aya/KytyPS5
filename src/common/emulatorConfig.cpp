@@ -127,6 +127,10 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool AsyncShadersEnabled() {
+	return g_config->async_shaders;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

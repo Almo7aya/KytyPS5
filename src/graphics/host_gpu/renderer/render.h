@@ -4,6 +4,8 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -174,11 +176,12 @@ private:
 		std::optional<PreparedBindings> pixel;
 	};
 
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
-	                                                       const ShaderStageRuntime& pixel,
-	                                                       bool                      pixel_active);
+	[[nodiscard]] GraphicsBindings& PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+	                                                        const ShaderStageRuntime& pixel,
+	                                                        bool                      pixel_active);
 	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderColorInfo& target, uint32_t render_target_slice_offset = 0,
 	                              uint32_t render_target_slot = UINT32_MAX,
@@ -205,12 +208,55 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 
+	// Consecutive draws overwhelmingly share render targets and fixed-function state. Both caches
+	// are keyed on register-block version stamps (see HW::Context), so a hit means the registers
+	// that fed the cached result are byte-identical; the texture-cache epoch and scheduler tick
+	// guard against image ids going stale.
+	struct RenderStateCache {
+		struct Key {
+			uint64_t rt_version       = 0;
+			uint64_t state_version    = 0;
+			uint64_t sh_version       = 0;
+			uint64_t shader_version   = 0;
+			uint64_t texture_epoch    = 0;
+			uint64_t scheduler_tick   = 0;
+			uint32_t slice_offset     = 0;
+			bool     operator==(const Key&) const = default;
+		};
+		bool            valid = false;
+		Key             key;
+		RenderColorInfo color_info[RENDER_COLOR_ATTACHMENTS_MAX];
+		uint32_t        color_count = 0;
+		RenderDepthInfo depth_info;
+	};
+
+	struct PipelinePointerCache {
+		struct Key {
+			uint64_t                 rt_version     = 0;
+			uint64_t                 state_version  = 0;
+			uint64_t                 sh_version     = 0;
+			uint64_t                 shader_version = 0;
+			uint64_t                 vertex_id      = 0;
+			uint64_t                 pixel_id       = 0;
+			vk::PrimitiveTopology    topology       = vk::PrimitiveTopology::ePointList;
+			bool                     primitive_restart = false;
+			bool                     ps_active         = false;
+			PipelineVertexInputState vertex_input;
+			bool                     operator==(const Key&) const = default;
+		};
+		Key                              key;
+		PipelineCache::GraphicsPipeline* pipeline = nullptr;
+	};
+
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	GraphicsBindings                      m_graphics_bindings;
+	RenderStateCache                      m_render_state_cache;
+	PipelinePointerCache                  m_pipeline_pointer_cache;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

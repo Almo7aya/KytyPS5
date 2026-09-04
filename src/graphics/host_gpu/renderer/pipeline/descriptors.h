@@ -43,11 +43,17 @@ struct NativeDescriptors {
 	BufferView                  shader_data;
 };
 
+struct PreparedBufferBinding {
+	ShaderBufferResource descriptor {};
+	BufferId             id {};
+	uint64_t             extent = 0;
+};
+
 struct PreparedBindings {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program  = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
 	NativeDescriptors                             resources;
-	std::vector<std::pair<ShaderBufferResource, BufferId>> buffer_sources;
+	std::vector<PreparedBufferBinding>            buffer_bindings;
 	std::vector<uint32_t>                         shader_data;
 };
 

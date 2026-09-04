@@ -53,11 +53,12 @@ int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& 
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
 	const auto& resources = vs_input_info.stage.resources;
+	const auto& user_data = resources.user_data;
 	if (program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
 		    static_cast<uint32_t>(program.info.vertex_offset_sgpr) - program.user_data_base;
-		if (index < resources.user_data.size()) {
-			return static_cast<int32_t>(resources.user_data[index]);
+		if (index < user_data.size()) {
+			return static_cast<int32_t>(user_data[index]);
 		}
 	}
 
@@ -393,6 +394,10 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
 		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
 	}
+
+#if !defined(__APPLE__)
+	vk_buffer.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+#endif
 
 	if (depth.stencil_test_enable) {
 		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
@@ -991,23 +996,57 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	if (ResolveColorTargets(submit_id, buffer, render_target_slice_offset)) {
 		return false;
 	}
-	if (log_setup_phases) {
-		LogDrawPhase(draw.name, "ResolveRenderColorTarget");
-	}
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
-		                  ctx.GetRenderTarget(slot).base.addr != 0)) {
-			ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
-			                         render_target_slice_offset, slot);
-			if (state.color_info[state.color_count].image_id) {
-				state.color_count++;
+	const RenderStateCache::Key cache_key {
+	    .rt_version     = ctx.GetRenderTargetVersion(),
+	    .state_version  = ctx.GetStateVersion(),
+	    .sh_version     = ctx.GetShaderRegVersion(),
+	    .shader_version = buffer.GetShaders().GetVersion(),
+	    .texture_epoch  = m_context.GetTextureCache().MutationEpoch(),
+	    .scheduler_tick = m_context.GetCommandScheduler().CurrentTick(),
+	    .slice_offset   = render_target_slice_offset,
+	};
+	if (m_render_state_cache.valid && m_render_state_cache.key == cache_key) {
+		// Same targets, same state, same submission: reuse the resolved attachments. The only
+		// side effect of resolution that later stages rely on is the bound-target tracking.
+		state.color_count = m_render_state_cache.color_count;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			state.color_info[i] = m_render_state_cache.color_info[i];
+			BindRenderTarget(state.color_info[i].image_id);
+		}
+		state.depth_info = m_render_state_cache.depth_info;
+		if (state.depth_info.image_id) {
+			BindRenderTarget(state.depth_info.image_id);
+		}
+	} else {
+		if (log_setup_phases) {
+			LogDrawPhase(draw.name, "ResolveRenderColorTarget");
+		}
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if (slot == 0 || (render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0 &&
+			                  ctx.GetRenderTarget(slot).base.addr != 0)) {
+				ResolveRenderColorTarget(submit_id, buffer, state.color_info[state.color_count],
+				                         render_target_slice_offset, slot);
+				if (state.color_info[state.color_count].image_id) {
+					state.color_count++;
+				}
 			}
 		}
+		if (log_setup_phases) {
+			LogDrawPhase(draw.name, "ResolveRenderDepthTarget");
+		}
+		ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
+
+		// Resolution may itself have created or freed images; only cache when the ids are
+		// guaranteed current for the key we store.
+		m_render_state_cache.key = cache_key;
+		m_render_state_cache.key.texture_epoch = m_context.GetTextureCache().MutationEpoch();
+		m_render_state_cache.valid       = true;
+		m_render_state_cache.color_count = state.color_count;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			m_render_state_cache.color_info[i] = state.color_info[i];
+		}
+		m_render_state_cache.depth_info = state.depth_info;
 	}
-	if (log_setup_phases) {
-		LogDrawPhase(draw.name, "ResolveRenderDepthTarget");
-	}
-	ResolveRenderDepthTarget(submit_id, buffer, state.depth_info);
 
 	state.ps_active       = DrawHasActivePixelShader(buffer);
 	const bool with_depth = (state.depth_info.format != vk::Format::eUndefined &&
@@ -1184,23 +1223,50 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	EXIT_IF(draw.name == nullptr);
 	auto& ucfg = buffer.GetUserConfig();
 
+	if (log_pipeline_phase) {
+		LogDrawPhase(draw.name, "CreatePipeline");
+	}
+	const auto&                      regs = buffer.GetRegisters();
+	const PipelinePointerCache::Key  pipeline_key {
+	    .rt_version        = regs.GetRenderTargetVersion(),
+	    .state_version     = regs.GetStateVersion(),
+	    .sh_version        = regs.GetShaderRegVersion(),
+	    .shader_version    = buffer.GetShaders().GetVersion(),
+	    .vertex_id         = state.programs.vertex.id,
+	    .pixel_id          = state.ps_active ? state.programs.pixel.id : 0,
+	    .topology          = topology,
+	    .primitive_restart = primitive_restart_enable,
+	    .ps_active         = state.ps_active,
+	    .vertex_input      = PipelineCache::BuildVertexInputState(state.vs_input_info),
+	};
+	PipelineCache::GraphicsPipeline* pipeline_ptr = nullptr;
+	if (m_pipeline_pointer_cache.pipeline != nullptr && m_pipeline_pointer_cache.key == pipeline_key) {
+		pipeline_ptr = m_pipeline_pointer_cache.pipeline;
+	} else {
+		pipeline_ptr = m_context.GetPipelineCache().CreateGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info,
+		    buffer, state.ps_active ? &state.ps_input_info : nullptr, topology,
+		    primitive_restart_enable, state.programs.vertex, state.programs.pixel);
+		if (pipeline_ptr != nullptr) {
+			m_pipeline_pointer_cache.key      = pipeline_key;
+			m_pipeline_pointer_cache.pipeline = pipeline_ptr;
+		}
+	}
+	if (pipeline_ptr == nullptr) {
+		// The pipeline is still compiling on a worker; this draw is dropped for the frame.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
+
 	LogDrawPhase(draw.name, "PrepareBindings");
-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
-	                                        state.ps_active);
+	auto& bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
+	                                         state.ps_active);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
 
-	if (log_pipeline_phase) {
-		LogDrawPhase(draw.name, "CreatePipeline");
-	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
-
-	// Resource preparation above may synchronously finish and restart the scheduler. From this
+	// Resource preparation may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
@@ -1370,6 +1436,11 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	RefreshShaders(buffer, draw, true, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// A shader is still being translated on a worker; drop this draw for the frame.
+		ResetBindings();
+		return;
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, args.index_type_and_size,
 	                     args.index_addr);
@@ -1456,6 +1527,11 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 	RefreshShaders(buffer, draw, false, state);
+	if (!state.programs.vertex || (state.ps_active && !state.programs.pixel)) {
+		// A shader is still being translated on a worker; drop this draw for the frame.
+		ResetBindings();
+		return;
+	}
 
 	const bool rect_list = topology == vk::PrimitiveTopology::ePatchList;
 	if (rect_list && state.vs_input_info.buffers_num == 0 &&
