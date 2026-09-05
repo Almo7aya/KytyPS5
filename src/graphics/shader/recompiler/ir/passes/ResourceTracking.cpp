@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstring>
 #include <fmt/format.h>
 #include <span>
 #include <utility>
@@ -98,6 +99,7 @@ public:
 			Fail(0, "SRT plan is not ready");
 		}
 		PlanIndirectImages();
+		LowerDynamicScalarBuffers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -200,6 +202,77 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static bool ContainsPhi(Value value, std::vector<const Inst*>& visited) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+			return false;
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return true;
+		}
+		visited.push_back(inst);
+		for (uint32_t index = 0; index < inst->NumArgs(); index++) {
+			if (ContainsPhi(inst->Arg(index), visited)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void LowerDynamicScalarBuffers() {
+		for (auto* block: m_program.blocks) {
+			for (auto inst = block->begin(); inst != block->end(); ++inst) {
+				if (inst->GetOpcode() != ValueOpcode::ReadConstBuffer) {
+					continue;
+				}
+				const auto flags = inst->Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					Fail(flags.pc,
+					     fmt::format("memory metadata index {} is out of range", flags.index));
+				}
+				auto& memory = m_program.memory_info[flags.index];
+				if (memory.kind != ResourceKind::ScalarBuffer || inst->NumArgs() != 2u) {
+					continue;
+				}
+				auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    handle->NumArgs() != 4u) {
+					continue;
+				}
+				DescriptorSource descriptor;
+				MakeSource(*handle, 4u, false, false, descriptor, flags.pc);
+				uint32_t bad_dword = 0;
+				if (ValidateSource(descriptor, bad_dword)) {
+					continue;
+				}
+				const bool all_dwords_are_u32 = std::ranges::all_of(
+				    std::span(descriptor.dwords).first(descriptor.dword_count),
+				    [](Value dword) { return dword.Resolve().GetType() == Type::U32; });
+				std::vector<const Inst*> visited;
+				const bool dynamic_phi = bad_dword == 0u && all_dwords_are_u32 &&
+				                         ContainsPhi(descriptor.dwords[0], visited);
+				if (!dynamic_phi) {
+					continue;
+				}
+
+				// Scalar reads need only the selected descriptor's address. Preserve its dynamic
+				// low/high words and route the load through the existing guest-address BDA path.
+				const auto high = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::BitwiseAnd32, {handle->Arg(1), Value(0xffffu)}));
+				const auto address = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::GetAddressResource, {handle->Arg(0), high}));
+				uint64_t load_flags = 0;
+				std::memcpy(&load_flags, &flags, sizeof(flags));
+				const auto load = Value(&*block->PrependNewInst(
+				    inst, ValueOpcode::LoadAddressU32,
+				    {address, inst->Arg(1), Value(0u), Value(true)}, load_flags));
+				inst->ReplaceUsesWith(load);
+				memory.kind = ResourceKind::ScalarAddress;
+			}
+		}
 	}
 
 	uint32_t InternSource(const DescriptorSource& descriptor) {
@@ -475,6 +548,18 @@ private:
 			bad_dword = 0;
 		}
 		if (!ValidateSource(descriptor, bad_dword)) {
+			// Dynamic sampler tables are not materialized yet. Keep tracking the paired image and use
+			// the native default point sampler for the narrowly identified Phi-selected case.
+			std::vector<const Inst*> visited;
+			const bool dynamic_sampler_base =
+			    sampler && bad_dword == 0u &&
+			    descriptor.dwords[0].Resolve().GetType() == Type::U32 &&
+			    ContainsPhi(descriptor.dwords[0], visited);
+			if (dynamic_sampler_base) {
+				descriptor.dwords.fill(Value(0u));
+				source = InternSource(descriptor);
+				return;
+			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
 		}

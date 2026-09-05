@@ -718,6 +718,57 @@ void TestSampleAdjustSamplerScratch() {
                 "SampleAdjust canonicalization discarded border-mode bits");
 }
 
+void TestDynamicSamplerFallback() {
+  Fixture fixture(ShaderType::Pixel);
+  auto *left = fixture.block;
+  auto *right = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  left->AddBranch(merge);
+  right->AddBranch(merge);
+
+  const auto left_sampler = fixture.UserData(0);
+  const auto right_sampler = fixture.Emit(
+      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(4))}, 0, right);
+  auto &sampler_base = merge->AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  sampler_base.AddPhiOperand(left, left_sampler);
+  sampler_base.AddPhiOperand(right, right_sampler);
+
+  fixture.block = merge;
+  const auto image = fixture.Image(
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)},
+      0x1c8);
+  const auto sampler = fixture.Sampler(
+      {Value(&sampler_base), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)},
+      0x1c8);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x1c8));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.images.size() == 1 &&
+            fixture.program.info.samplers.size() == 1 &&
+            fixture.program.info.sampled_pairs.size() == 1,
+        "dynamic sampler fallback did not preserve sampled-image tracking");
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto &descriptor = fixture.program.descriptor_sources[source];
+  Check(descriptor.dword_count == 4 &&
+            std::ranges::all_of(
+                std::span(descriptor.dwords).first(descriptor.dword_count),
+                [](Value dword) {
+                  const auto resolved = dword.Resolve();
+                  return resolved.IsImmediate() &&
+                         resolved.GetType() == Type::U32 &&
+                         resolved.U32() == 0u;
+                }),
+        "Phi-selected sampler did not use the default descriptor fallback");
+}
+
 void TestDynamicStorageMipTracking() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -1056,6 +1107,78 @@ void TestInvariantLoopPhi() {
                                  fixture.program.info.buffers[0].source, runtime, descriptor) &&
             descriptor.dwords[0] == user_data[0],
         "loop-invariant descriptor phi was not evaluated through typed SSA");
+}
+
+void TestDynamicScalarBufferUsesDma() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &base = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                   static_cast<uint64_t>(Type::U32));
+  const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                 {Value(&base), Value(16u)}, 0, loop);
+  base.AddPhiOperand(entry, fixture.UserData(0));
+  base.AddPhiOperand(loop, next);
+  const auto descriptor = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(&base), Value(0x12340000u), Value(0u), Value(0u)},
+      MemoryFlags{0, 0x1e8}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarBuffer;
+  const auto flags = fixture.AddMemory(memory, 0x1e8);
+  fixture.Emit(ValueOpcode::ReadConstBuffer, {descriptor, Value(8u)}, flags,
+               loop);
+
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.buffers.empty() && fixture.program.info.uses_dma &&
+            fixture.program.memory_info[flags.index].kind ==
+                ResourceKind::ScalarAddress,
+        "dynamic scalar descriptor was not lowered to DMA");
+  const auto lowered = std::ranges::find_if(*loop, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::LoadAddressU32;
+  });
+  Check(lowered != loop->end() &&
+            lowered->Arg(0).ResolveInstruction() != nullptr &&
+            lowered->Arg(0).ResolveInstruction()->GetOpcode() ==
+                ValueOpcode::GetAddressResource,
+        "dynamic scalar load did not retain an address resource");
+}
+
+void TestDynamicScalarDescriptorTupleUsesDma() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  std::array<Inst *, 4> words{};
+  for (uint32_t index = 0; index < words.size(); index++) {
+    auto &word = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    const auto next = fixture.Emit(ValueOpcode::IAdd32,
+                                   {Value(&word), Value(16u + index)}, 0, loop);
+    word.AddPhiOperand(entry, fixture.UserData(index));
+    word.AddPhiOperand(loop, next);
+    words[index] = &word;
+  }
+  const auto descriptor = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(words[0]), Value(words[1]), Value(words[2]), Value(words[3])},
+      MemoryFlags{0, 0x1e8}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::ScalarBuffer;
+  const auto flags = fixture.AddMemory(memory, 0x1e8);
+  fixture.Emit(ValueOpcode::ReadConstBuffer, {descriptor, Value(8u)}, flags,
+               loop);
+
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.buffers.empty() && fixture.program.info.uses_dma &&
+            fixture.program.memory_info[flags.index].kind ==
+                ResourceKind::ScalarAddress,
+        "dynamic scalar descriptor tuple was not lowered to DMA");
 }
 
 void TestDmaAddressMaterialization() {
@@ -1472,6 +1595,7 @@ int main() {
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
+    Run("dynamic sampler fallback", TestDynamicSamplerFallback);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
@@ -1479,6 +1603,9 @@ int main() {
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
+    Run("dynamic scalar buffer DMA", TestDynamicScalarBufferUsesDma);
+    Run("dynamic scalar descriptor tuple DMA",
+        TestDynamicScalarDescriptorTupleUsesDma);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
