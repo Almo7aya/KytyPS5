@@ -390,7 +390,7 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 }
 
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
-                              const ShaderRecompiler::IR::Program& program,
+                              const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
 	for (const auto& binding: program.bindings.descriptors) {
 		descriptor_bindings.push_back(
@@ -421,10 +421,10 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
-    const PipelineRenderingState& rendering, const ShaderVertexInputInfo& vs_input_info,
-    vk::ShaderModule vertex_module, const ShaderPixelInputInfo* ps_input_info,
-	vk::ShaderModule pixel_module, const PipelineStaticParameters& static_params,
-	vk::PipelineCache driver_cache) {
+    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
+    const ShaderVertexInputInfo& vs_input_info, vk::ShaderModule vertex_module,
+    const ShaderPixelInputInfo* ps_input_info, vk::ShaderModule pixel_module,
+    const PipelineStaticParameters& static_params, vk::PipelineCache driver_cache) {
 	const bool ps_active = ps_input_info != nullptr;
 	EXIT_IF(vertex_module == nullptr || (ps_active && pixel_module == nullptr));
 
@@ -505,135 +505,131 @@ void CreatePipelineInternal(
 		shader_stages[shader_stage_count++] = frag_shader_stage_info;
 	}
 
-	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX];
-	vk::VertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX];
+	vk::VertexInputAttributeDescription input_attr[ShaderVertexInputInfo::RES_MAX] {};
+	vk::VertexInputBindingDescription   input_desc[ShaderVertexInputInfo::RES_MAX] {};
 
-	for (int bi = 0; bi < vs_input_info.buffers_num; bi++) {
-		const auto& b          = vs_input_info.buffers[bi];
-		input_desc[bi].binding = bi;
-		input_desc[bi].stride  = b.stride;
-		input_desc[bi].inputRate =
-		    (b.fetch_index == 0 ? vk::VertexInputRate::eVertex : vk::VertexInputRate::eInstance);
+	for (uint32_t binding = 0; binding < vertex_input.binding_count; binding++) {
+		input_desc[binding].binding   = binding;
+		input_desc[binding].stride    = vertex_input.bindings[binding].stride;
+		input_desc[binding].inputRate = vertex_input.bindings[binding].instance
+		                                    ? vk::VertexInputRate::eInstance
+		                                    : vk::VertexInputRate::eVertex;
+	}
+	for (uint32_t index = 0; index < vertex_input.attribute_count; index++) {
+		input_attr[index].binding  = vertex_input.attributes[index].binding;
+		input_attr[index].location = index;
+		input_attr[index].offset   = vertex_input.attributes[index].offset;
 
-		for (int ai = 0; ai < b.attr_num; ai++) {
-			auto index                 = b.attr_indices[ai];
-			input_attr[index].binding  = bi;
-			input_attr[index].location = index;
-			input_attr[index].offset   = b.attr_offsets[ai];
+		uint32_t   attr_size     = 4;
+		const auto registers_num = vs_input_info.resources_dst[index].registers_num;
+		const auto compiled_components =
+		    vs_input_info.stage.program->info.vertex_fetch_components[index];
+		const auto used_components =
+		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
+		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
+		               static_cast<uint32_t>(used_components));
 
-			uint32_t attr_size       = 4;
-			auto     registers_num   = vs_input_info.resources_dst[index].registers_num;
-			const auto compiled_components =
-			    vs_input_info.stage.program->info.vertex_fetch_components[index];
-			auto used_components =
-			    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
-			GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
-			               static_cast<uint32_t>(used_components));
-
-			if (graphics_debug_dump_enabled()) {
-				static std::atomic_uint log_count = 0;
-				const auto              log_id = log_count.fetch_add(1, std::memory_order_relaxed);
-				if (log_id < 128) {
-					LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
-					     "src_fmt=%u dst=v%u regs=%u"
-					     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
-					     log_id, index, input_attr[index].binding, input_attr[index].offset,
-					     input_desc[bi].stride, static_cast<int>(input_attr[index].format),
-					     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
-					     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
-					     static_cast<uint32_t>(registers_num),
-					     static_cast<uint32_t>(used_components), attr_size,
-					     static_cast<uint32_t>(vs_input_info.resources[index].DstSelX()),
-					     static_cast<uint32_t>(vs_input_info.resources[index].DstSelY()),
-					     static_cast<uint32_t>(vs_input_info.resources[index].DstSelZ()),
-					     static_cast<uint32_t>(vs_input_info.resources[index].DstSelW()));
-				}
+		if (graphics_debug_dump_enabled()) {
+			static std::atomic_uint log_count = 0;
+			const auto              log_id    = log_count.fetch_add(1, std::memory_order_relaxed);
+			if (log_id < 128) {
+				LOGF("VertexInputState[%u]: attr=%u binding=%u offset=%u stride=%u fmt=%d "
+				     "src_fmt=%u dst=v%u regs=%u"
+				     " fetched_components=%u attr_size=%u swizzle=%u,%u,%u,%u\n",
+				     log_id, index, input_attr[index].binding, input_attr[index].offset,
+				     input_desc[input_attr[index].binding].stride,
+				     static_cast<int>(input_attr[index].format),
+				     static_cast<uint32_t>(vs_input_info.resources[index].Format()),
+				     static_cast<uint32_t>(vs_input_info.resources_dst[index].register_start),
+				     static_cast<uint32_t>(registers_num), static_cast<uint32_t>(used_components),
+				     attr_size, static_cast<uint32_t>(vs_input_info.resources[index].DstSelX()),
+				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelY()),
+				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelZ()),
+				     static_cast<uint32_t>(vs_input_info.resources[index].DstSelW()));
 			}
+		}
 
-			if (vs_input_info.resources[index].OutOfBounds() != 0) {
-				static bool logged = false;
-				if (!logged) {
-					LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8
-					     "\n",
-					     vs_input_info.resources[index].OutOfBounds());
-					logged = true;
-				}
+		if (vs_input_info.resources[index].OutOfBounds() != 0) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8 "\n",
+				     vs_input_info.resources[index].OutOfBounds());
+				logged = true;
 			}
+		}
 
-			EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
-			EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
+		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].AddTid());
+		EXIT_NOT_IMPLEMENTED(vs_input_info.resources[index].SwizzleEnabled());
 
-			auto log_unsupported_vertex_swizzle = [index, attr_size, registers_num](
-			                                          uint32_t swizzle, uint32_t expected) {
-				static bool logged = false;
-				if (!logged) {
-					LOGF(
-					    "VertexInput: temporary: accepting unsupported dst swizzle at attr %" PRIu32
-					    " (attr_size=%" PRIu32 ", regs=%" PRIu32 ", swizzle=0x%03" PRIx32
-					    ", expected=0x%03" PRIx32 ")\n",
-					    static_cast<uint32_t>(index), attr_size, registers_num, swizzle, expected);
-					logged = true;
-				}
-			};
-
-			switch (registers_num) {
-				case 1: {
-					auto swizzle = vs_input_info.resources[index].DstSelX();
-					if (swizzle != DstSel(4)) {
-						log_unsupported_vertex_swizzle(swizzle, DstSel(4));
-					}
-					break;
-				}
-				case 2: {
-					auto swizzle  = vs_input_info.resources[index].DstSelXY();
-					auto expected = (attr_size == 1 ? DstSel(4, 0) : DstSel(4, 5));
-					if (swizzle != expected) {
-						log_unsupported_vertex_swizzle(swizzle, expected);
-					}
-					break;
-				}
-				case 3: {
-					auto swizzle  = vs_input_info.resources[index].DstSelXYZ();
-					auto expected = DstSel(4, 5, 6);
-					switch (attr_size) {
-						case 1: expected = DstSel(4, 0, 0); break;
-						case 2: expected = DstSel(4, 5, 0); break;
-						default: break;
-					}
-					if (swizzle != expected) {
-						log_unsupported_vertex_swizzle(swizzle, expected);
-					}
-					break;
-				}
-				case 4: {
-					auto swizzle   = vs_input_info.resources[index].DstSelXYZW();
-					auto expected  = DstSel(4, 5, 6, 7);
-					bool supported = false;
-					switch (attr_size) {
-						case 1:
-							expected  = DstSel(4, 0, 0, 1);
-							supported = (swizzle == expected);
-							break;
-						case 2:
-							expected  = DstSel(4, 5, 0, 1);
-							supported = (swizzle == expected);
-							break;
-						case 3:
-							expected  = DstSel(4, 5, 6, 1);
-							supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 0));
-							break;
-						default:
-							supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 1) ||
-							             swizzle == DstSel(4, 5, 6, 0));
-							break;
-					}
-					if (!supported) {
-						log_unsupported_vertex_swizzle(swizzle, expected);
-					}
-					break;
-				}
-				default: EXIT("invalid registers_num");
+		auto log_unsupported_vertex_swizzle = [index, attr_size, registers_num](uint32_t swizzle,
+		                                                                        uint32_t expected) {
+			static bool logged = false;
+			if (!logged) {
+				LOGF("VertexInput: temporary: accepting unsupported dst swizzle at attr %" PRIu32
+				     " (attr_size=%" PRIu32 ", regs=%" PRIu32 ", swizzle=0x%03" PRIx32
+				     ", expected=0x%03" PRIx32 ")\n",
+				     static_cast<uint32_t>(index), attr_size, registers_num, swizzle, expected);
+				logged = true;
 			}
+		};
+
+		switch (registers_num) {
+			case 1: {
+				auto swizzle = vs_input_info.resources[index].DstSelX();
+				if (swizzle != DstSel(4)) {
+					log_unsupported_vertex_swizzle(swizzle, DstSel(4));
+				}
+				break;
+			}
+			case 2: {
+				auto swizzle  = vs_input_info.resources[index].DstSelXY();
+				auto expected = (attr_size == 1 ? DstSel(4, 0) : DstSel(4, 5));
+				if (swizzle != expected) {
+					log_unsupported_vertex_swizzle(swizzle, expected);
+				}
+				break;
+			}
+			case 3: {
+				auto swizzle  = vs_input_info.resources[index].DstSelXYZ();
+				auto expected = DstSel(4, 5, 6);
+				switch (attr_size) {
+					case 1: expected = DstSel(4, 0, 0); break;
+					case 2: expected = DstSel(4, 5, 0); break;
+					default: break;
+				}
+				if (swizzle != expected) {
+					log_unsupported_vertex_swizzle(swizzle, expected);
+				}
+				break;
+			}
+			case 4: {
+				auto swizzle   = vs_input_info.resources[index].DstSelXYZW();
+				auto expected  = DstSel(4, 5, 6, 7);
+				bool supported = false;
+				switch (attr_size) {
+					case 1:
+						expected  = DstSel(4, 0, 0, 1);
+						supported = (swizzle == expected);
+						break;
+					case 2:
+						expected  = DstSel(4, 5, 0, 1);
+						supported = (swizzle == expected);
+						break;
+					case 3:
+						expected  = DstSel(4, 5, 6, 1);
+						supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 0));
+						break;
+					default:
+						supported = (swizzle == expected || swizzle == DstSel(4, 5, 6, 1) ||
+						             swizzle == DstSel(4, 5, 6, 0));
+						break;
+				}
+				if (!supported) {
+					log_unsupported_vertex_swizzle(swizzle, expected);
+				}
+				break;
+			}
+			default: EXIT("invalid registers_num");
 		}
 	}
 
@@ -641,9 +637,9 @@ void CreatePipelineInternal(
 	vertex_input_info.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
 	vertex_input_info.pNext = nullptr;
 	vertex_input_info.flags = {};
-	vertex_input_info.vertexBindingDescriptionCount   = vs_input_info.buffers_num;
+	vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
 	vertex_input_info.pVertexBindingDescriptions      = input_desc;
-	vertex_input_info.vertexAttributeDescriptionCount = vs_input_info.resources_num;
+	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
 	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
@@ -653,20 +649,6 @@ void CreatePipelineInternal(
 	input_assembly.topology = static_params.topology;
 	input_assembly.primitiveRestartEnable =
 	    static_params.primitive_restart_enable ? VK_TRUE : VK_FALSE;
-
-	vk::Viewport viewport {};
-	viewport.x        = static_params.viewport_offset[0] - static_params.viewport_scale[0];
-	viewport.y        = static_params.viewport_offset[1] - static_params.viewport_scale[1];
-	viewport.width    = static_params.viewport_scale[0] * 2.0f;
-	viewport.height   = static_params.viewport_scale[1] * 2.0f;
-	viewport.minDepth = static_params.viewport_offset[2];
-	viewport.maxDepth = static_params.viewport_scale[2] + static_params.viewport_offset[2];
-
-	vk::Rect2D scissor {};
-	scissor.offset = {static_params.scissor_ltrb[0], static_params.scissor_ltrb[1]};
-	scissor.extent = {
-	    static_cast<uint32_t>(static_params.scissor_ltrb[2] - static_params.scissor_ltrb[0]),
-	    static_cast<uint32_t>(static_params.scissor_ltrb[3] - static_params.scissor_ltrb[1])};
 
 	vk::PipelineViewportDepthClipControlCreateInfoEXT depth_clip_control {};
 	depth_clip_control.sType = vk::StructureType::ePipelineViewportDepthClipControlCreateInfoEXT;
@@ -678,9 +660,9 @@ void CreatePipelineInternal(
 	viewport_state.pNext         = &depth_clip_control;
 	viewport_state.flags         = {};
 	viewport_state.viewportCount = 1;
-	viewport_state.pViewports    = &viewport;
+	viewport_state.pViewports    = nullptr;
 	viewport_state.scissorCount  = 1;
-	viewport_state.pScissors     = &scissor;
+	viewport_state.pScissors     = nullptr;
 
 	vk::CullModeFlags cull_mode = vk::CullModeFlagBits::eNone;
 	if (static_params.cull_back) {
@@ -792,15 +774,11 @@ void CreatePipelineInternal(
 #else
 	color_blending.pNext = &color_write;
 #endif
-	color_blending.flags             = {};
-	color_blending.logicOpEnable     = VK_FALSE;
-	color_blending.logicOp           = vk::LogicOp::eCopy;
-	color_blending.attachmentCount   = static_params.color_count;
-	color_blending.pAttachments      = color_blend_attachment;
-	color_blending.blendConstants[0] = static_params.blend_color_red;
-	color_blending.blendConstants[1] = static_params.blend_color_green;
-	color_blending.blendConstants[2] = static_params.blend_color_blue;
-	color_blending.blendConstants[3] = static_params.blend_color_alpha;
+	color_blending.flags           = {};
+	color_blending.logicOpEnable   = VK_FALSE;
+	color_blending.logicOp         = vk::LogicOp::eCopy;
+	color_blending.attachmentCount = static_params.color_count;
+	color_blending.pAttachments    = color_blend_attachment;
 
 	EXIT_IF(!vs_input_info.stage);
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
@@ -814,8 +792,8 @@ void CreatePipelineInternal(
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	constexpr auto GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
-	const vk::PushConstantRange push_constants {
-	    GraphicsStages, 0, ShaderRecompiler::IR::NativePushConstantSize};
+	const vk::PushConstantRange push_constants {GraphicsStages, 0,
+	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	pipeline_layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
@@ -847,9 +825,6 @@ void CreatePipelineInternal(
 	depth_stencil_info.sType            = vk::StructureType::ePipelineDepthStencilStateCreateInfo;
 	depth_stencil_info.pNext            = nullptr;
 	depth_stencil_info.flags            = {};
-	depth_stencil_info.depthTestEnable  = (static_params.depth_test_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.depthWriteEnable = (static_params.depth_write_enable ? VK_TRUE : VK_FALSE);
-	depth_stencil_info.depthCompareOp   = static_params.depth_compare_op;
 	depth_stencil_info.depthBoundsTestEnable =
 #if defined(__APPLE__)
 	    VK_FALSE; // MoltenVK lacks the depthBounds feature; depth-bounds testing is disabled
@@ -872,11 +847,15 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eViewport,
 	    vk::DynamicState::eScissor,
 	    vk::DynamicState::eLineWidth,
+	    vk::DynamicState::eDepthTestEnable,
+	    vk::DynamicState::eDepthWriteEnable,
+	    vk::DynamicState::eDepthCompareOp,
 	    vk::DynamicState::eDepthBiasEnable,
 	    vk::DynamicState::eDepthBias,
 	    vk::DynamicState::eStencilCompareMask,
 	    vk::DynamicState::eStencilReference,
 	    vk::DynamicState::eStencilWriteMask,
+	    vk::DynamicState::eBlendConstants,
 #if !defined(__APPLE__)
 	    // Keep last so depth-only pipelines can omit this dynamic state.
 	    vk::DynamicState::eColorWriteEnableEXT, // unsupported by MoltenVK; static mask instead
@@ -932,14 +911,11 @@ void CreatePipelineInternal(
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
-		     " depth=%s blend=%s dyn_states=%" PRIu32 " viewport=%f,%f %fx%f"
-		     " scissor=%d,%d %ux%u\n",
+		     " depth=%s blend=%s dyn_states=%" PRIu32 "\n",
 		     pipeline.vs_shader_id, pipeline.ps_shader_id,
-		     static_cast<uint32_t>(static_params.topology),
-		     static_params.color_mask[0], (static_params.with_depth ? "true" : "false"),
-		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count, viewport.x,
-		     viewport.y, viewport.width, viewport.height, scissor.offset.x, scissor.offset.y,
-		     scissor.extent.width, scissor.extent.height);
+		     static_cast<uint32_t>(static_params.topology), static_params.color_mask[0],
+		     (static_params.with_depth ? "true" : "false"),
+		     (static_params.blend_enable[0] ? "true" : "false"), dynamic_states_count);
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);

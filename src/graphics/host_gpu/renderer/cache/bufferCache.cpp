@@ -259,51 +259,36 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
-	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
-	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
 		return;
 	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+	// Widen nearby CPU reads so they share one GPU drain.
+	constexpr uint64_t WindowSize   = 512 * 1024;
+	const auto         buffer_begin = buffer.CpuAddress();
+	const auto         buffer_end   = buffer_begin + buffer.Size();
+	const auto         window_begin = std::max(vaddr & ~(WindowSize - 1), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+
 	std::vector<DownloadCopy> copies;
 	m_memory_tracker.ForEachDownloadRange<false>(
-	    vaddr, size,
+	    window_begin, window_end - window_begin,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "memory invalidation");
 	    },
-		[&](uint64_t address, uint64_t bytes) noexcept {
+	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
-			    for (uint64_t copied = 0; copied < range.size;) {
-				    const auto copy_address = range.address + copied;
-				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
-				    if (owner == nullptr || !*owner) {
-					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
-				    }
-				    auto& buffer = m_slot_buffers[*owner];
-				    if (!buffer.IsInBounds(copy_address, 1)) {
-					    EXIT("BufferCache: invalidation readback is outside its buffer owner\n");
-				    }
-				    const auto copy_size = std::min(
-				        range.size - copied, buffer.CpuAddress() + buffer.Size() - copy_address);
-				    copies.push_back(
-				        {&buffer, buffer.Offset(copy_address), copy_address, copy_size});
-				    copied += copy_size;
-			    }
+			    copies.push_back(
+			        {&buffer, buffer.Offset(range.address), range.address, range.size});
 		    }
 	    });
-	if (copies.empty()) {
-		if (!is_write) {
-			return;
-		}
-		// A preceding read fault can consume the last GPU-owned copy after this write invalidation
-		// has already chosen to flush. Complete the CPU ownership handoff even though this callback
-		// no longer has bytes to download.
-		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-		return;
+	if (!copies.empty()) {
+		DownloadBufferMemory(copies);
+		// The enumeration covered whole dirty pages and every exact interval on them.
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 	}
-	DownloadBufferMemory(copies);
-	// The enumeration above covered whole dirty pages and every exact interval on them.
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
@@ -326,38 +311,81 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	return CreateBuffer(vaddr, size);
 }
 
-BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	auto& command = m_scheduler.Current();
-	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	auto       first = m_buffers.lower_bound(begin);
-	if (first != m_buffers.begin()) {
-		const auto previous = std::prev(first);
-		if (const auto& buffer = m_slot_buffers[previous->second];
-		    buffer.CpuAddress() + buffer.Size() > begin) {
-			first = previous;
+BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t size) {
+	static constexpr int      StreamLeapThreshold = 16;
+	static constexpr uint64_t StreamLeapSize      = CACHING_PAGESIZE * 128;
+
+	auto       begin      = vaddr;
+	auto       end        = vaddr + size;
+	const auto find_first = [&](uint64_t address) {
+		auto first = m_buffers.lower_bound(address);
+		if (first != m_buffers.begin()) {
+			const auto  previous = std::prev(first);
+			const auto& buffer   = m_slot_buffers[previous->second];
+			if (buffer.CpuAddress() + buffer.Size() > address) {
+				first = previous;
+			}
+		}
+		return first;
+	};
+	auto first           = find_first(begin);
+	auto last            = first;
+	int  stream_score    = 0;
+	bool has_stream_leap = false;
+	for (; last != m_buffers.end() && last->first < end; ++last) {
+		const auto& buffer        = m_slot_buffers[last->second];
+		const auto  buffer_begin  = buffer.CpuAddress();
+		const auto  buffer_end    = buffer_begin + buffer.Size();
+		const bool  expands_left  = buffer_begin < begin;
+		const bool  expands_right = buffer_end > end;
+		begin                     = std::min(begin, buffer_begin);
+		end                       = std::max(end, buffer_end);
+		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
+			has_stream_leap = true;
+			if (expands_right) {
+				end += std::min(StreamLeapSize, PageTable::kAddressSpaceSize - end);
+			}
+			if (expands_left) {
+				const auto minimum = CACHING_PAGESIZE * 2;
+				if (begin > minimum) {
+					begin -= std::min(StreamLeapSize, begin - minimum);
+				}
+				first = find_first(begin);
+				begin = std::min(begin, first->first);
+			}
 		}
 	}
-	auto last = first;
-	for (; last != m_buffers.end() && last->first < end; ++last) {
-		const auto& buffer = m_slot_buffers[last->second];
-		begin              = std::min(begin, buffer.CpuAddress());
-		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
+	return {first, last, begin, end, has_stream_leap};
+}
+
+void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
+	auto& new_buffer = m_slot_buffers[new_id];
+	auto& overlap    = m_slot_buffers[overlap_id];
+	if (accumulate_stream_score) {
+		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
 	}
+	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
+	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	DeleteBuffer(overlap_id);
+}
+
+BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(m_scheduler.Current().IsInvalid());
+	const auto end = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	vaddr &= ~(CACHING_PAGESIZE - 1);
+	size               = end - vaddr;
+	const auto overlap = ResolveOverlaps(vaddr, size);
 
 	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
-	auto&      buffer = m_slot_buffers[id];
+	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
-	for (auto overlap = first; overlap != last;) {
-		const auto current = overlap++;
-		const auto old_id  = current->second;
-		const auto& old    = m_slot_buffers[old_id];
-		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
-		DeleteBuffer(old_id);
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
+	                     overlap.end - overlap.begin);
+	for (auto it = overlap.first; it != overlap.last;) {
+		const auto old_id = (it++)->second;
+		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
 	return id;

@@ -103,20 +103,21 @@ uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 	           : Unary(ctx.state, OpBitcast, TypeF32(ctx.state), value);
 }
 
-ImageSampleLayout Layout(const IR::MemoryInfo& mem, ImageViewKind view) {
+ImageSampleLayout Layout(const IR::MemoryInfo& mem, ImageDimension dimension) {
 	ImageSampleLayout layout;
 	uint32_t          cursor = 0;
+	const auto&       info   = ImageDimensionInfoFor(dimension);
 	if (HasFlag(mem, Decoder::ImageSampleFlagOffset)) layout.offset = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagBias)) layout.bias = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagCompare)) layout.dref = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 		layout.grad_x = cursor;
-		cursor += ImageViewSpatialComponents(view);
+		cursor += info.spatial_components;
 		layout.grad_y = cursor;
-		cursor += ImageViewSpatialComponents(view);
+		cursor += info.spatial_components;
 	}
 	layout.coord = cursor;
-	cursor += ImageViewCoordinateComponents(view);
+	cursor += info.coordinate_components;
 	if (HasFlag(mem, Decoder::ImageSampleFlagLod)) layout.lod = cursor++;
 	return layout;
 }
@@ -144,11 +145,12 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                   uint32_t first, uint32_t components) {
+	const bool cube = ctx.state.program.info.images.at(mem.resource).cube;
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
 	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
 	                                                   : ZeroF32(ctx.state);
-	if (mem.image_cube) {
+	if (cube) {
 		x = CubeAxis(ctx.state, x);
 		y = CubeAxis(ctx.state, y);
 	}
@@ -157,7 +159,7 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 		auto z = mem.image_address_components > first + 2u
 		             ? AddressF32(ctx, mem, address, first + 2u)
 		             : ZeroF32(ctx.state);
-		if (mem.image_cube) z = CubeLayer(ctx.state, z);
+		if (cube) z = CubeLayer(ctx.state, z);
 		ctx.state.builder.AddFunction(
 		    {OpCompositeConstruct, TypeF32Vector(ctx.state, 3), result, x, y, z});
 	} else {
@@ -168,8 +170,8 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 }
 
 uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  ImageViewKind view) {
-	const auto components = ImageViewCoordinateComponents(view);
+                  ImageDimension dimension) {
+	const auto components = ImageDimensionInfoFor(dimension).coordinate_components;
 	const auto x          = AddressU32(ctx, mem, address, 0);
 	if (components == 1u) return x;
 	const auto y      = mem.image_address_components > 1u ? AddressU32(ctx, mem, address, 1)
@@ -188,8 +190,8 @@ uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 }
 
 uint32_t LodU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                ImageViewKind view) {
-	const auto component = ImageViewCoordinateComponents(view);
+                ImageDimension dimension) {
+	const auto component = ImageDimensionInfoFor(dimension).coordinate_components;
 	return mem.image_has_mip && mem.image_address_components > component
 	           ? AddressU32(ctx, mem, address, component)
 	           : ConstantU32(ctx.state, 0);
@@ -199,8 +201,33 @@ uint32_t FloatBits(ValueEmitContext& ctx, uint32_t value) {
 	return Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
 }
 
-uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool dref,
+uint32_t SampledComponentBits(ValueEmitContext& ctx, uint32_t value,
+                              Prospero::TextureNumericClass numeric_class) {
+	if (numeric_class == Prospero::TextureNumericClass::Uint) {
+		return value;
+	}
+	return Unary(ctx.state, OpBitcast, TypeU32(ctx.state), value);
+}
+
+uint32_t SampledComponentZero(EmitterState& state, Prospero::TextureNumericClass numeric_class) {
+	switch (numeric_class) {
+		case Prospero::TextureNumericClass::Float: return ZeroF32(state);
+		case Prospero::TextureNumericClass::Uint: return ConstantU32(state, 0);
+		case Prospero::TextureNumericClass::Sint: return ConstantI32(state, 0);
+		case Prospero::TextureNumericClass::Unsupported: break;
+	}
+	EXIT("invalid sampled image numeric class");
+}
+
+uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
+                      Prospero::TextureNumericClass numeric_class, bool dref,
                       const IR::MemoryInfo& mem, bool gather = false) {
+	auto value_class = numeric_class;
+	if (dref) {
+		value_class = Prospero::TextureNumericClass::Float;
+	}
+	const bool integer = value_class == Prospero::TextureNumericClass::Uint ||
+	                     value_class == Prospero::TextureNumericClass::Sint;
 	if (mem.data_bits == 16u) {
 		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
@@ -209,25 +236,27 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 			const auto component = gather ? index : DmaskComponent(mem.dmask, index);
 			const auto result    = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction({OpCompositeExtract,
-			                               integer ? TypeU32(ctx.state) : TypeF32(ctx.state),
-			                               result, value, component});
+			                               ImageScalarType(ctx.state, value_class), result, value,
+			                               component});
 			return result;
 		};
 		for (uint32_t word = 0; word < mem.data_dwords; word++) {
 			const auto low_index  = word * 2u;
 			const auto high_index = low_index + 1u;
 			const auto low        = scalar(low_index);
-			const auto high = high_index < mem.component_count
-			                      ? scalar(high_index)
-			                      : (integer ? ConstantU32(ctx.state, 0) : ZeroF32(ctx.state));
+			const auto high       = high_index < mem.component_count
+			                            ? scalar(high_index)
+			                            : SampledComponentZero(ctx.state, value_class);
 			if (integer) {
-				const auto mask = ConstantU32(ctx.state, 0xffffu);
-				packed[word] =
-				    Binary(ctx.state, OpBitwiseOr, TypeU32(ctx.state),
-				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low, mask),
-				           Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
-				                  Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high, mask),
-				                  ConstantU32(ctx.state, 16u)));
+				const auto low_bits  = SampledComponentBits(ctx, low, value_class);
+				const auto high_bits = SampledComponentBits(ctx, high, value_class);
+				const auto mask      = ConstantU32(ctx.state, 0xffffu);
+				packed[word]         = Binary(
+				    ctx.state, OpBitwiseOr, TypeU32(ctx.state),
+				    Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), low_bits, mask),
+				    Binary(ctx.state, OpShiftLeftLogical, TypeU32(ctx.state),
+				           Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state), high_bits, mask),
+				           ConstantU32(ctx.state, 16u)));
 			} else {
 				const auto pair = ctx.state.builder.AllocateId();
 				ctx.state.builder.AddFunction(
@@ -249,10 +278,9 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 			continue;
 		}
 		const auto scalar = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction({OpCompositeExtract,
-		                               integer ? TypeU32(ctx.state) : TypeF32(ctx.state), scalar,
-		                               value, index});
-		component[index] = integer ? scalar : FloatBits(ctx, scalar);
+		ctx.state.builder.AddFunction(
+		    {OpCompositeExtract, ImageScalarType(ctx.state, value_class), scalar, value, index});
+		component[index] = SampledComponentBits(ctx, scalar, value_class);
 	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction({OpCompositeConstruct, TypeU32Vector(ctx.state, 4), result,
@@ -260,20 +288,20 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value, bool integer, bool 
 	return result;
 }
 
-uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                          const IR::Inst& address) {
-	const auto pc    = inst.Flags<IR::MemoryFlags>().pc;
-	const auto view  = SampledImageViewKind(ctx.state, mem, pc);
-	const auto image = LoadSampledImageDescriptor(ctx.state, mem, pc, view);
-	const auto size  = ctx.state.builder.AllocateId();
-	if (ImageSpirvMultisampled(view) != 0u) {
+	const auto  dimension = ctx.state.program.info.images.at(mem.resource).dimension;
+	const auto& info      = ImageDimensionInfoFor(dimension);
+	const auto  image     = LoadSampledImageDescriptor(ctx.state, mem.resource);
+	const auto  size      = ctx.state.builder.AllocateId();
+	if (info.multisampled != 0u) {
 		ctx.state.builder.AddFunction(
-		    {OpImageQuerySize, ImageViewSizeType(ctx.state, view), size, image});
+		    {OpImageQuerySize, ImageViewSizeType(ctx.state, dimension), size, image});
 	} else {
-		ctx.state.builder.AddFunction({OpImageQuerySizeLod, ImageViewSizeType(ctx.state, view),
+		ctx.state.builder.AddFunction({OpImageQuerySizeLod, ImageViewSizeType(ctx.state, dimension),
 		                               size, image, AddressU32(ctx, mem, address, 0)});
 	}
-	const auto components = ImageViewCoordinateComponents(view);
+	const auto components = info.coordinate_components;
 	uint32_t   result[4]  = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 	                         ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
 	if (components == 1u) {
@@ -285,7 +313,7 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::Inst& inst, const IR::
 			    {OpCompositeExtract, TypeU32(ctx.state), result[index], size, index});
 		}
 	}
-	if (ImageSpirvMultisampled(view) == 0u) {
+	if (info.multisampled == 0u) {
 		result[3] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction({OpImageQueryLevels, TypeU32(ctx.state), result[3], image});
 	}
@@ -296,8 +324,8 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::Inst& inst, const IR::
 }
 
 uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                      const ImageSampleLayout& layout, ImageViewKind view) {
-	const auto components = ImageViewSpatialComponents(view);
+                      const ImageSampleLayout& layout, ImageDimension dimension) {
+	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto zero       = ConstantI32(ctx.state, 0);
 	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
 		if (components == 1u) return zero;
@@ -332,8 +360,8 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	return result;
 }
 
-uint32_t HorizontalOffsets(EmitterState& state, ImageViewKind view) {
-	const auto components   = ImageViewSpatialComponents(view);
+uint32_t HorizontalOffsets(EmitterState& state, ImageDimension dimension) {
+	const auto components   = ImageDimensionInfoFor(dimension).spatial_components;
 	const auto count        = ConstantU32(state, 4);
 	const auto element_type = components == 1u ? TypeI32(state) : TypeI32Vector(state, 2);
 	const auto array_type   = state.builder.Type(OpTypeArray, {element_type, count});
@@ -363,8 +391,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
 	const auto format = state.program.info.images[mem.resource].conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
 	const auto info = Format::GetFormatInfo(format);
-	EXIT_IF(!Prospero::IsSampledTextureFormat(format) ||
-	        !Prospero::IsUintTextureFormat(format) ||
+	EXIT_IF(Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
 	        Prospero::RemapTextureFormat(format) == format ||
 	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
 	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
@@ -439,46 +466,46 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	return result;
 }
 
-uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t pc,
-	                                 uint32_t coord, bool integer) {
+uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                                    uint32_t coord, Prospero::TextureNumericClass numeric_class) {
 	auto& state = ctx.state;
 	state.builder.RequireCapability(CapabilityImageQuery);
-	const auto image = LoadSampledImageDescriptor(state, mem, pc, ImageViewKind::Dim1D);
+	const auto image = LoadSampledImageDescriptor(state, mem.resource);
 	const auto width = state.builder.AllocateId();
 	state.builder.AddFunction(
 	    {OpImageQuerySizeLod, TypeU32(state), width, image, ConstantU32(state, 0)});
 	const auto width_f32 = state.builder.AllocateId();
 	state.builder.AddFunction({OpConvertUToF, TypeF32(state), width_f32, width});
 	const auto left = state.builder.AllocateId();
-	state.builder.AddFunction(
-	    {OpExtInst, TypeF32(state), left, GlslStd450(state), GlslFloor,
-	     Binary(state, OpFSub, TypeF32(state),
-	            Binary(state, OpFMul, TypeF32(state), coord, width_f32),
-	            ConstantF32(state, 0x3f000000u))});
+	state.builder.AddFunction({OpExtInst, TypeF32(state), left, GlslStd450(state), GlslFloor,
+	                           Binary(state, OpFSub, TypeF32(state),
+	                                  Binary(state, OpFMul, TypeF32(state), coord, width_f32),
+	                                  ConstantF32(state, 0x3f000000u))});
 
-	const auto sampled = MakeSampledImage(state, mem, pc, ImageViewKind::Dim1D);
-	const auto vector_type = integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-	const auto scalar_type = integer ? TypeU32(state) : TypeF32(state);
-	const auto component = ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
-	                           ? ImageGatherComponent(mem.dmask)
-	                           : 0u;
+	const auto sampled     = MakeSampledImage(state, mem.resource, mem.sampler);
+	const auto vector_type = ImageVectorType(state, numeric_class, 4);
+	const auto scalar_type = ImageScalarType(state, numeric_class);
+	const auto component =
+	    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid
+	        ? ImageGatherComponent(mem.dmask)
+	        : 0u;
 	uint32_t values[2] {};
 	for (uint32_t index = 0; index < 2u; index++) {
-		const auto sample_coord = Binary(
-		    state, OpFDiv, TypeF32(state),
-		    Binary(state, OpFAdd, TypeF32(state), left,
-		           ConstantF32(state, index == 0u ? 0x3f000000u : 0x3fc00000u)),
-		    width_f32);
+		const auto sample_coord =
+		    Binary(state, OpFDiv, TypeF32(state),
+		           Binary(state, OpFAdd, TypeF32(state), left,
+		                  ConstantF32(state, index == 0u ? 0x3f000000u : 0x3fc00000u)),
+		           width_f32);
 		const auto texel = state.builder.AllocateId();
-		state.builder.AddFunction({OpImageSampleExplicitLod, vector_type, texel, sampled, sample_coord,
-		                           ImageOperandsLodMask, ZeroF32(state)});
+		state.builder.AddFunction({OpImageSampleExplicitLod, vector_type, texel, sampled,
+		                           sample_coord, ImageOperandsLodMask, ZeroF32(state)});
 		values[index] = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpCompositeExtract, scalar_type, values[index], texel, component});
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction({OpCompositeConstruct, vector_type, result, values[0], values[1],
-	                           values[1], values[0]});
+	state.builder.AddFunction(
+	    {OpCompositeConstruct, vector_type, result, values[0], values[1], values[1], values[0]});
 	return result;
 }
 
@@ -549,6 +576,7 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 
 uint32_t ImageAtomicOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
+		case IR::ValueOpcode::ImageAtomicSwap32: return OpAtomicExchange;
 		case IR::ValueOpcode::ImageAtomicIAdd32: return OpAtomicIAdd;
 		case IR::ValueOpcode::ImageAtomicUMin32: return OpAtomicUMin;
 		case IR::ValueOpcode::ImageAtomicUMax32: return OpAtomicUMax;
@@ -569,24 +597,24 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	auto&       state     = ctx.state;
 	const auto& mem       = ctx.Memory(inst);
-	const auto  pc        = inst.Flags<IR::MemoryFlags>().pc;
 	const auto  image_arg = inst.Arg(0);
 	ctx.ResourceIndex(image_arg, IR::ValueOpcode::GetImageResource);
+	const auto& image   = state.program.info.images.at(mem.resource);
 	const auto* address = ctx.ImageAddress(inst.Arg(image_info.needs_sampler ? 2 : 1));
 	if (address == nullptr) return true;
 	if (op == IR::ValueOpcode::ImageQueryDimensions) {
 		state.builder.RequireCapability(CapabilityImageQuery);
-		ctx.Define(inst, QueryDimensions(ctx, inst, mem, *address));
+		ctx.Define(inst, QueryDimensions(ctx, mem, *address));
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageQueryLod) {
 		state.builder.RequireCapability(CapabilityImageQuery);
-		const auto view    = SampledImageViewKind(state, mem, pc);
-		const auto sampled = MakeSampledImage(state, mem, pc, view);
-		const auto lod     = state.builder.AllocateId();
+		const auto dimension = image.dimension;
+		const auto sampled   = MakeSampledImage(state, mem.resource, mem.sampler);
+		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
-		     CoordF32(ctx, mem, *address, 0, ImageViewSpatialComponents(view))});
+		     CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components)});
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -601,143 +629,153 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto view      = SampledImageViewKind(state, mem, pc);
-		const bool integer   = mem.kind == IR::ResourceKind::ImageUint;
-		const auto condition = ctx.Arg(inst, 2);
+		const auto  dimension      = image.dimension;
+		const auto& dimension_info = ImageDimensionInfoFor(dimension);
+		const auto  numeric_class  = image.numeric_class;
+		const auto  condition      = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
-			        const auto image = LoadSampledImageDescriptor(state, mem, pc, view);
-			        const auto color = state.builder.AllocateId();
-			        const auto coord = CoordU32(ctx, mem, *address, view);
-			        if (ImageSpirvMultisampled(view) != 0u) {
+			        const auto descriptor = LoadSampledImageDescriptor(state, mem.resource);
+			        const auto color      = state.builder.AllocateId();
+			        const auto coord      = CoordU32(ctx, mem, *address, dimension);
+			        if (dimension_info.multisampled != 0u) {
 				        state.builder.AddFunction(
-				            {OpImageFetch,
-				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
-				             image, coord, ImageOperandsSampleMask,
-				             AddressU32(ctx, mem, *address, ImageViewCoordinateComponents(view))});
+				            {OpImageFetch, ImageVectorType(state, numeric_class, 4), color,
+				             descriptor, coord, ImageOperandsSampleMask,
+				             AddressU32(ctx, mem, *address, dimension_info.coordinate_components)});
 			        } else {
-				        state.builder.AddFunction(
-				            {OpImageFetch,
-				             integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4), color,
-				             image, coord, ImageOperandsLodMask, LodU32(ctx, mem, *address, view)});
+				        state.builder.AddFunction({OpImageFetch,
+				                                   ImageVectorType(state, numeric_class, 4), color,
+				                                   descriptor, coord, ImageOperandsLodMask,
+				                                   LodU32(ctx, mem, *address, dimension)});
 			        }
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), integer, false,
-			                            mem);
+			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
+			                            false, mem);
 		        }));
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageWrite) {
-		const auto uint_image = mem.kind == IR::ResourceKind::StorageImageUint;
-		const auto view       = StorageImageViewKind(mem);
+		const bool uint_image = image.numeric_class == Prospero::TextureNumericClass::Uint;
+		const auto dimension  = image.dimension;
 		EmitIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			const auto mip_lod =
 			    state.program.info.images[mem.resource].mip_mode == IR::ImageMipMode::DynamicStorage
-			        ? LodU32(ctx, mem, *address, view)
+			        ? LodU32(ctx, mem, *address, dimension)
 			        : 0u;
-			const auto coord = CoordU32(ctx, mem, *address, view);
+			const auto coord = CoordU32(ctx, mem, *address, dimension);
 			const auto texel = StoreTexel(ctx, mem, ctx.Arg(inst, 2), uint_image);
-			EmitStorageImageWrite(state, mem.resource, view, mip_lod, coord, texel);
+			EmitStorageImageWrite(state, mem.resource, mip_lod, coord, texel);
 		});
 		return true;
 	}
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
-		const auto view    = SampledImageViewKind(state, mem, pc);
-		const auto layout  = Layout(mem, view);
-		const bool integer = mem.kind == IR::ResourceKind::ImageUint;
-		const bool dref    = HasFlag(mem, Decoder::ImageSampleFlagCompare);
+		const auto  dimension      = image.dimension;
+		const auto& dimension_info = ImageDimensionInfoFor(dimension);
+		const auto  layout         = Layout(mem, dimension);
+		const auto  numeric_class  = image.numeric_class;
+		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
 			return true;
 		}
 		const auto coord =
-		    CoordF32(ctx, mem, *address, layout.coord, ImageViewCoordinateComponents(view));
+		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			if (view == ImageViewKind::Dim1D) {
+			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return true;
 				}
-				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, pc, coord, integer);
-				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample), integer,
-				                              false, mem, true));
+				const auto sample = EmitOneDimensionalGatherLz(ctx, mem, coord, numeric_class);
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
+				                              numeric_class, false, mem, true));
 				return true;
 			}
-			if (view == ImageViewKind::Dim1DArray) {
+			if (dimension == ImageDimension::Dim1DArray) {
 				ctx.Fail(inst, "has an unsupported 1D-array gather");
 				return true;
 			}
-			const auto            sampled = MakeSampledImage(state, mem, pc, view);
+			const auto            sampled = MakeSampledImage(state, mem.resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words =
-			    dref ? std::vector<uint32_t> {OpImageDrefGather,
-			                                  TypeF32Vector(state, 4),
-			                                  sample,
-			                                  sampled,
-			                                  coord,
-			                                  layout.dref != NoImageComponent
-			                                      ? AddressF32(ctx, mem, *address, layout.dref)
-			                                      : ZeroF32(state)}
-			         : std::vector<uint32_t> {
-			               OpImageGather,
-			               integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4),
-			               sample,
-			               sampled,
-			               coord,
-			               ConstantU32(state, ImageConversionFormat(state, mem).format ==
-			                                          Prospero::BufferFormat::kInvalid
-			                                      ? ImageGatherComponent(mem.dmask)
-			                                      : 0u)};
+			std::vector<uint32_t> words;
+			if (dref) {
+				auto dref_value = ZeroF32(state);
+				if (layout.dref != NoImageComponent) {
+					dref_value = AddressF32(ctx, mem, *address, layout.dref);
+				}
+				words = {OpImageDrefGather, TypeF32Vector(state, 4), sample, sampled, coord,
+				         dref_value};
+			} else {
+				uint32_t component = 0;
+				if (ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
+					component = ImageGatherComponent(mem.dmask);
+				}
+				words = {OpImageGather, ImageVectorType(state, numeric_class, 4),
+				         sample,        sampled,
+				         coord,         ConstantU32(state, component)};
+			}
 			if (HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 				words.push_back(ImageOperandsConstOffsetsMask);
-				words.push_back(HorizontalOffsets(state, view));
+				words.push_back(HorizontalOffsets(state, dimension));
 			} else if (layout.offset != NoImageComponent) {
 				words.push_back(ImageOperandsOffsetMask);
-				words.push_back(PackedOffset(ctx, mem, *address, layout, view));
+				words.push_back(PackedOffset(ctx, mem, *address, layout, dimension));
 			}
 			state.builder.AddFunction(words);
+			auto result_numeric_class = numeric_class;
+			if (dref) {
+				result_numeric_class = Prospero::TextureNumericClass::Float;
+			}
 			ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, sample),
-			                              integer && !dref, false, mem, true));
+			                              result_numeric_class, false, mem, true));
 			return true;
 		}
 		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
 		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 		                          state.stage != ShaderType::Pixel;
-		const auto opcode = explicit_lod
-		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
-		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
-		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
-		const auto dref_value =
-		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
-		                                            : ZeroF32(state))
-		         : 0u;
+		uint32_t opcode = OpImageSampleImplicitLod;
+		if (explicit_lod) {
+			opcode = dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod;
+		} else if (dref) {
+			opcode = OpImageSampleDrefImplicitLod;
+		}
+		uint32_t result_type = ImageVectorType(state, numeric_class, 4);
+		uint32_t dref_value  = 0;
+		if (dref) {
+			result_type = TypeF32(state);
+			dref_value  = ZeroF32(state);
+			if (layout.dref != NoImageComponent) {
+				dref_value = AddressF32(ctx, mem, *address, layout.dref);
+			}
+		}
 		uint32_t              operand_mask = 0;
 		std::vector<uint32_t> operands;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operand_mask |= ImageOperandsGradMask;
 			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, ImageViewSpatialComponents(view)));
+			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
 			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, ImageViewSpatialComponents(view)));
+			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components));
 		} else if (explicit_lod) {
 			operand_mask |= ImageOperandsLodMask;
-			operands.push_back(HasFlag(mem, Decoder::ImageSampleFlagLod) &&
-			                           layout.lod != NoImageComponent
-			                       ? AddressF32(ctx, mem, *address, layout.lod)
-			                       : ZeroF32(state));
+			auto lod = ZeroF32(state);
+			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && layout.lod != NoImageComponent) {
+				lod = AddressF32(ctx, mem, *address, layout.lod);
+			}
+			operands.push_back(lod);
 		} else if (layout.bias != NoImageComponent) {
 			operand_mask |= ImageOperandsBiasMask;
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
+			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
 			if (dref) {
@@ -750,11 +788,13 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(words);
 			return sample;
 		};
-		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
-			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
-			                              integer, dref, mem));
+			auto       result = sample;
+			if (!dref) {
+				result = UnpackImageTexel(ctx, mem, sample);
+			}
+			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 			return true;
 		}
 		const auto* handle = image_arg.ResolveInstruction();
@@ -767,7 +807,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
-		if (state.flattened_srt_variable == 0 || image.indirect_mapping_capacity == 0u ||
+		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return true;
@@ -785,7 +825,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		auto       low      = ConstantU32(state, 0u);
 		auto       high     = LoadMapping(mapping);
 		auto       selected = ConstantU32(state, 0u);
-		for (uint32_t iteration = 0; iteration < std::bit_width(image.indirect_mapping_capacity);
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
 		     iteration++) {
 			const auto active = Binary(state, OpULessThan, TypeBool(state), low, high);
 			const auto mid =
@@ -845,22 +885,24 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
-		                        integer, dref, mem));
+		auto result = phi_words[2];
+		if (!dref) {
+			result = UnpackImageTexel(ctx, mem, result);
+		}
+		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (atomic_opcode != 0u) {
-		const auto view = StorageImageViewKind(mem);
+		const auto dimension = image.dimension;
 		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
 			           const auto pointer = state.builder.AllocateId();
 			           const auto pointer_type =
 			               state.builder.Type(OpTypePointer, {StorageClassImage, TypeU32(state)});
 			           state.builder.AddFunction(
 			               {OpImageTexelPointer, pointer_type, pointer,
-			                StorageImageDescriptorPointer(state, mem.resource, view),
-			                CoordU32(ctx, mem, *address, view), ConstantU32(state, 0)});
+			                StorageImageDescriptorPointer(state, mem.resource),
+			                CoordU32(ctx, mem, *address, dimension), ConstantU32(state, 0)});
 			           const auto old = state.builder.AllocateId();
 			           state.builder.AddFunction({atomic_opcode, TypeU32(state), old, pointer,
 			                                      ConstantU32(state, ScopeDevice),

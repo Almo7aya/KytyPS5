@@ -512,10 +512,6 @@ bool KernelIsDispatchingSignalOnCurrentThread() {
 	return g_dispatching_signal_handler;
 }
 
-static void QueuePendingSignal(Pthread thread, int signum) {
-	PthreadQueuePendingSignal(thread, signum);
-}
-
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 static void WaitForSignalDispatch(Pthread thread, int signum) {
 	constexpr auto DISPATCH_WAIT_STEP = std::chrono::microseconds(1000);
@@ -528,10 +524,6 @@ static void WaitForSignalDispatch(Pthread thread, int signum) {
 	}
 }
 #endif
-
-static bool TakePendingSignal(Pthread thread, int signum) {
-	return PthreadTakePendingSignal(thread, signum);
-}
 
 struct SignalMcontext {
 	uint64_t mc_onstack;
@@ -985,7 +977,7 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 	auto* host_ctx = static_cast<ucontext_t*>(native_context);
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!TakePendingSignal(current, signum)) {
+		if (!PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -1046,7 +1038,7 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
-	if (!TakePendingSignal(thread, signum)) {
+	if (!PthreadTakePendingSignal(thread, signum)) {
 		return;
 	}
 
@@ -1081,7 +1073,7 @@ void KernelDispatchPendingSignalForCurrentThread() {
 	}
 
 	for (int signum = 0; signum < static_cast<int>(std::size(g_exception_handlers)); signum++) {
-		if (!TakePendingSignal(current, signum)) {
+		if (!PthreadTakePendingSignal(current, signum)) {
 			continue;
 		}
 
@@ -1159,7 +1151,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		QueuePendingSignal(thread, signum);
+		PthreadQueuePendingSignal(thread, signum);
 		KytyUserApcOption option {};
 		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
 
@@ -1168,7 +1160,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
 
 		if (status != 0) {
-			TakePendingSignal(thread, signum);
+			PthreadTakePendingSignal(thread, signum);
 			CloseHandle(target_thread);
 			LOGF("\t NtQueueApcThreadEx failed: target_os_thread=%" PRIu64 ", status=0x%016" PRIx64
 			     "\n",
@@ -1194,9 +1186,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 			return KERNEL_ERROR_EINVAL;
 		}
 
-		QueuePendingSignal(thread, signum);
+		PthreadQueuePendingSignal(thread, signum);
 		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
-			TakePendingSignal(thread, signum);
+			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");
 			return KERNEL_ERROR_EINVAL;
 		}
@@ -1336,6 +1328,15 @@ static int KYTY_SYSV_ABI KernelIsTrinityMode() {
 	}
 
 	return 0;
+}
+
+static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
+	PRINT_NAME();
+
+	*mode    = 2; // PS5 Base
+	*submode = 0; // None
+	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
+	return OK;
 }
 
 static int KYTY_SYSV_ABI KernelFsync(int fd) {
@@ -3028,9 +3029,9 @@ namespace EventQueue = LibKernel::EventQueue;
 namespace EventFlag  = LibKernel::EventFlag;
 namespace Semaphore  = LibKernel::Semaphore;
 
-LIB_DEFINE(InitFiber_1) {
-	LIB_USING(Fiber);
+namespace Fiber {
 
+LIB_DEFINE(InitFiber_1) {
 	LIB_FUNC("hVYD7Ou2pCQ", Fiber::FiberInitialize);
 	LIB_FUNC("7+OJIpko9RY", Fiber::FiberInitializeInternal);
 	LIB_FUNC("asjUJJ+aa8s", Fiber::FiberOptParamInitialize);
@@ -3048,12 +3049,16 @@ LIB_DEFINE(InitFiber_1) {
 	LIB_FUNC("0dy4JtMUcMQ", Fiber::FiberGetThreadFramePointerAddress);
 }
 
-LIB_DEFINE(InitCoredump_1) {
-	LIB_USING(Coredump);
+} // namespace Fiber
 
+namespace Coredump {
+
+LIB_DEFINE(InitCoredump_1) {
 	LIB_FUNC("8zLSfEfW5AU", Coredump::sceCoredumpRegisterCoredumpHandler);
 	LIB_FUNC("fFkhOgztiCA", Coredump::sceCoredumpUnregisterCoredumpHandler);
 }
+
+} // namespace Coredump
 
 LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("1G3lF1Gg1k8", FileSystem::KernelOpen);
@@ -3078,6 +3083,7 @@ LIB_DEFINE(InitLibKernel_1_Mem) {
 	LIB_FUNC("mL8NDH86iQI", Memory::KernelMapNamedFlexibleMemory);
 	LIB_FUNC("IWIBBdTHit4", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("DGMG3JshrZU", Memory::KernelSetVirtualRangeName);
+	LIB_FUNC("mkgXxsoxWHg", Memory::KernelClearVirtualRangeName);
 	// 6xx
 	LIB_FUNC("4h6F1LLbTiw", Memory::KernelMapFlexibleMemory);
 	LIB_FUNC("cQke9UuBQOk", Memory::KernelMunmap);
@@ -3230,6 +3236,9 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("mqdNorrB+gI", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("sIlRvQqsN2Y", LibKernel::PthreadRwlockWrlock);
 	LIB_FUNC("bIHoZCTomsI", LibKernel::PthreadRwlockTrywrlock);
+	LIB_FUNC("XD3mDeybCnk", LibKernel::PthreadRwlockTryrdlock);
+	LIB_FUNC("iPtZRWICjrM", LibKernel::PthreadRwlockTimedrdlock);
+	LIB_FUNC("adh--6nIqTk", LibKernel::PthreadRwlockTimedwrlock);
 	LIB_FUNC("i2ifZ3fS2fo", LibKernel::PthreadRwlockattrDestroy);
 	LIB_FUNC("yOfGg-I1ZII", LibKernel::PthreadRwlockattrInit);
 	LIB_FUNC("qsdmgXjqSgk", LibKernel::PthreadRwlockattrDestroy);
@@ -3325,6 +3334,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("8OnWXlgQlvo", LibKernel::KernelRtldThreadAtexitDecrement);
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
+	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
 	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);

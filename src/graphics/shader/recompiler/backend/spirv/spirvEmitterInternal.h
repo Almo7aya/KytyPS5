@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -40,6 +39,7 @@ enum : uint32_t {
 	MemoryModelGLSL450                       = 1,
 	CapabilityShader                         = 1,
 	CapabilityInt64                          = 11,
+	CapabilityInt64Atomics                   = 12,
 	CapabilityImageGatherExtended            = 25,
 	CapabilityClipDistance                   = 32,
 	CapabilityCullDistance                   = 33,
@@ -74,6 +74,7 @@ enum : uint32_t {
 	DecorationBuiltIn       = 11,
 	DecorationNoPerspective = 13,
 	DecorationFlat          = 14,
+	DecorationAliased       = 20,
 	DecorationLocation      = 30,
 	DecorationArrayStride   = 6,
 	DecorationBinding       = 33,
@@ -129,6 +130,7 @@ enum : uint32_t {
 	MemorySemanticsAcquireRelease  = 0x00000008u,
 	MemorySemanticsUniformMemory   = 0x00000040u,
 	MemorySemanticsWorkgroupMemory = 0x00000100u,
+	MemorySemanticsImageMemory     = 0x00000800u,
 };
 
 enum : uint32_t {
@@ -318,61 +320,54 @@ struct OutputBinding {
 	std::string         debug_name;
 };
 
-struct DescriptorResourceBinding {
-	const IR::DescriptorBinding* descriptor  = nullptr;
-	uint32_t                     array_index = 0;
+using ImageDimension = Decoder::ImageDimension;
+
+struct ImageDimensionInfo {
+	ImageDimension dimension;
+	uint32_t       spirv_dimension;
+	uint32_t       coordinate_components;
+	uint32_t       spatial_components;
+	uint32_t       arrayed;
+	uint32_t       multisampled;
 };
 
-enum class ImageViewKind {
-	Dim1D,
-	Dim1DArray,
-	Dim2D,
-	Dim2DArray,
-	Dim3D,
-	Dim2DMsaa,
-	Dim2DMsaaArray,
-	Count,
-};
+constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
+    {ImageDimension::Dim1D, Dim1D, 1, 1, 0, 0},
+    {ImageDimension::Dim1DArray, Dim1D, 2, 1, 1, 0},
+    {ImageDimension::Dim2D, Dim2D, 2, 2, 0, 0},
+    {ImageDimension::Dim2DArray, Dim2D, 3, 2, 1, 0},
+    {ImageDimension::Dim3D, Dim3D, 3, 3, 0, 0},
+    {ImageDimension::Dim2DMsaa, Dim2D, 2, 2, 0, 1},
+    {ImageDimension::Dim2DMsaaArray, Dim2D, 3, 2, 1, 1},
+}};
 
-constexpr uint32_t SampledImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Count);
-constexpr uint32_t StorageImageViewKindCount = static_cast<uint32_t>(ImageViewKind::Dim2DMsaa);
-
-enum class StorageImageClass : uint32_t {
-	FormatlessFloat,
-	FormatlessUint,
-	AtomicUint,
-	Count,
-};
+const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct EmitterState {
-	EmitterState(const IR::Program& program_, const IR::ResourceSnapshot& resources_,
-	             ShaderStageInputInfo input_info_)
-	    : program(program_), resources(resources_), input_info(input_info_),
+	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
+	    : program(program_), input_info(input_info_),
 	      requirements(*program_.spirv_requirements) {}
 
-	Builder                      builder;
-	const IR::Program&           program;
-	const IR::ResourceSnapshot&  resources;
-	ShaderStageInputInfo         input_info;
-	const IR::SpirvRequirements& requirements;
-	ShaderType                   stage                   = ShaderType::Unknown;
-	uint32_t                     wave_size               = 64;
-	uint32_t                     storage_buffer_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers>      memory_byte_offsets {};
-	uint32_t                                             bda_pagetable_variable = 0;
-	uint32_t                                             fault_buffer_variable  = 0;
-	uint32_t                                             bda_pointer_function   = 0;
-	uint32_t                                             gds_variable            = 0;
-	uint32_t                                             gds_length              = 0;
-	uint32_t                                             push_constant_variable  = 0;
-	uint32_t                                             vsharp_storage_variable = 0;
-	uint32_t                                             flattened_srt_variable  = 0;
-	uint32_t                                             lds_variable            = 0;
-	uint32_t                                             scratch_variable        = 0;
-	std::array<uint32_t, 2u * SampledImageViewKindCount> sampled_image_variables {};
-	std::array<uint32_t,
-	           static_cast<uint32_t>(StorageImageClass::Count) * StorageImageViewKindCount>
-	                           storage_image_variables {};
+	Builder                                          builder;
+	const IR::Program&                               program;
+	ShaderStageInputInfo                             input_info;
+	const IR::SpirvRequirements&                     requirements;
+	ShaderType                                       stage                   = ShaderType::Unknown;
+	uint32_t                                         wave_size               = 64;
+	uint32_t                                         storage_buffer_variable = 0;
+	uint32_t                                         storage_buffer_u64_variable = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	uint32_t                                         bda_pagetable_variable  = 0;
+	uint32_t                                         fault_buffer_variable   = 0;
+	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         gds_length              = 0;
+	uint32_t                                         push_constant_variable  = 0;
+	uint32_t                                         shader_data_storage_variable = 0;
+	uint32_t                                         flattened_srt_variable  = 0;
+	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         scratch_variable        = 0;
+	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   entry_label                           = 0;
@@ -399,6 +394,7 @@ uint32_t TypeBoolVector(EmitterState& state, uint32_t components);
 uint32_t TypeU32(EmitterState& state);
 uint32_t TypeU64(EmitterState& state);
 uint32_t TypeDeviceAddress(EmitterState& state);
+uint32_t TypeScalarU64(EmitterState& state);
 uint32_t TypeU32Pair(EmitterState& state);
 uint32_t TypeI32(EmitterState& state);
 uint32_t TypeI32Pair(EmitterState& state);
@@ -412,6 +408,8 @@ uint32_t TypePointer(EmitterState& state, uint32_t storage_class, uint32_t point
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferPointer(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state);
+uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
+uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -443,7 +441,7 @@ struct ValueEmitContext {
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
-	const IR::Program&                                            program;
+	const IR::Program&                                                 program;
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;
 	std::unordered_map<const IR::Block*, uint32_t>                     labels;
 	const std::unordered_map<const IR::Inst*, uint32_t>*               dispatcher_spills = nullptr;
@@ -470,119 +468,6 @@ struct ImageSampleLayout {
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
 };
-
-constexpr uint32_t SampledImageIndex(bool integer, ImageViewKind view) {
-	return static_cast<uint32_t>(view) + (integer ? SampledImageViewKindCount : 0u);
-}
-
-constexpr StorageImageClass StorageImageClassFor(bool uint_image, bool atomic) {
-	if (atomic) {
-		return StorageImageClass::AtomicUint;
-	}
-	if (uint_image) {
-		return StorageImageClass::FormatlessUint;
-	}
-	return StorageImageClass::FormatlessFloat;
-}
-
-constexpr uint32_t StorageImageIndex(StorageImageClass image_class, ImageViewKind view) {
-	return static_cast<uint32_t>(view) +
-	       static_cast<uint32_t>(image_class) * StorageImageViewKindCount;
-}
-
-constexpr IR::DescriptorBindingKind SampledBindingKind(bool integer, ImageViewKind view) {
-	if (integer) {
-		switch (view) {
-			case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::SampledUint1D;
-			case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::SampledUint1DArray;
-			case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::SampledUint2D;
-			case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::SampledUint2DArray;
-			case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::SampledUint3D;
-			case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::SampledUint2DMsaa;
-			case ImageViewKind::Dim2DMsaaArray:
-				return IR::DescriptorBindingKind::SampledUint2DMsaaArray;
-			default: break;
-		}
-	}
-	switch (view) {
-		case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Sampled1D;
-		case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Sampled1DArray;
-		case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Sampled2D;
-		case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Sampled2DArray;
-		case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Sampled3D;
-		case ImageViewKind::Dim2DMsaa: return IR::DescriptorBindingKind::Sampled2DMsaa;
-		case ImageViewKind::Dim2DMsaaArray: return IR::DescriptorBindingKind::Sampled2DMsaaArray;
-		default: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
-constexpr IR::DescriptorBindingKind StorageBindingKind(StorageImageClass image_class,
-                                                       ImageViewKind     view) {
-	switch (image_class) {
-		case StorageImageClass::FormatlessFloat:
-			switch (view) {
-				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::Storage1D;
-				case ImageViewKind::Dim1DArray: return IR::DescriptorBindingKind::Storage1DArray;
-				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::Storage2D;
-				case ImageViewKind::Dim2DArray: return IR::DescriptorBindingKind::Storage2DArray;
-				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::Storage3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::FormatlessUint:
-			switch (view) {
-				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageUint1D;
-				case ImageViewKind::Dim1DArray:
-					return IR::DescriptorBindingKind::StorageUint1DArray;
-				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageUint2D;
-				case ImageViewKind::Dim2DArray:
-					return IR::DescriptorBindingKind::StorageUint2DArray;
-				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageUint3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::AtomicUint:
-			switch (view) {
-				case ImageViewKind::Dim1D: return IR::DescriptorBindingKind::StorageAtomic1D;
-				case ImageViewKind::Dim1DArray:
-					return IR::DescriptorBindingKind::StorageAtomic1DArray;
-				case ImageViewKind::Dim2D: return IR::DescriptorBindingKind::StorageAtomic2D;
-				case ImageViewKind::Dim2DArray:
-					return IR::DescriptorBindingKind::StorageAtomic2DArray;
-				case ImageViewKind::Dim3D: return IR::DescriptorBindingKind::StorageAtomic3D;
-				default: break;
-			}
-			break;
-		case StorageImageClass::Count: break;
-	}
-	return IR::DescriptorBindingKind::Count;
-}
-
-constexpr uint32_t ImageSpirvDimension(ImageViewKind view) {
-	switch (view) {
-		case ImageViewKind::Dim1D:
-		case ImageViewKind::Dim1DArray: return Dim1D;
-		case ImageViewKind::Dim2D:
-		case ImageViewKind::Dim2DArray:
-		case ImageViewKind::Dim2DMsaa:
-		case ImageViewKind::Dim2DMsaaArray:
-		case ImageViewKind::Count: return Dim2D;
-		case ImageViewKind::Dim3D: return Dim3D;
-	}
-	return Dim2D;
-}
-
-constexpr uint32_t ImageSpirvArrayed(ImageViewKind view) {
-	return view == ImageViewKind::Dim1DArray || view == ImageViewKind::Dim2DArray ||
-	               view == ImageViewKind::Dim2DMsaaArray
-	           ? 1u
-	           : 0u;
-}
-
-constexpr uint32_t ImageSpirvMultisampled(ImageViewKind view) {
-	return view == ImageViewKind::Dim2DMsaa || view == ImageViewKind::Dim2DMsaaArray ? 1u : 0u;
-}
 
 struct F32Class {
 	uint32_t bits = 0;
@@ -626,48 +511,33 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
                                                IR::DescriptorBindingKind kind, uint32_t resource,
                                                const char* reason);
 
-DescriptorResourceBinding ResourceForDescriptor(const EmitterState&       state,
-                                                IR::DescriptorBindingKind kind, uint32_t resource);
+uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
+                               uint32_t resource);
 
 uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name);
 
-ImageViewKind SampledImageViewKind(const EmitterState& state, const IR::MemoryInfo& mem,
-                                   uint32_t use_pc);
+uint32_t ImageScalarType(EmitterState& state, Prospero::TextureNumericClass numeric_class);
 
-uint32_t ImageViewCoordinateComponents(ImageViewKind view);
+uint32_t ImageVectorType(EmitterState& state, Prospero::TextureNumericClass numeric_class,
+                         uint32_t components);
 
-uint32_t ImageViewSpatialComponents(ImageViewKind view);
+uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
-uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, bool integer);
+uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageViewSampledImageType(EmitterState& state, ImageViewKind view, bool integer);
+uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
 
-uint32_t ImageViewSizeType(EmitterState& state, ImageViewKind view);
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t StorageImageType(EmitterState& state, StorageImageClass image_class, ImageViewKind view);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
 
-uint32_t StorageImagePointerType(EmitterState& state, StorageImageClass image_class,
-                                 ImageViewKind view);
+uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                                    ImageViewKind view);
-
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t use_pc);
-
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view);
-uint32_t MakeSampledImage(EmitterState& state, const IR::MemoryInfo& mem, uint32_t use_pc,
-                          ImageViewKind view, uint32_t image_resource);
-
-ImageViewKind StorageImageViewKind(const IR::MemoryInfo& mem);
-
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource, ImageViewKind view);
-
-void EmitStorageImageWrite(EmitterState& state, uint32_t resource, ImageViewKind view,
-                           uint32_t mip_lod, uint32_t coord, uint32_t texel);
+void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
+                           uint32_t texel);
 
 uint32_t ExecutionModelForStage(ShaderType stage);
 
@@ -755,10 +625,16 @@ struct MemoryResourceAccess {
 	uint32_t         object_pointer   = 0;
 	uint32_t         length           = 0;
 	uint32_t         index_offset     = 0;
+	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
+
+MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
+                                                         const IR::MemoryInfo& mem,
+                                                         uint32_t variable,
+                                                         uint32_t pointer_type);
 
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);
@@ -768,6 +644,10 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
+
+uint32_t EmitStorageBufferElementPointer(EmitterState& state,
+                                         const MemoryResourceAccess& access, uint32_t index,
+                                         uint32_t pointer_type);
 
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
 
@@ -791,6 +671,9 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
                                   uint32_t component, uint32_t raw);
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
+
+uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
+                                    bool max_value);
 
 uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t control);
 
@@ -905,6 +788,47 @@ template <typename Fn>
 uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	return EmitValueOrDefaultIfCondition(state, condition, TypeU32(state), ConstantU32(state, 0),
 	                                     std::forward<Fn>(fn));
+}
+
+template <typename Fn>
+uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	const auto scope = kind == IR::ResourceKind::Lds ? ScopeWorkgroup : ScopeDevice;
+	const auto memory = [&] {
+		switch (kind) {
+			case IR::ResourceKind::Lds: return MemorySemanticsWorkgroupMemory;
+			case IR::ResourceKind::Image: return MemorySemanticsImageMemory;
+			default: return MemorySemanticsUniformMemory;
+		}
+	}();
+	const auto preheader = state.builder.AllocateId();
+	const auto header    = state.builder.AllocateId();
+	const auto cont      = state.builder.AllocateId();
+	const auto merge     = state.builder.AllocateId();
+	const auto initial   = state.builder.AllocateId();
+	const auto observed  = state.builder.AllocateId();
+	const auto exchanged = state.builder.AllocateId();
+	state.builder.AddFunction({OpBranch, preheader});
+	EmitLabel(state, preheader);
+	state.builder.AddFunction({OpAtomicLoad, TypeU32(state), initial, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone)});
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, header);
+	state.builder.AddFunction(
+	    {OpPhi, TypeU32(state), observed, initial, preheader, exchanged, cont});
+	const auto next = desired(observed);
+	state.builder.AddFunction({OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+	                           ConstantU32(state, scope), ConstantU32(state, MemorySemanticsNone),
+	                           ConstantU32(state, MemorySemanticsNone), next, observed});
+	const auto success = state.builder.AllocateId();
+	state.builder.AddFunction({OpIEqual, TypeBool(state), success, exchanged, observed});
+	state.builder.AddFunction({OpLoopMerge, merge, cont, LoopControlNone});
+	state.builder.AddFunction({OpBranchConditional, success, merge, cont});
+	EmitLabel(state, cont);
+	state.builder.AddFunction({OpBranch, header});
+	EmitLabel(state, merge);
+	state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, scope),
+	                           ConstantU32(state, MemorySemanticsAcquireRelease | memory)});
+	return observed;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -34,9 +34,9 @@ const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
 
-std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
+std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
-	dump += CFG::GraphToString(cfg);
+	dump += cfg;
 	dump += "\nIR:\n";
 	dump += fmt::format("mode={} scratch_dwords={}\n",
 	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
@@ -234,8 +234,10 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
                                             uint32_t wave_size) {
 	EmbeddedFetchData data;
 	data.loads.reserve(input_info->resources_num);
-	int32_t offset_candidate = -1;
-	bool    offset_conflict  = false;
+	int32_t vertex_offset_candidate   = -1;
+	int32_t instance_offset_candidate = -1;
+	bool    vertex_offset_conflict    = false;
+	bool    instance_offset_conflict  = false;
 
 	const int shift_regs = 8;
 	const int attrib_reg = input_info->fetch_attrib_reg + shift_regs;
@@ -263,26 +265,34 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 	for (const auto& inst: decoded.instructions) {
 		// Fetch shaders accumulate the draw's vertex offset in v0. The PS5 NGG ABI
-		// seeds S_NGG_VERTEX_INDEX in v5 and applies the same offset there before fetching.
+		// seeds S_NGG_VERTEX_INDEX in v5 and S_NGG_INSTANCE_INDEX in v8, then applies the
+		// corresponding direct-draw offsets before fetching.
 		const bool vertex_index_accumulator =
 		    IsDecodedVgpr(inst.dst) &&
 		    (inst.dst.reg == 0 || (user_data_base == 8 && inst.dst.reg == 5));
+		const bool instance_index_accumulator =
+		    IsDecodedVgpr(inst.dst) && (inst.dst.reg == (user_data_base == 8 ? 8u : 3u));
 		uint32_t   sad_zero = 0;
-		const bool vertex_offset_add =
-		    vertex_index_accumulator && IsDecodedSgpr(inst.src0) &&
+		const bool index_offset_add =
+		    (vertex_index_accumulator || instance_index_accumulator) &&
+		    IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
 		      inst.src1.reg == inst.dst.reg) ||
-		     (user_data_base == 8 && inst.dst.reg == 5 &&
+		     (user_data_base == 8 && (inst.dst.reg == 5 || inst.dst.reg == 8) &&
 		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
 		      inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
-		if (data.loads.empty() && vertex_offset_add) {
+		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
 			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
-				if (offset_candidate >= 0 && offset_candidate != static_cast<int32_t>(reg)) {
-					offset_conflict = true;
+				auto& candidate = vertex_index_accumulator ? vertex_offset_candidate
+				                                           : instance_offset_candidate;
+				auto& conflict  = vertex_index_accumulator ? vertex_offset_conflict
+				                                           : instance_offset_conflict;
+				if (candidate >= 0 && candidate != static_cast<int32_t>(reg)) {
+					conflict = true;
 				} else {
-					offset_candidate = static_cast<int32_t>(reg);
+					candidate = static_cast<int32_t>(reg);
 				}
 			}
 		}
@@ -441,8 +451,13 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 						load.attrib_id    = buffer.attrib_id;
 						load.components   = DecodedDstSize(inst);
 						load.prolog_loads = buffer.prolog_loads;
-						if (data.loads.empty() && !offset_conflict) {
-							data.vertex_offset_sgpr = offset_candidate;
+						if (data.loads.empty()) {
+							if (!vertex_offset_conflict) {
+								data.vertex_offset_sgpr = vertex_offset_candidate;
+							}
+							if (!instance_offset_conflict) {
+								data.instance_offset_sgpr = instance_offset_candidate;
+							}
 						}
 						data.loads.push_back(load);
 					}
@@ -464,7 +479,7 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 
 } // namespace
 
-CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& options) {
+TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -615,33 +630,46 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
-		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
+		ir.info.vertex_offset_sgpr   = embedded_fetch.vertex_offset_sgpr;
+		ir.info.instance_offset_sgpr = embedded_fetch.instance_offset_sgpr;
 	}
 
-	const IR::SrtRuntime runtime {
-	    .user_data                  = options.user_data,
-	    .shader_base                = reinterpret_cast<uint64_t>(code.data()),
-	    .read_memory                = options.read_memory,
-	    .userdata                   = options.read_memory_data,
-	    .read_specialization_memory = options.read_specialization_memory,
-	};
-	IR::ResourceSnapshot resources;
-	if (!IR::MaterializeResources(ir, runtime, resources)) {
-		EXIT("shader resource materialization failed: stage=%s hash=0x%016" PRIx64 "\n",
-		     StageName(options.stage), options.shader_hash);
+	TranslateResult result;
+	result.program = std::move(ir);
+	if (options.dump_ir) {
+		result.decoded_dump = std::move(decoded_dump);
+		result.cfg_dump     = CFG::GraphToString(cfg);
 	}
-	IR::SpecializeResources(ir, resources);
+	return result;
+}
+
+CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
+                             const IR::ResourceSpecialization& specialization,
+                             uint32_t push_data_start_dword) {
+	const auto emit_begin = std::chrono::steady_clock::now();
+	auto& ir = translated.program;
+	IR::ApplyResourceSpecialization(ir, specialization);
+
+	const ShaderVertexInputInfo*  vertex  = nullptr;
+	const ShaderPixelInputInfo*   pixel   = nullptr;
+	const ShaderComputeInputInfo* compute = nullptr;
+	switch (options.stage) {
+		case ShaderType::Vertex: vertex = options.input_info.vertex; break;
+		case ShaderType::Pixel: pixel = options.input_info.pixel; break;
+		case ShaderType::Compute: compute = options.input_info.compute; break;
+		default: EXIT("invalid shader stage\n");
+	}
 
 	IR::ShaderInfoOptions info_options;
 	info_options.vertex  = vertex;
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	IR::AllocateBindings(ir, options.push_constant_offset);
+	IR::AllocateBindings(ir, push_data_start_dword);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
-		ir_dump = MakeIrDump(cfg, ir);
+		ir_dump = MakeIrDump(translated.cfg_dump, ir);
 		if (options.early_dump) {
 			LOGF("%s native IR and bindings (early):\n%s", GetDumpLabel(options), ir_dump.c_str());
 		}
@@ -649,17 +677,19 @@ CompileResult Recompile(std::span<const uint32_t> code, const CompileOptions& op
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, resources, options.input_info);
+	auto spirv = Spirv::EmitProgram(ir, options.input_info);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(spirv.size()), phase_ms());
+	     static_cast<uint64_t>(spirv.size()),
+	     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                               std::chrono::steady_clock::now() - emit_begin)
+	                               .count()));
 	CompileResult result;
-	result.spirv     = std::move(spirv);
-	result.program   = std::move(ir);
-	result.resources = std::move(resources);
+	result.spirv   = std::move(spirv);
+	result.program = std::move(ir);
 	if (options.dump_ir) {
-		result.decoded_dump = std::move(decoded_dump);
+		result.decoded_dump = std::move(translated.decoded_dump);
 		result.ir_dump      = std::move(ir_dump);
 	}
 	return result;
