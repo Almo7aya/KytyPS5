@@ -211,6 +211,20 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	Dispatch(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode, 0);
+}
+
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
+                                      uint64_t args_address, uint32_t mode) {
+	EXIT_IF((!GuestRange {args_address, sizeof(vk::DispatchIndirectCommand)}.Valid()) ||
+	        (args_address & 3u) != 0 || (mode & (1u << 5u)) != 0);
+	Dispatch(submit_id, buffer, 0, 0, 0, mode, args_address);
+}
+
+void RenderExecutor::Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+                              uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+                              uint64_t indirect_args_address) {
+	bool indirect = indirect_args_address != 0;
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -273,8 +287,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return;
 	}
-	if (TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                thread_group_z, mode)) {
+	if (indirect && resources.uniform_fill.kind != ShaderRecompiler::IR::UniformFillKind::None) {
+		// Metadata/image clear emulation needs the exact coverage of a recognized fill.
+		// General compute dispatches keep their arguments on the GPU.
+		std::array<uint32_t, 3> groups {};
+		std::memcpy(groups.data(), reinterpret_cast<const void*>(indirect_args_address),
+		            sizeof(groups));
+		thread_group_x = groups[0];
+		thread_group_y = groups[1];
+		thread_group_z = groups[2];
+		indirect       = false;
+	}
+	if (!indirect && TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                             thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -361,7 +386,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	if (!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -375,6 +400,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
+	auto& cache = m_context.GetBufferCache();
+	// Discover the argument range before shader resources, which may merge cached buffers.
+	const auto args_id =
+	    indirect ? cache.FindBuffer(indirect_args_address, sizeof(vk::DispatchIndirectCommand))
+	             : BufferId {};
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
@@ -383,6 +413,15 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindBuffers(bindings);
 	RebindImages(bindings);
+	vk::Buffer indirect_buffer = nullptr;
+	uint64_t   indirect_offset = 0;
+	if (indirect) {
+		auto [args, offset] = cache.ObtainBuffer(
+		    indirect_args_address, sizeof(vk::DispatchIndirectCommand), false, false, args_id);
+		EXIT_IF(args == nullptr || (offset & 3u) != 0);
+		indirect_buffer = args->Handle();
+		indirect_offset = offset;
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
@@ -403,10 +442,31 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (indirect) {
+		vk::BufferMemoryBarrier2 barrier {};
+		barrier.srcStageMask =
+		    vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost;
+		barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eHostWrite;
+		barrier.dstStageMask  = vk::PipelineStageFlagBits2::eDrawIndirect;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eIndirectCommandRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = indirect_buffer;
+		barrier.offset              = indirect_offset;
+		barrier.size                = sizeof(vk::DispatchIndirectCommand);
+		vk::DependencyInfo dependency {};
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &barrier;
+		vk_buffer.pipelineBarrier2(dependency);
+		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader |
+	                                   (indirect ? vk::PipelineStageFlagBits::eDrawIndirect
+	                                             : vk::PipelineStageFlags {}));
 	ResetBindings();
 }
 
