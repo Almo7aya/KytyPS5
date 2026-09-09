@@ -156,6 +156,8 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_address,
+	                      uint32_t mode);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
@@ -166,6 +168,9 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	void Dispatch(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	              uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	              uint64_t indirect_args_address);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 

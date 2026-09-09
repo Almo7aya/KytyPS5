@@ -1129,18 +1129,25 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
-	struct DispatchIndirectArgs {
-		uint32_t thread_group_x;
-		uint32_t thread_group_y;
-		uint32_t thread_group_z;
-	};
-
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
+	EXIT_IF(data_offset > UINT64_MAX - m_dispatch_indirect_args_base_addr);
+	DispatchIndirectAtAddress(m_dispatch_indirect_args_base_addr + data_offset, mode);
+}
 
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
-	auto*      args      = reinterpret_cast<const DispatchIndirectArgs*>(args_addr);
-
-	DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
+void CommandProcessor::DispatchIndirectAtAddress(uint64_t args_address, uint32_t mode) {
+	EXIT_IF(args_address == 0 || (args_address & 3u) != 0 || args_address > UINT64_MAX - 12u);
+	constexpr uint32_t UseThreadDimensions = 1u << 5u;
+	if ((mode & UseThreadDimensions) != 0) {
+		// This mode needs guest thread-to-group conversion and the original thread counts
+		// in shader push data. Retain the CPU path until that conversion runs on the GPU.
+		const auto* args = reinterpret_cast<const uint32_t*>(args_address);
+		DispatchDirect(args[0], args[1], args[2], mode);
+		return;
+	}
+	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
+	CheckBuffer();
+	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_address,
+	                                                mode);
 }
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
