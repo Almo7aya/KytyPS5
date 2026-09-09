@@ -799,20 +799,24 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-		const auto address = descriptor.Base48();
-		const auto stride  = descriptor.Stride();
-		const auto records = descriptor.NumRecords();
+	prepared.buffer_sources.resize(program.info.buffers.size());
+	const auto* binding = ShaderRecompiler::IR::FindBinding(
+	    program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+	if (binding == nullptr) {
+		return;
+	}
+	for (const auto i: binding->resources) {
+		auto       descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+		const auto address    = descriptor.Base48();
+		const auto stride     = descriptor.Stride();
+		const auto records    = descriptor.NumRecords();
 		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested_size == 0) {
-			prepared.buffer_sources.push_back({});
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
-		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
+		prepared.buffer_sources[i] = {address, size, cache.FindBuffer(address, size)};
 	}
 }
 
@@ -825,7 +829,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
 
 	prepared.buffers.clear();
-	prepared.buffers.reserve(program.info.buffers.size());
+	prepared.buffers.resize(program.info.buffers.size());
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -834,12 +838,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		uint32_t buffer_offset = 0;
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
-		pack_memory_offset(i, buffer_offset);
+	if (const auto* binding = ShaderRecompiler::IR::FindBinding(
+	        layout, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+	    binding != nullptr) {
+		// Offsets follow the native descriptor array, while snapshots retain resource indices.
+		uint32_t native_index = 0;
+		for (const auto i: binding->resources) {
+			uint32_t buffer_offset = 0;
+			prepared.buffers[i] =
+			    NativeStorageBuffer(m_context, prepared.buffer_sources[i], program.info.buffers[i],
+			                        program.stage, i, buffer_offset);
+			pack_memory_offset(native_index++, buffer_offset);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
