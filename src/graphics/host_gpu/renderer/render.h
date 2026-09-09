@@ -157,7 +157,7 @@ public:
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -176,7 +176,7 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
+	[[nodiscard]] GraphicsBindings& PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -208,6 +208,9 @@ private:
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
+	// Only storage is reused; each draw/dispatch rebuilds its runtime bindings.
+	GraphicsBindings                      m_graphics_bindings;
+	PreparedBindings                      m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
