@@ -708,8 +708,8 @@ void CreatePipelineInternal(
 	depth_stencil_info.back.passOp       = static_params.stencil_back.passOp;
 	depth_stencil_info.back.depthFailOp  = static_params.stencil_back.depthFailOp;
 	depth_stencil_info.back.compareOp    = static_params.stencil_back.compareOp;
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
+	depth_stencil_info.minDepthBounds    = 0.0f;
+	depth_stencil_info.maxDepthBounds    = 1.0f;
 
 	std::vector<vk::DynamicState> dynamic_states {
 	    vk::DynamicState::eViewportWithCount,
@@ -726,6 +726,7 @@ void CreatePipelineInternal(
 	    vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
+	dynamic_states.push_back(vk::DynamicState::eDepthBounds);
 	if (rendering.color_count != 0) {
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}

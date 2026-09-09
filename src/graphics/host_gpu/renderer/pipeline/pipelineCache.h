@@ -40,8 +40,6 @@ struct PipelineStaticParameters {
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       depth_bounds_test_enable = false;
-	float                      depth_min_bounds         = 0.0f;
-	float                      depth_max_bounds         = 0.0f;
 	bool                       stencil_test_enable      = false;
 	PipelineStencilStaticState stencil_front;
 	PipelineStencilStaticState stencil_back;
@@ -69,7 +67,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 166);
+static_assert(sizeof(PipelineStaticParameters) == 158);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
