@@ -1253,10 +1253,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	ImageId result {};
 	{
 		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
-		for (const auto id: candidates) {
+		// Exact backing matches share the start address, so their owners are all
+		// present on the first page regardless of the texture's size.
+		for (const auto id: FindImagesInRegion(desc.info.data.address, 1, false)) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
 				result = id;
@@ -1266,6 +1265,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
+			const auto candidates =
+			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 			for (const auto candidate: candidates) {
 				view_mip                = -1;
 				view_layer              = -1;
