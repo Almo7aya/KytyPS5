@@ -35,8 +35,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
-	if (!program.info.buffers.empty()) {
-		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
+	if (auto resources = IR::CollectNativeBufferResources(program); !resources.empty()) {
+		Expect(Kind::Buffers, std::move(resources));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
@@ -105,7 +105,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_offset_count !=
+	        expected[static_cast<size_t>(Kind::Buffers)].size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||

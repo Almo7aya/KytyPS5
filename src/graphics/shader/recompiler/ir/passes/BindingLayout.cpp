@@ -82,6 +82,36 @@ bool UsesFlattenedSrt(const Program& program) {
 	});
 }
 
+std::vector<uint32_t> CollectNativeBufferResources(const Program& program) {
+	std::vector<bool> used(program.info.buffers.size());
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				BindingFail("typed shader contains invalid buffer-memory metadata");
+			}
+			const auto& memory = program.memory_info[index];
+			if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer && memory.planning_only) {
+				continue;
+			}
+			if (memory.resource >= used.size()) {
+				BindingFail("typed shader contains an invalid buffer resource");
+			}
+			used[memory.resource] = true;
+		}
+	}
+	std::vector<uint32_t> resources;
+	for (uint32_t i = 0; i < used.size(); i++) {
+		if (used[i]) {
+			resources.push_back(i);
+		}
+	}
+	return resources;
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
@@ -89,18 +119,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
-	next.user_data_registers = CollectUserData(program);
-	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	auto          buffer_resources = CollectNativeBufferResources(program);
+	next.user_data_registers       = CollectUserData(program);
+	next.memory_offset_dword       = static_cast<uint32_t>(next.user_data_registers.size());
+	next.memory_offset_count       = static_cast<uint32_t>(buffer_resources.size());
+	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
-	if (!program.info.buffers.empty()) {
-		std::vector<uint32_t> resources(program.info.buffers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
-		}
-		AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+	if (!buffer_resources.empty()) {
+		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffer_resources));
 	}
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
