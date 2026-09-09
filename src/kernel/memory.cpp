@@ -916,7 +916,22 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	return g_gpu_resources != nullptr && g_gpu_resources->HandleFault(access, fault_vaddr);
+	if (g_gpu_resources == nullptr) {
+		return false;
+	}
+	if (g_gpu_resources->HandleFault(access, fault_vaddr)) {
+		return true;
+	}
+	if (Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Fixed mapping replacement temporarily withdraws the range from GPU tracking.
+	// Wait for that transaction before rejecting a concurrent guest memory access.
+	// Release the lock before fault handling, which can wait for GPU commands.
+	{
+		std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	}
+	return g_gpu_resources->HandleFault(access, fault_vaddr);
 }
 
 struct PrtAperture {
