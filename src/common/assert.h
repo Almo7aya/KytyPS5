@@ -11,14 +11,14 @@ namespace Common {
 
 #ifdef __clang__
 int DbgExitHandler(char const* file, int line, std::string_view text)
-    __attribute__((analyzer_noreturn));
+    __attribute__((analyzer_noreturn, cold));
 int DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text)
-    __attribute__((analyzer_noreturn));
+    __attribute__((analyzer_noreturn, cold));
 int DbgExitIfHandler(char const* expr, char const* file, int line)
-    __attribute__((analyzer_noreturn));
+    __attribute__((analyzer_noreturn, cold));
 int DbgNotImplementedHandler(char const* expr, char const* file, int line)
-    __attribute__((analyzer_noreturn));
-void DbgExit(int status) __attribute__((analyzer_noreturn));
+    __attribute__((analyzer_noreturn, cold));
+void DbgExit(int status) __attribute__((analyzer_noreturn, cold));
 #else
 int  DbgExitHandler(char const* file, int line, std::string_view text);
 int  DbgExitHandler(char const* file, int line, fmt::text_style style, std::string_view text);
