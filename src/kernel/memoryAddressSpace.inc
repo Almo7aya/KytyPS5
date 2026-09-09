@@ -486,6 +486,17 @@ private:
 		}
 
 		std::lock_guard lock(m_mutex);
+		// Small descriptor reads normally fit in one mapping. Validate and transfer
+		// that span with one lookup, retaining the two-pass path for split mappings.
+		MapEntry single {};
+		if (FindContainingUnlocked(vaddr, size, &single)) {
+			const auto offset = single.backing_offset + vaddr - single.vaddr;
+			if (!RangeOk(offset, size)) {
+				return false;
+			}
+			transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+			return true;
+		}
 		const auto      end     = vaddr + size;
 		auto            current = vaddr;
 		while (current < end) {
