@@ -730,7 +730,7 @@ void CreatePipelineInternal(
 		dynamic_states.push_back(vk::DynamicState::eColorWriteEnableEXT);
 	}
 #endif
-	if (graphics.attachment_feedback_loop_enabled) {
+	if (graphics.attachment_feedback_loop_dynamic_enabled) {
 		dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
 	}
 
@@ -739,6 +739,11 @@ void CreatePipelineInternal(
 	dynamic_state.pDynamicStates    = dynamic_states.data();
 
 	vk::GraphicsPipelineCreateInfo  pipeline_info {};
+	if (with_depth && graphics.attachment_feedback_loop_enabled &&
+	    !graphics.attachment_feedback_loop_dynamic_enabled) {
+		// The layout extension supports feedback through static pipeline state as well.
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDepthStencilAttachmentFeedbackLoopEXT;
+	}
 	vk::PipelineRenderingCreateInfo rendering_info {};
 	rendering_info.colorAttachmentCount    = rendering.color_count;
 	rendering_info.pColorAttachmentFormats = rendering.color_formats.data();
