@@ -155,6 +155,28 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	[[nodiscard]] constexpr bool Any(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return false;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << (start % BITS_PER_WORD);
+		const auto end_mask   = ~uint64_t {0} >> (BITS_PER_WORD - 1 - (end - 1) % BITS_PER_WORD);
+		if (first_word == last_word) {
+			return (m_data[first_word] & start_mask & end_mask) != 0;
+		}
+		if ((m_data[first_word] & start_mask) != 0) {
+			return true;
+		}
+		for (auto word = first_word + 1; word < last_word; ++word) {
+			if (m_data[word] != 0) {
+				return true;
+			}
+		}
+		return (m_data[last_word] & end_mask) != 0;
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
