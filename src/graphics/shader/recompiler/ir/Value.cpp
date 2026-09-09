@@ -1,10 +1,16 @@
 #include "graphics/shader/recompiler/ir/Value.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+[[noreturn]] void Inst::InvalidArgIndex(size_t index) const {
+	EXIT("shader IR operand index %zu exceeds argument count %zu", index, args.size());
+	std::abort();
+}
 
 Value::Value(Inst* value): type(Type::Opaque), inst(value) {}
 Value::Value(ScalarReg value): type(Type::ScalarReg), scalar_reg(value) {}
@@ -25,48 +31,14 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
-bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
-Type Value::GetType() const {
-	if (IsPhi()) {
-		return inst->Flags<Type>();
-	}
-	if (IsIdentity()) {
-		return inst->Arg(0).GetType();
-	}
-	return type == Type::Opaque ? inst->GetType() : type;
-}
-
 Inst* Value::Instruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return inst;
 }
 
-Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
 Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -79,39 +51,9 @@ VectorReg Value::VectorRegister() const {
 	return vector_reg;
 }
 
-bool Value::U1() const {
-	EXIT_IF(type != Type::U1);
-	return imm_u1;
-}
-
-uint8_t Value::U8() const {
-	EXIT_IF(type != Type::U8);
-	return imm_u8;
-}
-
-uint16_t Value::U16() const {
-	EXIT_IF(type != Type::U16);
-	return imm_u16;
-}
-
-uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
-}
-
-uint64_t Value::U64() const {
-	EXIT_IF(type != Type::U64);
-	return imm_u64;
-}
-
 uint16_t Value::F16Bits() const {
 	EXIT_IF(type != Type::F16);
 	return imm_u16;
-}
-
-float Value::F32Value() const {
-	EXIT_IF(type != Type::F32);
-	return std::bit_cast<float>(imm_u32);
 }
 
 bool Value::operator==(const Value& other) const {
@@ -146,10 +88,6 @@ Inst::~Inst() {
 	ClearArgs();
 }
 
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
 Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
@@ -172,17 +110,8 @@ size_t Inst::UseCount() const {
 	return uses.size();
 }
 
-size_t Inst::NumArgs() const {
-	return args.size();
-}
-
 size_t Inst::NumPhiBlocks() const {
 	return phi_blocks.size();
-}
-
-Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= args.size());
-	return args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {
