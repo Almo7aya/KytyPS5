@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <fmt/format.h>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -491,14 +492,42 @@ private:
 		if (inst == nullptr) {
 			return false;
 		}
+		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
+		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+			return EvaluateWide(inst->Arg(1), result);
+		}
+		if (const auto index = inst->PlanIndex(); index != UINT32_MAX) {
+			EXIT_IF(index >= m_program.value_storage.size());
+			if (!m_values) {
+				const auto count = m_program.value_storage.size();
+				m_values = std::make_unique_for_overwrite<uint64_t[]>(count + (count + 7u) / 8u);
+				m_value_states = reinterpret_cast<unsigned char*>(m_values.get() + count);
+				std::memset(m_value_states, static_cast<unsigned char>(EvaluationState::Empty),
+				            count);
+			}
+			auto& state = m_value_states[index];
+			if (state == static_cast<unsigned char>(EvaluationState::Ready)) {
+				result = m_values[index];
+				return true;
+			}
+			if (state == static_cast<unsigned char>(EvaluationState::Visiting)) {
+				return false;
+			}
+			state                = static_cast<unsigned char>(EvaluationState::Visiting);
+			uint64_t   out       = 0;
+			const bool evaluated = EvaluateInst(*inst, out);
+			if (evaluated) {
+				result = m_values[index] = out;
+			}
+			state = static_cast<unsigned char>(evaluated ? EvaluationState::Ready
+			                                             : EvaluationState::Empty);
+			return evaluated;
+		}
+		// Values in a mutable program use the general pointer-keyed cache.
 		if (!m_reserved) {
 			m_cache.reserve(m_program.value_storage.size());
 			m_visiting.reserve(m_program.value_storage.size());
 			m_reserved = true;
-		}
-		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
-		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
-			return EvaluateWide(inst->Arg(1), result);
 		}
 		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
 			result = found->second;
@@ -956,11 +985,17 @@ private:
 		return false;
 	}
 
-	const ResourcePlan&                       m_program;
-	const SrtRuntime&                         m_runtime;
-	std::span<const uint8_t>                  m_clean_flat_slots;
-	Evaluator*                                m_clean_evaluator = nullptr;
-	Value                                     m_active_mask;
+	const ResourcePlan&      m_program;
+	const SrtRuntime&        m_runtime;
+	std::span<const uint8_t> m_clean_flat_slots;
+	Evaluator*               m_clean_evaluator = nullptr;
+	Value                    m_active_mask;
+	enum class EvaluationState : uint8_t { Empty, Visiting, Ready };
+	// Each evaluator owns fresh values, including a separate cache for clean reads.
+	// Packed state bytes follow the value array in the same allocation. Only states need
+	// initialization: a value is written before its state can become Ready.
+	std::unique_ptr<uint64_t[]>               m_values;
+	unsigned char*                            m_value_states = nullptr;
 	std::unordered_map<const Inst*, uint64_t> m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;

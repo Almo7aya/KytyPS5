@@ -903,6 +903,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		EXIT_IF(plan.value_storage.size() > UINT32_MAX);
+		target.SetPlanIndex(static_cast<uint32_t>(plan.value_storage.size() - 1));
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {
