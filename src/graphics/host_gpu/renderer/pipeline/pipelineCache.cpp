@@ -633,6 +633,12 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+void PipelineCache::PipelineKeyHash::MixStaticParams(std::size_t&                    hash,
+                                                     const PipelineStaticParameters& params) {
+	// The packed state is also compared byte-for-byte by operator==.
+	Mix(hash, XXH3_64bits(&params, sizeof(params)));
+}
+
 PipelineCache::Pipeline& PipelineCache::CreateGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,

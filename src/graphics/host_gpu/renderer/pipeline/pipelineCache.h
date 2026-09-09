@@ -169,12 +169,7 @@ private:
 			        (hash >> 2u);
 		}
 
-		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
-		}
+		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params);
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
 			Mix(hash, rendering.color_count);
