@@ -145,9 +145,10 @@ public:
 	}
 
 private:
-	void AddUse(Inst* used, size_t operand);
-	void RemoveUse(Inst* used, size_t operand);
-	void ClearArgs();
+	void              AddUse(Inst* used, size_t operand);
+	void              RemoveUse(Inst* used, size_t operand);
+	void              ClearArgs();
+	[[noreturn]] void InvalidArgIndex(size_t index) const;
 
 	ValueOpcode         opcode;
 	uint64_t            flags;
@@ -156,5 +157,89 @@ private:
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
 };
+
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Type Value::GetType() const {
+	auto value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	if (value.IsPhi()) {
+		return value.inst->Flags<Type>();
+	}
+	return value.type == Type::Opaque ? value.inst->GetType() : value.type;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Value Value::Resolve() const {
+	auto value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
+
+inline bool Value::U1() const {
+	EXIT_IF(type != Type::U1);
+	return imm_u1;
+}
+
+inline uint8_t Value::U8() const {
+	EXIT_IF(type != Type::U8);
+	return imm_u8;
+}
+
+inline uint16_t Value::U16() const {
+	EXIT_IF(type != Type::U16);
+	return imm_u16;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline uint64_t Value::U64() const {
+	EXIT_IF(type != Type::U64);
+	return imm_u64;
+}
+
+inline float Value::F32Value() const {
+	EXIT_IF(type != Type::F32);
+	return std::bit_cast<float>(imm_u32);
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return args.size();
+}
+
+inline Value Inst::Arg(size_t index) const {
+	if (index >= args.size()) [[unlikely]] {
+		InvalidArgIndex(index);
+	}
+	return args[index];
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
