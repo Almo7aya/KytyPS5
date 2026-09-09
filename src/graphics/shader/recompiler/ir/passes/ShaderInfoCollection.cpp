@@ -369,6 +369,22 @@ void CollectShaderInfo(Program& program, const ShaderInfoOptions& options) {
 	auto next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
+	// Specialization can eliminate address loads used only to build CPU descriptors. Keep
+	// BDA preparation and fault tracking only when the emitted shader still accesses addresses.
+	next.uses_dma = false;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::None) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				return Fail("address operation has invalid memory metadata");
+			}
+			const auto& memory = program.memory_info[index];
+			next.uses_dma |= !memory.planning_only && memory.kind != ResourceKind::Scratch;
+		}
+	}
 	next.has_bitwise_xor =
 	    std::any_of(program.blocks.begin(), program.blocks.end(), [](const auto* block) {
 		    return std::any_of(block->begin(), block->end(), [](const auto& inst) {
