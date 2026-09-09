@@ -57,6 +57,14 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	{
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		// A new mapping can replace a reservation that has never been GPU-visible.
+		// There is no work or cached ownership to retire for an entirely unmapped span.
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	const auto unmap = [this, vaddr, size] {
 		if (m_scheduler.Active()) {
 			const auto tick = m_scheduler.CurrentTick();
