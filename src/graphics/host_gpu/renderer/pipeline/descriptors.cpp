@@ -1005,15 +1005,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
 					EXIT_IF(storage || host_view == image.views.end());
 					const auto aspect = host_view->info.aspect;
-					const bool depth_feedback =
-					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
-					    program.stage == ShaderType::Pixel;
+					const bool feedback =
+					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
 					const bool depth_read =
-					    depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+					    feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
 					const bool stencil_read =
-					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+					    feedback || layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
 					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||
