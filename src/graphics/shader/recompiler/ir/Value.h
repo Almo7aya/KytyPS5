@@ -120,9 +120,11 @@ public:
 	[[nodiscard]] Value                   Arg(size_t index) const;
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
+	[[nodiscard]] uint32_t                PlanIndex() const { return plan_index; }
 	[[nodiscard]] const std::vector<Use>& Uses() const;
 
 	void SetParent(Block* block);
+	void SetPlanIndex(uint32_t index) { plan_index = index; }
 	void SetArg(size_t index, Value value);
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
@@ -150,7 +152,9 @@ private:
 	void              ClearArgs();
 	[[noreturn]] void InvalidArgIndex(size_t index) const;
 
-	ValueOpcode         opcode;
+	ValueOpcode opcode;
+	// Assigned only to immutable values cloned into a resource plan.
+	uint32_t            plan_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;
