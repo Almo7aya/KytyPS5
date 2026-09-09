@@ -1012,6 +1012,10 @@ void WindowContext::UpdateTitle() {
 		              static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+	} else if (frame_num != 1) {
+		// Refresh statistics once per second instead of waiting for the UI thread
+		// on every presented frame. Keep counting every frame above.
+		return;
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
