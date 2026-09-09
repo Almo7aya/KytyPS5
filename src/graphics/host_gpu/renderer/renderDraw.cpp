@@ -1183,7 +1183,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.vs_input_info, state.color_info,
 	                         state.color_count, state.depth_info);
-	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+	if (m_context.GetGraphics().attachment_feedback_loop_dynamic_enabled) {
 		const auto& attachment = rendering.depth_stencil_attachment;
 		vk::ImageAspectFlags feedback_aspects {};
 		if (attachment.image_layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT) {
