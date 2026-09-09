@@ -208,14 +208,24 @@ void CommandScheduler::Wait(uint64_t tick) {
 }
 
 void CommandScheduler::PopPendingOperations() {
-	m_master.Refresh();
+	bool refreshed = false;
 	for (;;) {
 		PendingOperation operation;
 		{
-			std::lock_guard lock(m_operation_mutex);
-			if (m_pending_operations.empty() ||
-			    !m_master.IsFree(m_pending_operations.front().tick)) {
+			std::unique_lock lock(m_operation_mutex);
+			if (m_pending_operations.empty()) {
 				return;
+			}
+			if (!m_master.IsFree(m_pending_operations.front().tick)) {
+				if (refreshed) {
+					return;
+				}
+				// Draws without pending retirements need no driver query. Refresh only
+				// when a queued operation depends on completion not yet observed.
+				lock.unlock();
+				m_master.Refresh();
+				refreshed = true;
+				continue;
 			}
 			operation = std::move(m_pending_operations.front());
 			m_pending_operations.pop();
