@@ -4,6 +4,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -121,6 +123,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
@@ -537,6 +540,59 @@ private:
 	std::vector<Patch> m_patches;
 };
 
+// Entries live only for one evaluation. Open addressing avoids allocating a
+// node for each IR value; entries are never evicted, including on hash collision.
+class EvaluationCache {
+public:
+	void Reserve(size_t expected) {
+		m_entries.resize(std::bit_ceil(std::max<size_t>(16, expected * 2)));
+	}
+	bool Find(const Inst* inst, uint64_t& result) {
+		if (m_entries.empty()) m_entries.resize(16);
+		const auto slot = FindSlot(inst);
+		if (m_entries[slot].inst == nullptr) {
+			return false;
+		}
+		result = m_entries[slot].value;
+		return true;
+	}
+	void Insert(const Inst* inst, uint64_t value) {
+		if ((m_size + 1) * 2 >= m_entries.size()) {
+			auto old = std::move(m_entries);
+			m_entries.resize(old.size() * 2);
+			for (const auto& entry: old) {
+				if (entry.inst != nullptr) {
+					m_entries[FindSlot(entry.inst)] = entry;
+				}
+			}
+		}
+		auto& entry = m_entries[FindSlot(inst)];
+		if (entry.inst == nullptr) {
+			++m_size;
+		}
+		entry = {inst, value};
+	}
+private:
+	struct Entry {
+		const Inst* inst = nullptr;
+		uint64_t value = 0;
+	};
+	size_t FindSlot(const Inst* inst) const {
+		auto hash = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(inst)) >> 4;
+		hash ^= hash >> 32;
+		hash *= 0x9e3779b97f4a7c15ull;
+		hash ^= hash >> 29;
+		const auto mask = m_entries.size() - 1;
+		auto slot = static_cast<size_t>(hash) & mask;
+		while (m_entries[slot].inst != nullptr && m_entries[slot].inst != inst) {
+			slot = (slot + 1) & mask;
+		}
+		return slot;
+	}
+	std::vector<Entry> m_entries;
+	size_t m_size = 0;
+};
+
 class Evaluator {
 public:
 	Evaluator(const ResourcePlan& program, const SrtRuntime& runtime,
@@ -562,7 +618,6 @@ private:
 	static uint64_t Float32Bits(float value) { return std::bit_cast<uint32_t>(value); }
 
 	bool EvaluateWide(Value value, uint64_t& result) {
-		value = value.Resolve();
 		if (value.IsImmediate()) {
 			switch (value.GetType()) {
 				case Type::U1: result = value.U1(); return true;
@@ -579,16 +634,16 @@ private:
 			return false;
 		}
 		if (!m_reserved) {
-			m_cache.reserve(m_program.value_storage.size());
-			m_visiting.reserve(m_program.value_storage.size());
+			// Most draws evaluate only the descriptor slice of a much larger IR.
+			m_cache.Reserve(std::min<size_t>(m_program.value_storage.size(), 256));
+			m_visiting.reserve(std::min<size_t>(m_program.value_storage.size(), 64));
 			m_reserved = true;
 		}
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
 		    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 			return EvaluateWide(inst->Arg(1), result);
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		if (m_cache.Find(inst, result)) {
 			return true;
 		}
 		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
@@ -601,7 +656,7 @@ private:
 		if (!evaluated) {
 			return false;
 		}
-		m_cache.emplace(inst, out);
+		m_cache.Insert(inst, out);
 		result = out;
 		return true;
 	}
@@ -721,6 +776,7 @@ private:
 			return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 		};
 		switch (inst.GetOpcode()) {
+			case ValueOpcode::Identity: return Arg(inst, 0, result);
 			case ValueOpcode::GetUserData: {
 				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 				if (reg < m_program.user_data_base ||
@@ -1031,6 +1087,12 @@ private:
 					return true;
 				}
 				return false;
+			case ValueOpcode::UGreaterThanEqual32:
+				if (binary()) {
+					result = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
+					return true;
+				}
+				return false;
 			case ValueOpcode::LogicalAnd:
 				if (binary()) {
 					result = (a != 0u) && (b != 0u);
@@ -1070,7 +1132,7 @@ private:
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	Value                                     m_active_mask;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	EvaluationCache                           m_cache;
 	std::vector<const Inst*>                  m_visiting;
 	bool                                      m_reserved = false;
 };

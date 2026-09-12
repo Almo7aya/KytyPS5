@@ -69,6 +69,10 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
+uint32_t LdsStorageDwordCount(const EmitterState& state) {
+	return state.compact_lds_dwords != 0 ? state.compact_lds_dwords : LdsDwordCount(state);
+}
+
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
@@ -166,6 +170,9 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index) {
 	if (access.kind == IR::ResourceKind::Lds || access.kind == IR::ResourceKind::Scratch) {
+		if (access.kind == IR::ResourceKind::Lds && state.compact_lds_dwords != 0) {
+			index = ConstantU32(state, state.function_lds_index_slots.at(index));
+		}
 		const auto pointer = state.builder.AllocateId();
 		const auto storage_class = access.kind == IR::ResourceKind::Scratch ? StorageClassFunction
 		                           : ShaderWorkgroupInput(state.stage, state.input_info) != nullptr

@@ -244,6 +244,11 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.sampler_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
 	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::LodStats) != nullptr) {
+		state.lod_stats_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
+		                                                        StorageClassStorageBuffer);
+		state.builder.RequireCapability(CapabilityImageQuery);
+	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Gds) != nullptr) {
 		state.gds_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
 		                                                        StorageClassStorageBuffer);
@@ -384,6 +389,11 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	if (state.lod_stats_subgroup) {
+		state.lod_helper_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.lod_helper_variable);
+	}
+
 	if (state.lane_count == 2) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
@@ -489,6 +499,12 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 }
 
 void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.lod_helper_variable != 0) {
+		state.builder.AddName(state.lod_helper_variable, "gl_HelperInvocation");
+		state.builder.AddAnnotation({OpDecorate, state.lod_helper_variable,
+		                             DecorationBuiltIn, BuiltInHelperInvocation});
+	}
+
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddName(state.subgroup_local_invocation_id_variable,
 		                      "gl_SubgroupInvocationID");
@@ -614,6 +630,9 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
 	}
+	if (state.lod_stats_variable != 0) {
+		Decorate(state.lod_stats_variable, "lod_stats", IR::DescriptorBindingKind::LodStats);
+	}
 	if (state.gds_variable != 0) {
 		Decorate(state.gds_variable, "gds", IR::DescriptorBindingKind::Gds);
 	}
@@ -688,6 +707,11 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
+	if (state.lod_stats_subgroup) {
+		state.builder.RequireCapability(CapabilityGroupNonUniform);
+		state.builder.RequireCapability(CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic);
+	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
@@ -760,6 +784,10 @@ void DefineModule(EmitterState& state) {
 		for (uint32_t half = 0; half < state.lane_count; half++) {
 			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
 		}
+	}
+	if (state.lod_helper_variable != 0) {
+		state.builder.DefineGlobalVariable(state.lod_helper_variable,
+		    TypePointer(state, StorageClassInput, TypeBool(state)), StorageClassInput);
 	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);

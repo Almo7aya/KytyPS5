@@ -236,10 +236,22 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 	});
 }
 
-uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
+uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                     bool include_base_low_bits = true) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		return BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
-		                         ctx.Arg(inst, 3));
+		const auto address = BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1), ctx.Arg(inst, 2),
+		                                      ctx.Arg(inst, 3));
+		if (!include_base_low_bits || !ctx.state.program.info.buffers[mem.resource].byte_base_offset)
+			return address;
+		// The host descriptor is aligned down. Its whole-dword displacement is
+		// added by EmitMemoryElementIndex; preserve the remaining byte displacement
+		// BEFORE selecting a dword or extracting a byte, including carry into the
+		// next dword. Scalar buffer reads deliberately ignore these base bits.
+		const auto resource = ResourceForDescriptor(ctx.state, IR::DescriptorBindingKind::Buffers,
+		                                            mem.resource);
+		const auto low = Binary(ctx.state, OpBitwiseAnd, TypeU32(ctx.state),
+		                        ctx.state.memory_byte_offsets[resource], ConstantU32(ctx.state, 3));
+		return Binary(ctx.state, OpIAdd, TypeU32(ctx.state), address, low);
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {
@@ -255,8 +267,13 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 }
 
 uint32_t DwordIndex(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
-	return Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state), ByteAddress(ctx, inst, mem),
-	              ConstantU32(ctx.state, 2));
+	const auto index = Binary(ctx.state, OpShiftRightLogical, TypeU32(ctx.state),
+	                          ByteAddress(ctx, inst, mem), ConstantU32(ctx.state, 2));
+	if (const auto slot = ctx.state.function_lds_slots.find(&inst);
+	    slot != ctx.state.function_lds_slots.end()) {
+		ctx.state.function_lds_index_slots.emplace(index, slot->second);
+	}
+	return index;
 }
 
 struct PreparedMemoryElement {
@@ -656,7 +673,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
 		    const auto byte_address = Binary(state, OpIAdd, TypeU32(state),
-		                                     ByteAddress(ctx, inst, mem), resource.byte_offset);
+		                                     ByteAddress(ctx, inst, mem, false), resource.byte_offset);
 		    const auto index = Binary(state, OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(

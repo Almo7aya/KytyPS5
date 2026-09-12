@@ -65,7 +65,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::LodStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -148,8 +149,13 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if ((resource.atomic && adjustment % sizeof(uint32_t) != 0) ||
+	    adjustment >= 256 || size > max_range - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported: stage=%s slot=%u "
+		     "guest=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64
+		     " alignment=0x%" PRIx64 " adjustment=0x%" PRIx64 " max=0x%" PRIx64 "\n",
+		     ShaderStageResourceName(stage), slot, address, size, offset,
+		     static_cast<uint64_t>(alignment), adjustment, static_cast<uint64_t>(max_range));
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
@@ -887,6 +893,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	for (uint32_t i = 0; i < layout.lod_stats_count; ++i) {
+		const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+		prepared.shader_data[layout.LodStatsDword() + i] = desc.MipStatsCntEn()
+		    ? (0x80000000u | desc.MipStatsCntId() | (uint32_t(desc.BaseLevel()) << 8u) |
+		       (uint32_t(desc.MinLodWarn5()) << 12u)) : 0u;
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -1130,6 +1142,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							m_descriptor_buffers.push_back(view);
 						}
 						break;
+					case BindingKind::LodStats: {
+						const auto* buffer = m_context.GetBufferCache().GetLodStatsBuffer();
+						m_descriptor_buffers.emplace_back(buffer->Handle(), 0, buffer->Size());
+						break;
+					}
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
 						auto&       cache      = m_context.GetBufferCache();

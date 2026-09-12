@@ -49,6 +49,8 @@ enum : uint32_t {
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
+	CapabilityGroupNonUniformVote            = 62,
+	CapabilityGroupNonUniformArithmetic      = 63,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityShaderLayer                    = 69,
@@ -98,6 +100,7 @@ enum : uint32_t {
 	BuiltInSampleId                  = 18,
 	BuiltInSampleMask                = 20,
 	BuiltInFragDepth                 = 22,
+	BuiltInHelperInvocation          = 23,
 	BuiltInWorkgroupId               = 26,
 	BuiltInLocalInvocationId         = 27,
 	BuiltInGlobalInvocationId        = 28,
@@ -274,6 +277,10 @@ enum : uint32_t {
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
+	OpGroupNonUniformElect         = 333,
+	OpGroupNonUniformAllEqual      = 336,
+	OpGroupNonUniformIAdd          = 349,
+	OpGroupNonUniformUMin          = 354,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
@@ -372,11 +379,17 @@ struct EmitterState {
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         lod_stats_variable      = 0;
+	bool                                             lod_stats_subgroup      = false;
+	uint32_t                                         lod_helper_variable     = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         compact_lds_dwords      = 0;
+	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
+	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -656,6 +669,7 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+uint32_t LdsStorageDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind kind             = IR::ResourceKind::None;

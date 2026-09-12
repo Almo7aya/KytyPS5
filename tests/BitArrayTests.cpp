@@ -246,6 +246,22 @@ void TestRandomizedDifferential() {
   }
 }
 
+void TestAnyInRange() {
+  Bits bits;
+  Check(!bits.AnyInRange(0, 0) && !bits.AnyInRange(128, 129) &&
+        !bits.AnyInRange(65, 64), "invalid/empty interval was not empty");
+  for (size_t bit = 0; bit < 128; ++bit) {
+    bits.Clear();
+    bits.Set(bit);
+    for (size_t start = 0; start <= 128; ++start) {
+      for (size_t end = start; end <= 128; ++end) {
+        Check(bits.AnyInRange(start, end) == (start <= bit && bit < end),
+              "single set bit range query mishandled an endpoint");
+      }
+    }
+  }
+}
+
 void TestTrackerSizedRandomizedDifferential() {
   using TrackerBits = Common::BitArray<1024>;
   TrackerBits bits;
@@ -278,6 +294,14 @@ void TestTrackerSizedRandomizedDifferential() {
             "tracker-sized randomized bit state diverged");
     }
 
+    const auto query_begin = static_cast<size_t>(next_random() % reference.size());
+    const auto query_end = query_begin + 1 +
+        static_cast<size_t>(next_random() % (reference.size() - query_begin));
+    bool any = false;
+    for (auto index = query_begin; index < query_end; ++index) any |= reference[index];
+    Check(bits.AnyInRange(query_begin, query_end) == any,
+          "tracker-sized range query differed from reference bits");
+
     size_t expected = 0;
     for (const auto [begin, end] : bits) {
       while (expected < reference.size() && !reference[expected]) {
@@ -301,6 +325,7 @@ void TestTrackerSizedRandomizedDifferential() {
 
 int main() {
   TestPointAndRangeOperations();
+  TestAnyInRange();
   TestMaskedConstructionAndBitwiseOperations();
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();

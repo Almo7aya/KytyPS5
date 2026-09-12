@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -11,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cstring>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -178,7 +180,8 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, uint32_t *value) {
 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+                         bool memory_backed_material = false,
+                         bool immediate_member = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -225,7 +228,7 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   material_scalar.kind = ResourceKind::ScalarBuffer;
   material_scalar.offset = material_immediate;
   const auto key =
-      fixture->Emit(ValueOpcode::ReadConstBuffer, {material, member},
+      fixture->Emit(ValueOpcode::ReadConstBuffer, {material, immediate_member ? record : member},
                     fixture->AddMemory(material_scalar, 0x10d8));
   const auto heap_offset =
       fixture->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
@@ -708,6 +711,74 @@ void TestRuntimeUnsignedMinDescriptor() {
       EvaluateDescriptorSource(fixture.program, source, runtime, value) &&
           value.dwords[3] == 0x80u,
       "runtime descriptor unsigned minimum did not preserve its first operand");
+}
+
+void TestRuntimeUnsignedGreaterEqual() {
+  Fixture fixture;
+  const auto predicate = fixture.Emit(ValueOpcode::UGreaterThanEqual32,
+                                      {fixture.UserData(0), fixture.UserData(1)});
+  BuildSrtPlan(fixture.program);
+  Check(ValidateRuntimeValue(fixture.program, predicate),
+        "uniform unsigned >= must be accepted by runtime descriptor evaluation");
+  const std::array<std::array<uint32_t, 3>, 5> cases{{
+      {0u, 0u, 1u}, {0u, 1u, 0u}, {1u, 0u, 1u},
+      {0xffffffffu, 0x80000000u, 1u}, {0x7fffffffu, 0x80000000u, 0u}}};
+  for (const auto& item : cases) {
+    SrtRuntime runtime{.user_data = std::span(item.data(), 2)};
+    uint32_t value = 42;
+    Check(EvaluateUniformValues(fixture.program, std::span(&predicate, 1), runtime,
+                                std::span(&value, 1)) && value == item[2],
+          "runtime unsigned >= must preserve equality and unsigned high-bit ordering");
+  }
+}
+
+void TestLargeRuntimeEvaluation() {
+  Fixture fixture;
+  const auto input = fixture.UserData(0);
+  std::vector<Value> values;
+  constexpr uint32_t count = 4096;
+  for (uint32_t i = 0; i < count; ++i) {
+    values.push_back(fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)}));
+    if (i % 16 == 0) {
+      values.back() = fixture.Emit(ValueOpcode::Identity, {values.back()});
+    }
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    values.push_back(values[count - i - 1]);
+  }
+  BuildSrtPlan(fixture.program);
+  std::vector<uint32_t> result(values.size());
+  for (uint32_t input_value : {17u, 0xffffff00u}) {
+    Check(EvaluateUniformValues(fixture.program, values,
+                                {.user_data = std::span(&input_value, 1)}, result),
+          "large runtime evaluation failed after cache growth");
+    for (uint32_t i = 0; i < count; ++i) {
+      Check(result[i] == input_value + i &&
+                result[count + i] == input_value + count - i - 1,
+            "runtime cache lost a value or retained data from a previous draw");
+    }
+  }
+}
+
+void TestExtractedRuntimeEvaluation() {
+  Fixture fixture;
+  const auto input = fixture.UserData(0);
+  constexpr uint32_t count = 4096;
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto value = fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)});
+    fixture.program.srt_reads.push_back({value, i});
+  }
+  fixture.program.srt_plan_complete = true;
+  auto plan = ExtractResourcePlan(fixture.program);
+  std::vector<uint32_t> result;
+  for (uint32_t input_value : {17u, 0xffffff00u}) {
+    Check(WalkSrt(plan, {.user_data = std::span(&input_value, 1)}, result),
+          "extracted runtime evaluation failed");
+    Check(result.size() == count, "extracted runtime evaluation lost outputs");
+    for (uint32_t i = 0; i < count; ++i) {
+      Check(result[i] == input_value + i, "extracted runtime cache returned stale data");
+    }
+  }
 }
 
 void TestImagesSamplersAndAliases() {
@@ -1317,7 +1388,8 @@ struct WaterfallFixture {
   WaterfallFixture(uint32_t one = 1u, uint32_t lane_mask = 31u,
                    ValueOpcode clear = ValueOpcode::BitwiseXor32,
                    bool entry_in_loop = false, bool body = true,
-                   bool ballot_from_key = true) {
+                   bool ballot_from_key = true, bool invert_bit = false,
+                   bool immediate_table = false) {
     auto *entry_block = fixture.block;
     auto *loop = fixture.AddBlock();
     entry_block->AddBranch(loop);
@@ -1340,15 +1412,18 @@ struct WaterfallFixture {
                                      {lsb, Value(lane_mask)}, 0, loop);
     const auto stepped = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
                                       {Value(one), masked}, 0, loop);
-    const auto cleared = fixture.Emit(clear, {stepped, mask}, 0, loop);
+    const auto clear_bit = invert_bit
+        ? fixture.Emit(ValueOpcode::BitwiseNot32, {stepped}, 0, loop)
+        : stepped;
+    const auto cleared = fixture.Emit(clear, {clear_bit, mask}, 0, loop);
     if (body) {
       fixture.Emit(ValueOpcode::IEqual32, {lsb, key}, 0, loop);
       const auto scaled = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
                                        {lsb, Value(5u)}, 0, loop);
       const auto based =
-          fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x158u)}, 0, loop);
+          immediate_table ? scaled : fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x158u)}, 0, loop);
       const auto second =
-          fixture.Emit(ValueOpcode::IAdd32, {Value(16u), based}, 0, loop);
+          immediate_table ? based : fixture.Emit(ValueOpcode::IAdd32, {Value(16u), based}, 0, loop);
       std::array<Value, 8> dwords{};
       for (uint32_t index = 0; index < dwords.size(); index++) {
         const auto address = fixture.Address(fixture.UserData(0),
@@ -1356,7 +1431,8 @@ struct WaterfallFixture {
         dwords[index] = fixture.Emit(
             ValueOpcode::LoadAddressU32,
             {address, index < 4u ? based : second, Value(0u), Value(true)},
-            MemoryFlags{0, 0x118}, loop);
+            immediate_table ? fixture.AddMemory(MemoryInfo{.kind = ResourceKind::ScalarAddress, .offset = 0x158u + index * 4u}, 0x118)
+                            : MemoryFlags{0, 0x118}, loop);
       }
       fixture.Emit(ValueOpcode::GetImageResource,
                    {dwords[0], dwords[1], dwords[2], dwords[3], dwords[4],
@@ -1783,7 +1859,8 @@ void TestFindLsbDenseIndirectImage() {
   }
 }
 
-void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
+void TestReadLaneProbeIndirectImage(bool first_lane = false, bool loop_mask = false,
+                                    bool invalid_mask = false) {
   Fixture fixture;
   const auto low = fixture.UserData(0);
   const auto high = fixture.UserData(1);
@@ -1816,8 +1893,19 @@ void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
   const auto lane = fixture.Emit(
       ValueOpcode::BitwiseAnd32,
       {fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(5)}), Value(63u)});
-  const auto key = fixture.Emit(
-      readlane, {per_lane, readlane == ValueOpcode::ReadLane ? lane : Value(true)});
+  Value active = invalid_mask ? other : enable;
+  if (loop_mask) {
+    auto* entry = fixture.block;
+    auto* loop = fixture.AddBlock();
+    fixture.block = loop;
+    auto& phi = loop->AppendNewInst(ValueOpcode::Phi, {});
+    active = Value(&phi);
+    const auto carried = fixture.Emit(ValueOpcode::LogicalAnd, {active, other});
+    phi.AddPhiOperand(entry, invalid_mask ? other : enable);
+    phi.AddPhiOperand(loop, carried);
+  }
+  const auto key = fixture.Emit(first_lane ? ValueOpcode::ReadFirstLane : ValueOpcode::ReadLane,
+                                {per_lane, first_lane ? active : lane});
   const auto scaled =
       fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
   const auto based = fixture.Emit(ValueOpcode::IAdd32, {scaled, Value(0x20e0u)});
@@ -1849,6 +1937,12 @@ void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
                                 0x1aec),
                 fixture.ImageAddress()},
                fixture.AddMemory(memory, 0x1aec));
+  if (invalid_mask) {
+    CheckFatal([&] { fixture.PlanAndTrack(); },
+               "first-lane mask does not retain the key load enable",
+               "first-lane probe accepted an inactive load branch");
+    return;
+  }
   fixture.PlanAndTrack();
 
   Check(fixture.program.info.images.size() == 1,
@@ -1910,13 +2004,6 @@ void TestReadLaneProbeIndirectImageWith(ValueOpcode readlane) {
   }
 }
 
-void TestReadLaneProbeIndirectImage() {
-  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadLane);
-}
-
-void TestReadFirstLaneProbeIndirectImage() {
-  TestReadLaneProbeIndirectImageWith(ValueOpcode::ReadFirstLane);
-}
 
 void TestWaterfallDescriptorMatch() {
   WaterfallFixture built;
@@ -1932,6 +2019,54 @@ void TestWaterfallDescriptorMatch() {
             matches[0].handle->GetOpcode() == ValueOpcode::GetImageResource &&
             !matches[0].heap.IsEmpty(),
         "waterfall descriptor table was extracted incorrectly");
+}
+
+void TestWaterfallImmediateTable() {
+  WaterfallFixture built(1u, 31u, ValueOpcode::BitwiseAnd32, false, true, true, true, true);
+  const auto matches = FindWaterfallDescriptors(built.fixture.program);
+  Check(matches.size() == 1 && matches[0].table_offset == 0x158u,
+        "AND-NOT waterfall with scalar-load immediate table was not matched");
+  Check(RewriteWaterfallDescriptors(built.fixture.program) == 1,
+        "immediate table waterfall was not rewritten");
+  Check(matches[0].scaled->Arg(0).Resolve() == built.key.Resolve(),
+        "immediate table still uses the scalar loop index");
+  auto &fixture = built.fixture;
+  built.key.Resolve().TryInstruction()->ReplaceUsesWith(
+      fixture.Emit(ValueOpcode::LaneId));
+  MemoryInfo image;
+  image.kind = ResourceKind::Image;
+  image.image_dimension = Decoder::ImageDimension::Dim2DArray;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {Value(const_cast<Inst *>(matches[0].handle)),
+                fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0xfc),
+                fixture.ImageAddress()}, fixture.AddMemory(image, 0xfc));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1,
+        "immediate waterfall image was not tracked");
+  const auto &source = fixture.program.descriptor_sources[
+      fixture.program.info.images[0].source];
+  Check(source.indirect_image && source.indirect_image->table_offset == 0x158u &&
+            source.indirect_image->key_bound == 32u,
+        "per-lane immediate waterfall did not produce the bounded texture table");
+}
+
+void TestWaterfallAndNotClear() {
+  WaterfallFixture built(1u, 31u, ValueOpcode::BitwiseAnd32, false, true, true, true);
+  Check(FindWaterfallDescriptors(built.fixture.program).size() == 1,
+        "mask & ~lowest_bit waterfall was not matched");
+  Check(RewriteWaterfallDescriptors(built.fixture.program) == 1,
+        "AND-NOT waterfall was not rewritten");
+  Check(built.phi->Arg(0).Resolve().U32() == 1u &&
+            built.phi->Arg(1).Resolve().U32() == 0u,
+        "AND-NOT waterfall does not terminate after one iteration");
+  Check(FindWaterfallDescriptors(
+            WaterfallFixture(1u, 31u, ValueOpcode::BitwiseAnd32).fixture.program)
+            .empty(),
+        "mask & lowest_bit incorrectly matched as clearing the bit");
+  Check(FindWaterfallDescriptors(
+            WaterfallFixture(2u, 31u, ValueOpcode::BitwiseAnd32, false, true, true, true)
+                .fixture.program).empty(),
+        "AND-NOT clearing the wrong bit was accepted");
 }
 
 void TestWaterfallNearMissesRejected() {
@@ -2209,6 +2344,22 @@ void TestBufferSwizzleSpecialization() {
                              changed_specialization) &&
             changed_specialization != specialization,
         "buffer swizzle change did not select a new specialization key");
+
+  user_data[3] ^= 1u << 9u;
+  user_data[0] = 0x4000;
+  Check(MaterializeResources(resource_plan, runtime, changed_snapshot, changed_specialization) &&
+            changed_specialization == specialization,
+        "aligned buffer relocation changed the specialization");
+  user_data[0] = 0x4001;
+  Check(MaterializeResources(resource_plan, runtime, changed_snapshot, changed_specialization) &&
+            changed_specialization != specialization &&
+            changed_specialization.buffers[0].byte_base_offset,
+        "byte-aligned buffer did not enable its low-bit address path");
+  const auto byte_specialization = changed_specialization;
+  user_data[0] = 0x8003;
+  Check(MaterializeResources(resource_plan, runtime, changed_snapshot, changed_specialization) &&
+            changed_specialization == byte_specialization,
+        "different byte offsets unnecessarily created distinct shader variants");
 }
 
 enum class ConditionalBufferUse { Optional, Shared, Loop, Writable };
@@ -2439,6 +2590,36 @@ void TestShaderInfoAndBindingLayout() {
         "binding layout did not collect live typed user-data values");
 }
 
+void TestLodStatsBindingLayout() {
+  for (const auto stage : {ShaderType::Compute, ShaderType::Pixel}) {
+    for (const bool enabled : {false, true}) {
+      for (const uint32_t count : {1u, 64u}) {
+        Fixture f;
+        f.program.stage = stage;
+        f.program.shader_info_complete = true;
+        ImageResource image;
+        image.resource_class = ImageResourceClass::Sampled;
+        image.numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+        image.dimension = Decoder::ImageDimension::Dim2D;
+        f.program.info.images.resize(count, image);
+        AllocateBindings(f.program, 0, enabled);
+        const bool active = enabled && stage == ShaderType::Pixel;
+        Check((FindBinding(f.program.bindings, DescriptorBindingKind::LodStats) != nullptr) == active,
+              "LOD instrumentation leaked into disabled or compute layout");
+        Check(f.program.bindings.ShaderDataDwords() == (active ? count : 0),
+              "LOD metadata allocation does not cover every image");
+        if (active) {
+          Check(f.program.bindings.UsesPushData() == (count <= PushData::DwordCount),
+                "LOD metadata overflow did not switch to shader-data storage");
+          Check((FindBinding(f.program.bindings, DescriptorBindingKind::ShaderData) != nullptr) ==
+                    (count > PushData::DwordCount),
+                "large LOD metadata has no storage descriptor");
+        }
+      }
+    }
+  }
+}
+
 void TestImageBindingAbi() {
   using NumericClass = Libs::Graphics::Prospero::TextureNumericClass;
 
@@ -2450,7 +2631,8 @@ void TestImageBindingAbi() {
             static_cast<uint32_t>(DescriptorBindingKind::FaultBuffer) == 47u &&
             static_cast<uint32_t>(DescriptorBindingKind::FlattenedSrt) == 48u &&
             static_cast<uint32_t>(DescriptorBindingKind::ShaderData) == 49u &&
-            static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u,
+            static_cast<uint32_t>(DescriptorBindingKind::LodStats) == 50u &&
+            static_cast<uint32_t>(DescriptorBindingKind::Count) == 51u,
         "native descriptor binding anchors changed");
 
   const std::array sampled_dimensions{
@@ -2667,9 +2849,75 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+void TestFunctionLdsLayout() {
+  Fixture fixture(ShaderType::Pixel);
+  const auto lane_address = [&]() {
+    return fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                        {fixture.Emit(ValueOpcode::LaneId), Value(2u)});
+  };
+  const auto add_access = [&](uint32_t offset, bool write) {
+    const auto flags = fixture.AddMemory(
+        MemoryInfo{.kind = ResourceKind::Lds, .offset = offset}, 0);
+    return write ? fixture.Emit(ValueOpcode::WriteSharedU32,
+                               {lane_address(), Value(offset), Value(true)}, flags)
+                 : fixture.Emit(ValueOpcode::LoadSharedU32,
+                                {lane_address(), Value(true)}, flags);
+  };
+  const auto high_write = add_access(1280, true);
+  const auto low_write = add_access(0, true);
+  const auto high_read = add_access(1280, false);
+  auto layout = PlanFunctionLdsLayout(fixture.program);
+  Check(layout.dwords == 2 && layout.slots.size() == 3,
+        "private lane-relative LDS must use only the distinct scalar slots");
+  Check(layout.slots.at(high_write.TryInstruction()) == layout.slots.at(high_read.TryInstruction()) &&
+            layout.slots.at(high_write.TryInstruction()) != layout.slots.at(low_write.TryInstruction()),
+        "LDS slot compression must preserve aliases and separate distinct offsets");
+  fixture.program.stage = ShaderType::Compute;
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "workgroup-shared compute LDS must never be made private");
+  fixture.program.stage = ShaderType::Pixel;
+  fixture.program.memory_info[0].offset = 1281;
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "unaligned access must reject the whole private LDS layout");
+  fixture.program.memory_info[0].offset = 1280;
+  auto address = high_read.TryInstruction()->Arg(0).TryInstruction();
+  address->SetArg(1, Value(3u));
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "different lane scale must reject all slots, not partially compact LDS");
+  address->SetArg(1, Value(2u));
+  const auto extra = fixture.AddMemory(MemoryInfo{.kind = ResourceKind::Lds}, 0);
+  fixture.Emit(ValueOpcode::LoadSharedU16, {lane_address(), Value(true)}, extra);
+  Check(PlanFunctionLdsLayout(fixture.program).slots.empty(),
+        "mixed subword accesses must retain the original LDS representation");
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
+    Fixture fixture;
+    const auto input = fixture.UserData(0);
+    constexpr uint32_t count = 1024, repeats = 5000;
+    for (uint32_t i = 0; i < count; ++i) {
+      auto value = fixture.Emit(ValueOpcode::IAdd32, {input, Value(i)});
+      value = fixture.Emit(ValueOpcode::BitwiseAnd32, {value, Value(0xffffu)});
+      fixture.program.srt_reads.push_back({value, i});
+    }
+    fixture.program.srt_plan_complete = true;
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::vector<uint32_t> result;
+    uint64_t checksum = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t iteration = 0; iteration < repeats; ++iteration) {
+      Check(WalkSrt(plan, {.user_data = std::span(&iteration, 1)}, result), "benchmark evaluation failed");
+      checksum += result.back();
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << "SRT nodes=" << plan.value_storage.size() << " batches=" << repeats
+              << " seconds=" << seconds << " checksum=" << checksum << '\n';
+    return 0;
+  }
+
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -2678,9 +2926,11 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("private LDS scalar slots", TestFunctionLdsLayout);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("runtime unsigned greater equal", TestRuntimeUnsignedGreaterEqual);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
@@ -2692,15 +2942,22 @@ int main() {
     Run("phi validation", TestPhiValidation);
     Run("dense indirect images", TestDenseIndirectImageMaterialization);
     Run("loop-bounded dense images", TestLoopBoundedDenseIndirectImage);
-    Run("readlane probe images", TestReadLaneProbeIndirectImage);
-    Run("readfirstlane probe images", TestReadFirstLaneProbeIndirectImage);
+    Run("readlane probe images", [] { TestReadLaneProbeIndirectImage(false); });
+    Run("readfirstlane probe images", [] { TestReadLaneProbeIndirectImage(true); });
+    Run("readfirstlane loop mask", [] { TestReadLaneProbeIndirectImage(true, true); });
+    Run("readfirstlane invalid mask", [] { TestReadLaneProbeIndirectImage(true, false, true); });
+    Run("readfirstlane invalid loop mask", [] { TestReadLaneProbeIndirectImage(true, true, true); });
     Run("lsb-keyed dense images", TestFindLsbDenseIndirectImage);
     Run("waterfall descriptor match", TestWaterfallDescriptorMatch);
+    Run("waterfall AND-NOT clear", TestWaterfallAndNotClear);
+    Run("waterfall immediate table", TestWaterfallImmediateTable);
     Run("waterfall near misses", TestWaterfallNearMissesRejected);
     Run("waterfall rewrite", TestWaterfallRewriteDescalarizes);
     Run("null descriptor path", TestNullDescriptorPathCollapse);
     Run("mixed null descriptor paths", TestMixedNullDescriptorPathsRejected);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
+    Run("large runtime evaluation", TestLargeRuntimeEvaluation);
+    Run("extracted runtime evaluation", TestExtractedRuntimeEvaluation);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
@@ -2710,6 +2967,7 @@ int main() {
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
+    Run("LOD feedback binding layout", TestLodStatsBindingLayout);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);

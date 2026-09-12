@@ -84,23 +84,27 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+	[[nodiscard]] uint64_t CpuModificationEpoch() const {
+		return m_cpu_epoch.load(std::memory_order_acquire);
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return bits.AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}
@@ -112,6 +116,10 @@ public:
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateCpuProtection<!enable>();
+			if constexpr (enable) {
+				// Publish only after dirtiness/protection changes are visible.
+				m_cpu_epoch.fetch_add(1, std::memory_order_release);
+			}
 		} else {
 			UpdateGpuProtection<enable>();
 		}
@@ -120,6 +128,7 @@ public:
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(vaddr, size);
+		if (!GetBits<source>().AnyInRange(start, end)) return;
 		RegionBits mask(GetBits<source>(), start, end);
 		if constexpr (clear) {
 			GetBits<source>().UnsetRange(start, end);
@@ -200,6 +209,7 @@ private:
 
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
+	std::atomic<uint64_t> m_cpu_epoch {1};
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;

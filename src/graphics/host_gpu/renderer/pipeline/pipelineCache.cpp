@@ -184,6 +184,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	if (tools.Validate(spirv)) {
 		return true;
 	}
+	// Fatal validation diagnostics must survive silent shader/printf settings.
+	std::fprintf(stderr, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
+	             label, shader_hash, messages.c_str());
+	std::fflush(stderr);
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
 	std::string          text;
 	disassembler.Disassemble(spirv, &text,
@@ -359,6 +363,7 @@ struct PipelineCache::ProgramCache {
 		}
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
+		options.enable_lod_stats = true;
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
 		options.back_code      = params.back_code;
@@ -638,6 +643,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
+		pixel_info.lod_stats_subgroup = m_graphics.fragment_subgroup_reduction;
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	result.vertex = m_program_cache->Get(vertex_params, vertex_info, push_data_cursor);

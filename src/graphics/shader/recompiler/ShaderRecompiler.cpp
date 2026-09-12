@@ -696,7 +696,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {

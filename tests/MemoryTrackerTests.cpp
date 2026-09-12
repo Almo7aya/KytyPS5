@@ -305,6 +305,44 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestLocalCpuEpochs() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto region = Libs::Graphics::TRACKER_REGION_SIZE;
+  const auto page = harness.page_manager.GetPageSize();
+  auto *memory = Allocate(harness.page_manager, 2 * region / page);
+  const auto allocation = reinterpret_cast<uint64_t>(memory);
+  const auto first = (allocation + region - 1) & ~(region - 1);
+  const auto second = first + region;
+  Check(tracker.CpuModificationEpoch(first, page) == 0,
+        "untracked memory published a CPU epoch");
+  (void)tracker.IsRegionCpuModified(first, page);
+  (void)tracker.IsRegionCpuModified(second, page);
+  const auto initial = tracker.CpuModificationEpoch(first, page);
+  Check(initial != 0,
+        "CPU epoch feature state mismatched");
+  Check(tracker.CpuModificationEpoch(second - 1, 2) == 0,
+        "cross-region query must not be cached");
+  auto upload = [&](uint64_t address) {
+    tracker.ForEachUploadRange(address, page, false,
+                              [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+  };
+  upload(first);
+  upload(second);
+  tracker.MarkRegionAsGpuModified(first, page);
+  tracker.UnmarkRegionAsGpuModified(first, page);
+  tracker.MarkRegionAsCpuModified(second, page);
+  Check(tracker.CpuModificationEpoch(first, page) == initial,
+        "GPU changes or another region invalidated a local CPU epoch");
+  tracker.InvalidateRegion(first, page, []() noexcept {});
+  {
+    Check(tracker.CpuModificationEpoch(first, page) != initial,
+          "CPU invalidation did not publish a local epoch");
+  }
+  tracker.UntrackMemory(allocation, 2 * region);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
@@ -916,6 +954,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestLocalCpuEpochs();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

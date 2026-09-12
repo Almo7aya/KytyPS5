@@ -1492,7 +1492,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     if (i < test.storage_buffer_offsets.size()) {
       offset = test.storage_buffer_offsets[i];
     }
-    Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
+    Require(test.name, "shader data", offset < 256,
             "storage buffer offset is not representable");
     packed_user_data[result.program.bindings.memory_offset_dword + i / 4u] |=
         offset << ((i % 4u) * 8u);
@@ -1536,7 +1536,7 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, bool lod_stats = false) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1561,6 +1561,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
 
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Pixel;
+  options.enable_lod_stats = lod_stats;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
   options.user_data = user_data;
@@ -3547,6 +3548,11 @@ public:
       constexpr uint64_t index_page = BufferCache::CACHING_PAGESIZE;
       constexpr uint64_t index_span = 3 * index_page;
       const uint64_t index_begin = base + index_offset;
+      constexpr uint32_t sync_left_value = 0x35791357;
+      constexpr uint32_t sync_right_value = 0x24682468;
+      std::memcpy(memory + index_offset + 0x100, &sync_left_value, sizeof(uint32_t));
+      std::memcpy(memory + index_offset + 2 * index_page + 0x100,
+                  &sync_right_value, sizeof(uint32_t));
       Require(name, "registered-range empty lookup",
               !cache.IsRegionRegistered(index_begin, index_span) &&
                   !BufferCacheTestAccess::PageOwner(cache, index_begin),
@@ -3578,6 +3584,23 @@ public:
               cache.IsRegionRegistered(index_begin - 1, index_span + 2),
           "indexed lookup mishandled a half-open boundary, gap, or broad "
           "overlap");
+      cache.SynchronizeBuffersInRange(index_begin, index_span);
+      Require(name, "BDA disjoint synchronization",
+              ReadNativeValue(cache.GetBuffer(index_left), 0x100) == sync_left_value &&
+                  ReadNativeValue(cache.GetBuffer(index_right), 0x100) == sync_right_value,
+              "BDA synchronization missed a disjoint registered buffer");
+      // Repeat a broad synchronization, then invalidate only a contained word.
+      cache.SynchronizeBuffersInRange(index_begin, index_span);
+      constexpr uint32_t changed_left_value = 0xabcdef01;
+      cache.InvalidateMemory(index_begin + 0x100, sizeof(uint32_t));
+      std::memcpy(memory + index_offset + 0x100, &changed_left_value, sizeof(uint32_t));
+      cache.SynchronizeBuffersInRange(index_begin + 0x100, sizeof(uint32_t));
+      Require(name, "BDA cached range CPU invalidation",
+              ReadNativeValue(cache.GetBuffer(index_left), 0x100) == changed_left_value,
+              "cached BDA synchronization skipped a new CPU write");
+      cache.InvalidateMemory(index_begin + 0x100, sizeof(uint32_t));
+      std::memcpy(memory + index_offset + 0x100, &sync_left_value, sizeof(uint32_t));
+      cache.SynchronizeBuffersInRange(index_begin, index_span);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
       Require(name, "registered-range merge",
@@ -3599,6 +3622,12 @@ public:
                   (recycled.index == index_right.index &&
                    recycled != index_right),
               "retired Buffer slot was not reused with a new generation");
+      cache.SynchronizeBuffersInRange(index_begin, index_span);
+      Require(name, "BDA synchronization after merge",
+              ReadNativeValue(cache.GetBuffer(index_bridge), 0x100) == sync_left_value &&
+                  ReadNativeValue(cache.GetBuffer(index_bridge), 2 * index_page + 0x100) ==
+                      sync_right_value,
+              "BDA synchronization retained a retired buffer after merging");
       const auto [resolved_left, resolved_left_offset] = cache.ObtainBuffer(
           index_begin + 0x100, sizeof(uint32_t), true, false, index_left);
       const auto [resolved_right, resolved_right_offset] =
@@ -12088,11 +12117,10 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
-  void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
-    const char *name = packed_vertex_color ? "PackedFloatVertexColor"
-                      : depth_feedback ? "DepthAttachmentFeedback"
-                                       : "PolygonModeRasterization";
-    const uint32_t extent = depth_feedback ? 8 : 32;
+  void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false) {
+    const char *name = packed_vertex_color ? "PackedFloatVertexColor" : lod_stats ? "GpuLodStatsFeedback" :
+        (depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization");
+    const uint32_t extent = lod_stats ? lod_extent : (depth_feedback ? 8 : 32);
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x20000;
     EnsureRuntimeContext();
@@ -12130,7 +12158,7 @@ public:
       }
     }
     resources.MapMemory(depth_address, allocation_size);
-    if (depth_feedback) {
+    if (depth_feedback && !lod_stats) {
       depth.desc.type = BindingType::DepthTarget;
       depth.desc.info.data = {depth_address, 256 * extent};
       depth.desc.info.pixel_format = vk::Format::eD32Sfloat;
@@ -12159,7 +12187,7 @@ public:
           ((extent - 1u) >> 2u) | ((extent - 1u) << 14u),
           DstSel(4, 4, 4, 4) |
               (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u),
-          0, 0, 0, 0}};
+          0, lod_stats ? (0x02000000u | (1u << 8u)) : 0u, lod_stats ? 7u : 0u, 0}};
       test.has_user_data = true;
       std::copy_n(descriptor.fields, 8, test.user_data.begin());
       // Each fragment samples its own texel through interpolated screen UVs.
@@ -12167,7 +12195,7 @@ public:
         test.fragment_code.push_back(EncodeVintrp(0, 20 + component, 0, component, 0));
         test.fragment_code.push_back(EncodeVintrp(1, 20 + component, 0, component, 1));
       }
-      test.fragment_code.push_back(EncodeMimg0(0x27, 1));
+      test.fragment_code.push_back(EncodeMimg0(lod_stats ? 0x20 : 0x27, 1));
       test.fragment_code.push_back(EncodeMimg1(0, 20, 0, 2));
       AppendVMovLiteral(&test.fragment_code, 1, 0x3e000000u);
       test.fragment_code.push_back(EncodeVop2(0x03, 1, Vgpr(0), 1));
@@ -12183,7 +12211,7 @@ public:
     test.fragment_code.push_back(packed_vertex_color ? EncodeExp1(0, 1, 2, 3)
                                                     : EncodeExp1(0, 0, 0, 0));
     AppendEnd(&test.fragment_code);
-    auto fragment = CompileFragmentCase(test);
+    auto fragment = CompileFragmentCase(test, lod_stats);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
     const ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
     const ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
@@ -12265,7 +12293,7 @@ public:
       auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, vertex.stage, pixel.stage, true);
       Require(name, "sampled attachment identity",
-              !depth_feedback || bindings.pixel->images[0].image_id == depth.image_id,
+              !depth_feedback || lod_stats || bindings.pixel->images[0].image_id == depth.image_id,
               "the fragment must sample the depth attachment's native image");
       auto &command = scheduler.Current();
       auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
@@ -12307,6 +12335,22 @@ public:
     };
     draw(filled);
     const auto solid_pixels = read_color();
+    if (lod_stats) {
+      std::array<uint8_t, 0x840> report{};
+      auto &buffers = resources.GetBufferCache();
+      buffers.ReportLodStats(report.data(), report.size(), true);
+      uint64_t entry = 0;
+      std::memcpy(&entry, report.data() + 64 + 7 * 8, sizeof(entry));
+      Require(name, "GPU LOD samples", (entry & 0xffffffffu) == extent * extent &&
+          ((entry >> 32u) & 0xffffffu) == extent * extent && (entry >> 56u) == 0,
+          "real pixel samples did not produce the expected count and mip");
+      buffers.ReportLodStats(report.data(), report.size(), true);
+      for (uint32_t i = 0; i < 256; ++i) {
+        std::memcpy(&entry, report.data() + 64 + i * 8, sizeof(entry));
+        Require(name, "GPU LOD reset", entry == (uint64_t{15} << 56u),
+                "unused or reset LOD counter retained a sample");
+      }
+    }
     if (packed_vertex_color) {
       const std::array<float, 4> expected{0.5f, 1.0f, 2.0f, 1.0f};
       const auto center = 4 * ((extent / 2) * extent + extent / 2);
@@ -12316,7 +12360,7 @@ public:
                          expected[component]) < 0.0001f && solid_pixels[component] == 0,
                 "packed vertex color changed channels, clamped HDR, or filled outside the triangle");
       }
-    } else if (depth_feedback) {
+    } else if (depth_feedback && !lod_stats) {
       // Consecutive draws in the same submission must see each earlier depth write.
       draw(filled);
       draw(filled);
@@ -12336,7 +12380,7 @@ public:
                   "depth feedback lost a prior write or the read-only draw changed depth");
         }
       }
-    } else {
+    } else if (!lod_stats) {
       auto &wireframe = pipeline(true, 1, 1);
       Require(name, "pipeline cache", filled.pipeline != wireframe.pipeline &&
                   pipeline(true, 2, 2).pipeline == filled.pipeline &&
@@ -20156,6 +20200,77 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   return test;
 }
 
+TestCase BufferLoadsPreserveByteBaseOffset() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  for (const auto [op, offset, dst] :
+       {std::array<u32, 3>{0x08, 0, 0}, {0x08, 3, 1},
+        {0x0a, 1, 2}, {0x0c, 3, 3}}) {
+    AppendVMovU32(&code, 20, offset);
+    AppendBufferLoadOpcode(&code, op, dst, 20);
+  }
+  for (u32 i = 0; i < 4; ++i) AppendStoreVgpr(&code, i, i + 4);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferLoadsPreserveByteBaseOffset";
+  test.code = std::move(code);
+  test.initial = {0x44332211u, 0x88776655u, 0, 0, 0, 0, 0, 0};
+  test.expected = {0x44332211u, 0x88776655u, 0, 0, 0x22u, 0x55u, 0x4433u, 0x88776655u};
+  test.storage_buffer_offsets = {1, 0};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[0] = 1;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_USHORT,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferByteStorePreservesNeighbours() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0xaau);
+  AppendVMovU32(&code, 20, 1);
+  code.push_back(EncodeMubuf0(0x18u));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferByteStorePreservesNeighbours";
+  test.code = std::move(code);
+  test.initial = {0x44332211u, 0x88776655u};
+  test.expected = {0x44332211u, 0x887766aau};
+  test.storage_buffer_offsets = {3};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[0] = 3;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferUnorm8LoadPreservesByteBaseOffset() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferLoadOpcode(&code, 0x00, 0, 20);
+  AppendVMovU32(&code, 20, 3);
+  AppendBufferLoadOpcode(&code, 0x00, 1, 20);
+  AppendStoreVgpr(&code, 0, 4);
+  AppendStoreVgpr(&code, 1, 5);
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "BufferUnorm8LoadPreservesByteBaseOffset";
+  test.code = std::move(code);
+  test.initial = {0x4433ff11u, 0x88776600u, 0, 0, 0, 0};
+  test.expected = {0x4433ff11u, 0x88776600u, 0, 0, 0x3f800000u, 0};
+  test.storage_buffer_offsets = {1, 0};
+  test.user_data = MakeStructuredStorageBufferData(
+      0, 8, false, BufferFormat(Prospero::BufferFormat::k8UNorm));
+  test.user_data[0] = 1;
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_FORMAT_X, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -24149,13 +24264,13 @@ TestCase ImageD16StoreUnpacksHalfPairs() {
   return test;
 }
 
-void CheckIndirectImageKeySwitch() {
+void CheckIndirectImageKeySwitch(bool lod_stats = false) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
-  program.stage = ShaderType::Compute;
+  program.stage = lod_stats ? ShaderType::Pixel : ShaderType::Compute;
   program.wave_size = 32;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
@@ -24185,7 +24300,7 @@ void CheckIndirectImageKeySwitch() {
   memory.resource = 0;
   memory.sampler = 0;
   memory.dmask = 0xf;
-  memory.image_sample_flags = ShaderRecompiler::Decoder::ImageSampleFlagLod;
+  memory.image_sample_flags = lod_stats ? 0u : ShaderRecompiler::Decoder::ImageSampleFlagLod;
   memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   memory.image_address_components = 3;
   program.memory_info.push_back(memory);
@@ -24223,11 +24338,12 @@ void CheckIndirectImageKeySwitch() {
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
 
-  AllocateBindings(program);
+  AllocateBindings(program, 0, lod_stats);
   ShaderComputeInputInfo compute{};
+  ShaderPixelInputInfo pixel{};
   ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
-                                                    {.compute = &compute});
+      lod_stats ? ShaderStageInputInfo{.pixel = &pixel} : ShaderStageInputInfo{.compute = &compute});
   ValidateSpirv(name, spirv);
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
@@ -24236,9 +24352,15 @@ void CheckIndirectImageKeySwitch() {
   Require(name, "key switch",
           text.find("OpSwitch") != std::string::npos &&
               text.find("OpPhi") != std::string::npos &&
-              CountText(text, "OpImageSampleExplicitLod") == 2 &&
+              CountText(text, lod_stats ? "OpImageSampleImplicitLod" : "OpImageSampleExplicitLod") == 2 &&
               CountText(text, "OpIEqual") == 11,
           "dynamic image key did not use a compact two-sample switch");
+  if (lod_stats) {
+    Require(name, "LOD feedback", CountText(text, "OpImageQueryLod") == 2 &&
+        CountText(text, "OpAtomicUMin") == 2 && CountText(text, "OpAtomicIAdd") == 4,
+        "indirect candidates lack independent LOD feedback instrumentation");
+  }
+  std::printf("[host] indirect image switch LOD=%d SPIR-V valid\n", lod_stats);
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -25319,6 +25441,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
   AddCase(BufferOffsetsUsePackedLaneAndStorageFallback);
+  AddCase(BufferLoadsPreserveByteBaseOffset);
+  AddCase(BufferByteStorePreservesNeighbours);
+  AddCase(BufferUnorm8LoadPreservesByteBaseOffset);
   AddCase(BufferLoadVariants);
   AddCase(BufferLoadDwordx2SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
@@ -29678,6 +29803,17 @@ int main(int argc, char **argv) {
     vulkan.CheckPackedTextureComponents();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--lodstats-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRasterization(true, true);
+    vulkan.CheckRasterization(true, true, 7);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--lodstats-emission-only") == 0) {
+    CheckIndirectImageKeySwitch(false);
+    CheckIndirectImageKeySwitch(true);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {
     CheckErrorDialogLifecycle();
     return 0;
@@ -29771,6 +29907,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-data-storage-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
+    RunCase(&vulkan, BufferLoadsPreserveByteBaseOffset());
+    RunCase(&vulkan, BufferByteStorePreservesNeighbours());
+    RunCase(&vulkan, BufferUnorm8LoadPreservesByteBaseOffset());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
@@ -29922,7 +30061,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
-    vulkan.CheckRasterization(false, true);
+    vulkan.CheckRasterization(false, false, 8, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-slice-growth-only") == 0) {
@@ -30133,7 +30272,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDepthSliceGrowth();
   vulkan.CheckBgra16Readback();
   vulkan.CheckRasterization(false);
-  vulkan.CheckRasterization(false, true);
+  vulkan.CheckRasterization(false, false, 8, true);
   vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   vulkan.CheckUnifiedImageViewCache();

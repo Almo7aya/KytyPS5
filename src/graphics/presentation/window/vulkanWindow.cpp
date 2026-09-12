@@ -534,6 +534,12 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 
 	physical_device.getFeatures2(&features2);
 
+	constexpr auto reductions = vk::SubgroupFeatureFlagBits::eBasic |
+	                            vk::SubgroupFeatureFlagBits::eVote |
+	                            vk::SubgroupFeatureFlagBits::eArithmetic;
+	graphics.fragment_subgroup_reduction =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    (properties11.subgroupSupportedOperations & reductions) == reductions;
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
