@@ -1,4 +1,3 @@
-#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -33,6 +32,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -12117,6 +12117,189 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(descriptor_layout, nullptr);
     m_device.destroyShaderModule(module, nullptr);
+  }
+
+  void CheckStreamingCompute() {
+    constexpr const char *name = "StreamingCompute";
+    EnsureRuntimeContext();
+    // Independent test kernel: output[dst+x] = input[src+x] + add. No atomics
+    // or in-shader barriers can hide missing inter-dispatch visibility/order.
+    const std::string assembly = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %array ArrayStride 4
+OpDecorate %block BufferBlock
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %buffer DescriptorSet 0
+OpDecorate %buffer Binding 0
+OpDecorate %params Block
+OpMemberDecorate %params 0 Offset 0
+OpMemberDecorate %params 1 Offset 4
+OpMemberDecorate %params 2 Offset 8
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%vec = OpTypeVector %uint 3
+%ip = OpTypePointer Input %vec
+%gid = OpVariable %ip Input
+%array = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %array
+%bp = OpTypePointer Uniform %block
+%buffer = OpVariable %bp Uniform
+%up = OpTypePointer Uniform %uint
+%params = OpTypeStruct %uint %uint %uint
+%pp = OpTypePointer PushConstant %params
+%push = OpVariable %pp PushConstant
+%cp = OpTypePointer PushConstant %uint
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%ids = OpLoad %vec %gid
+%x = OpCompositeExtract %uint %ids 0
+%sp = OpAccessChain %cp %push %zero
+%dp = OpAccessChain %cp %push %one
+%ap = OpAccessChain %cp %push %two
+%src = OpLoad %uint %sp
+%dst = OpLoad %uint %dp
+%add = OpLoad %uint %ap
+%si = OpIAdd %uint %src %x
+%di = OpIAdd %uint %dst %x
+%read = OpAccessChain %up %buffer %zero %si
+%write = OpAccessChain %up %buffer %zero %di
+%value = OpLoad %uint %read
+%result = OpIAdd %uint %value %add
+OpStore %write %result
+OpReturn
+OpFunctionEnd
+)";
+    spvtools::SpirvTools assembler(SPV_ENV_VULKAN_1_0);
+    std::vector<u32> words;
+    Require(name, "assemble", assembler.Assemble(assembly, &words), "test kernel assembly failed");
+    ValidateSpirv(name, words);
+    auto device = m_runtime_context.device;
+    const vk::DescriptorSetLayoutBinding binding{0, vk::DescriptorType::eStorageBuffer, 1,
+                                                 vk::ShaderStageFlagBits::eCompute};
+    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+    descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+    descriptor_info.bindingCount = 1;
+    descriptor_info.pBindings = &binding;
+    vk::DescriptorSetLayout descriptors;
+    RequireVk(name, "create",
+              device.createDescriptorSetLayout(&descriptor_info, nullptr, &descriptors),
+              "descriptors");
+    const vk::PushConstantRange push_range{vk::ShaderStageFlagBits::eCompute, 0, 12};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 1;
+    layout_info.pSetLayouts = &descriptors;
+    layout_info.pushConstantRangeCount = 1;
+    layout_info.pPushConstantRanges = &push_range;
+    vk::PipelineLayout layout;
+    RequireVk(name, "create", device.createPipelineLayout(&layout_info, nullptr, &layout),
+              "layout");
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.codeSize = words.size() * 4;
+    module_info.pCode = words.data();
+    vk::ShaderModule module;
+    RequireVk(name, "create", device.createShaderModule(&module_info, nullptr, &module), "module");
+    vk::ComputePipelineCreateInfo pipeline_info{};
+    pipeline_info.stage.stage = vk::ShaderStageFlagBits::eCompute;
+    pipeline_info.stage.module = module;
+    pipeline_info.stage.pName = "main";
+    pipeline_info.layout = layout;
+    vk::Pipeline pipeline;
+    RequireVk(name, "create",
+              device.createComputePipelines(nullptr, 1, &pipeline_info, nullptr, &pipeline),
+              "pipeline");
+    constexpr u32 count = 4096, first = 16, second = first + count, total = second + count;
+    for (u32 scenario = 0; scenario < 2; ++scenario) {
+      CommandScheduler scheduler(Renderer(), m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user, shaders);
+      const auto initial_tick = scheduler.CurrentTick();
+      Libs::Graphics::Buffer data(m_runtime_context, scheduler, MemoryUsage::DeviceLocal, 0,
+                                  AllFlags, total * 4);
+      Libs::Graphics::Buffer download(m_runtime_context, scheduler, MemoryUsage::Download, 0,
+                                      AllFlags, total * 4);
+      std::vector<u32> expected(total);
+      expected[1] = expected[2] = 1;
+      expected[3] = count;
+      for (u32 i = first; i < total; ++i)
+        expected[i] = i * 0x1234567u;
+      scheduler.Current().Handle().updateBuffer(data.Handle(), 0, total * 4, expected.data());
+      const vk::DescriptorBufferInfo view{data.Handle(), 0, total * 4};
+      vk::WriteDescriptorSet write{};
+      write.dstBinding = 0;
+      write.descriptorCount = 1;
+      write.descriptorType = vk::DescriptorType::eStorageBuffer;
+      write.pBufferInfo = &view;
+      const auto dispatch = [&](u32 src, u32 dst, u32 add, u32 groups, bool indirect) {
+        auto &command = scheduler.Current();
+        auto handle = command.Handle();
+        {
+          ShaderWriteHazardBarrier(handle, vk::PipelineStageFlagBits::eComputeShader);
+          if (indirect) {
+            vk::MemoryBarrier args{};
+            args.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+            args.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+            handle.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                   vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &args, 0,
+                                   nullptr, 0, nullptr);
+          }
+        }
+        handle.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+        handle.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, 1, &write);
+        const u32 push[]{src, dst, add};
+        handle.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, 12, push);
+        if (indirect)
+          handle.dispatchIndirect(data.Handle(), 0);
+        else
+          handle.dispatch(groups, 1, 1);
+        ShaderAccessBarrier(handle, vk::PipelineStageFlagBits::eComputeShader);
+        if (scenario)
+          scheduler.CompleteDispatch();
+        for (u32 i = 0; i < groups; ++i)
+          expected[dst + i] = expected[src + i] + add;
+      };
+      dispatch(3, 0, 0, 1, false); // GPU produces indirect X count from zero.
+      for (u32 step = 0; step < 128; ++step) {
+        dispatch(step % 2 ? second : first, step % 2 ? first : second, step + 1, count,
+                 step % 3 != 0);
+        if (step % 19 == 0) {
+          // A transfer write is an unclassified boundary and must drain a
+          // pending read/write dependency before overwriting its input.
+          expected[first] = step * 91;
+          scheduler.Current().Handle().updateBuffer(data.Handle(), first * 4, 4, &expected[first]);
+        }
+      }
+      Require(name, "bounded asynchronous submissions",
+              scheduler.CurrentTick() >= initial_tick + (scenario ? 4 : 0),
+              "the recorded dispatch batch did not submit at its fixed bound");
+      scheduler.Finish();
+      download.CopyFrom(scheduler.Current(), data, 0, 0, total * 4,
+                        vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eHostRead,
+                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+                        vk::AccessFlagBits::eHostRead);
+      scheduler.Finish();
+      download.Invalidate(0, total * 4);
+      Require(
+          name, "GPU differential",
+          std::memcmp(download.Mapped().data(), expected.data(), total * 4) == 0,
+          "dependent compute/indirect/transfer/submit sequence produced stale values in scenario " +
+              std::to_string(scenario));
+      scheduler.Shutdown();
+    }
+    device.destroyPipeline(pipeline);
+    device.destroyShaderModule(module);
+    device.destroyPipelineLayout(layout);
+    device.destroyDescriptorSetLayout(descriptors);
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false, bool lod_subgroup = false) {
@@ -29886,6 +30069,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--streaming-compute-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStreamingCompute();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lodstats-gpu-only") == 0) {
