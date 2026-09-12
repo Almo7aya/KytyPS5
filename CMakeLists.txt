@@ -405,6 +405,16 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(demons_souls_copy_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsCopyTests.cpp")
+target_link_libraries(demons_souls_copy_tests xbyak::xbyak)
+target_include_directories(demons_souls_copy_tests PRIVATE ${inc_headers})
+
+add_executable(demons_souls_idle_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DemonsSoulsIdleTests.cpp")
+target_link_libraries(demons_souls_idle_tests xbyak::xbyak)
+target_include_directories(demons_souls_idle_tests PRIVATE ${inc_headers})
+
 add_executable(page_protection_table_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PageProtectionTableTests.cpp")
 target_link_libraries(page_protection_table_tests fmt::fmt common)
@@ -553,6 +563,8 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME demons_souls_copy COMMAND $<TARGET_FILE:demons_souls_copy_tests>)
+	add_test(NAME demons_souls_idle COMMAND $<TARGET_FILE:demons_souls_idle_tests>)
 	add_test(NAME page_protection_table COMMAND $<TARGET_FILE:page_protection_table_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
