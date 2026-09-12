@@ -578,6 +578,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --red-zone-patcher-only)
 	add_test(NAME shader_lod_feedback
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --lodstats-gpu-only)
+	add_test(NAME demons_souls_compute_chain
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --demons-compute-chain-only)
 	add_test(NAME compute_stream_submission
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --streaming-compute-only)
 	add_test(NAME command_scheduler_timeline

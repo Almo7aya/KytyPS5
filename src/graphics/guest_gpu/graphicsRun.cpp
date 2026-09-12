@@ -344,6 +344,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
+	BreakComputeChain();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -1294,6 +1295,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
 	CheckBuffer();
+	BreakComputeChain();
 
 	if (GraphicsRunDebugDumpEnabled()) {
 		const auto bits      = static_cast<unsigned>(sizeof(T) * 8u);
@@ -1555,13 +1557,22 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
-	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	CurrentBuffer().HandleForFullBarrier().pipelineBarrier2(dependency);
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	CheckBuffer();
 
 	Sync::TriggerEopEventAtEndOfPipe(CurrentBuffer(), m_interrupt_event_id, interrupt_context_id);
+}
+
+void CommandProcessor::BreakComputeChain() {
+	// Guest synchronization may be implemented without a host command.
+	// It still ends the compatibility profile's independent dispatch group.
+	if (!GetScheduler().Active()) return;
+	Common::LockGuard lock(m_renderer.GetMutex());
+	auto& buffer = CurrentBuffer();
+	if (buffer.ComputeChainPending()) (void)buffer.Handle();
 }
 
 void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
@@ -1612,6 +1623,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			LOGF("\t temporary: ignoring unsupported event_write type 0x%08" PRIx32
 			     ", index 0x%08" PRIx32 "\n",
 			     event_type, event_index);
+			BreakComputeChain();
 			break;
 		case 0x00000039: {
 			if (event_index != 0x00000001 || event_address == 0 || (event_address & 0x7u) != 0) {

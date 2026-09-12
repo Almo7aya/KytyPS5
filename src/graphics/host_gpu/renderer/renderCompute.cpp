@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/demonsSouls.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -346,6 +347,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (input_info.threads_num[0] * input_info.threads_num[1] * input_info.threads_num[2] >= 512);
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = input_info.stage.resources;
+	if (indirect_args == 0 && DemonsSouls::TryLinearCopy(input_info, m_context.GetBufferCache(),
+	        thread_group_x, thread_group_y, thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
 	if (indirect_args == 0 && TryConsumeComputeMetaClear(input_info, buffer, thread_group_x,
 	                                                     thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
@@ -482,10 +488,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_offset = owner.Offset(indirect_args);
 	}
 
-	auto vk_buffer = buffer.Handle();
+	const bool chain = DemonsSouls::IsSupportedGame();
+	auto vk_buffer = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
+	               std::span {&descriptor_stage, 1u}, chain);
+	const bool continues_chain = chain && buffer.ComputeChainPending();
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
@@ -495,7 +503,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	if (has_storage_writes && !continues_chain) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -513,7 +521,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.buffer              = indirect_buffer;
 		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		if (!continues_chain) vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                          vk::PipelineStageFlagBits::eDrawIndirect,
 		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
@@ -522,7 +530,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	if (chain) buffer.ContinueComputeChain();
+	else ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
 }
