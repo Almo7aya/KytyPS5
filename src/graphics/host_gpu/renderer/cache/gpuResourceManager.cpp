@@ -48,6 +48,7 @@ void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
+		++m_mapping_epoch;
 	}
 }
 
@@ -67,6 +68,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		++m_mapping_epoch;
 	};
 	if (m_gpu == nullptr) {
 		unmap();
@@ -75,11 +77,43 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+void GpuResourceManager::RefreshBdaRanges() {
+	const auto registered = m_buffer_cache.RegistrationEpoch();
+	if (m_bda_mapping_epoch == m_mapping_epoch && m_bda_registration_epoch == registered) return;
+	std::vector<RangeSet::Range> ranges;
+	m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, ranges);
+	m_bda_region_requests.clear();
+	for (const auto& range : ranges) {
+		const auto end = range.address + range.size;
+		for (auto start = range.address; start < end;) {
+			const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+			m_bda_region_requests.push_back({start, finish - start});
+			start = finish;
+		}
+	}
+	m_bda_mapping_epoch = m_mapping_epoch;
+	m_bda_registration_epoch = registered;
+}
+
+bool GpuResourceManager::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
+	if (ranges.empty() || ranges.size() > 128 ||
+	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); })) return false;
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	RefreshBdaRanges();
+	for (const auto range : ranges) {
+		auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), range.address,
+		    [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
+		for (; it != m_bda_region_requests.end() && it->address < range.End(); ++it)
+			m_buffer_cache.SynchronizeRegionRequest(*it);
+	}
+	m_fault_process_pending = true;
+	return true;
+}
+
 void GpuResourceManager::PrepareBda() {
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	RefreshBdaRanges();
+	for (auto& request : m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);
 	m_fault_process_pending = true;
 }
 

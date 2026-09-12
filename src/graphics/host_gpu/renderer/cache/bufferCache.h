@@ -71,6 +71,13 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	struct SyncRegionRequest {
+		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
+	};
+	void SynchronizeRegionRequest(SyncRegionRequest& request);
+	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch; }
+	void CollectMappedRegisteredRanges(const RangeSet& mapped, std::vector<RangeSet::Range>& ranges) const;
+
 	void               RunGarbageCollector();
 
 private:
@@ -120,6 +127,7 @@ private:
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
+	uint64_t m_registration_epoch = 1;
 	struct SyncBuffer {
 		uint64_t start;
 		uint64_t end;

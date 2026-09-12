@@ -60,6 +60,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	m_sync_buffers_valid = false;
+	++m_registration_epoch;
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
@@ -724,13 +725,44 @@ void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
 }
 
+void BufferCache::CollectMappedRegisteredRanges(const RangeSet& mapped,
+                                                std::vector<RangeSet::Range>& ranges) const {
+	ranges.clear();
+	for (const auto& [address, id] : m_buffers) {
+		mapped.ForEachIntersection(address, m_slot_buffers[id].Size(), [&](RangeSet::Range range) {
+			if (!ranges.empty() && ranges.back().address + ranges.back().size == range.address)
+				ranges.back().size += range.size;
+			else ranges.push_back(range);
+		});
+	}
+}
+
+void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
+	const auto epoch = m_memory_tracker.CpuModificationEpoch(request.address, request.size);
+	const auto registered = m_registration_epoch;
+	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered)
+		return;
+	SynchronizeBuffersInRange(request.address, request.size);
+	request.cpu_epoch = 0;
+	if (epoch != 0 && m_registration_epoch == registered &&
+	    m_memory_tracker.CpuModificationEpoch(request.address, request.size) == epoch) {
+		request.cpu_epoch = epoch;
+		request.registration_epoch = registered;
+	}
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	if (!m_sync_buffers_valid) {
 		m_sync_buffers.clear();
 		m_sync_buffers.reserve(m_buffers.size());
 		for (const auto& [address, id]: m_buffers) {
 			auto& buffer = m_slot_buffers[id];
-			m_sync_buffers.push_back({address, address + buffer.Size(), &buffer});
+			const auto end = address + buffer.Size();
+			for (auto start = address; start < end;) {
+				const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
+				m_sync_buffers.push_back({start, finish, &buffer});
+				start = finish;
+			}
 		}
 		m_sync_stamps.assign(m_sync_buffers.size(), {});
 		m_sync_buffers_valid = true;
