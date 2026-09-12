@@ -3012,6 +3012,308 @@ void TestLinearSrtDifferential() {
 #endif
 }
 
+void TestCompiledSrtSpanBounds() {
+#if defined(__x86_64__) || defined(_M_X64)
+	struct Memory {
+		std::vector<uint64_t> events;
+		uint64_t              groups = 0;
+		static uint32_t Word(uint64_t a) { return uint32_t(a) ^ uint32_t(a >> 32) ^ 0x93814762u; }
+	};
+	const auto read = +[](void* p, uint64_t a, uint32_t* v) {
+		static_cast<Memory*>(p)->events.push_back(a);
+		*v = Memory::Word(a);
+		return true;
+	};
+	const auto span = +[](void* p, uint64_t a, uint32_t* v, uint32_t n, bool clean) {
+		++static_cast<Memory*>(p)->groups;
+		Check(!clean && n >= 2 && n <= 16, "invalid boundary probe");
+		for (uint32_t i = 0; i < n; ++i) {
+			static_cast<Memory*>(p)->events.push_back(a + i * 4);
+			v[i] = Memory::Word(a + i * 4);
+		}
+		return true;
+	};
+	uint64_t used = 0;
+	for (bool buffer: {false, true})
+		for (int32_t immediate: {INT32_MIN, -65, -4, 0, 3, INT32_MAX - 64})
+			for (uint32_t offset: {0u, 3u, 7u, 0x80000000u, UINT32_MAX - 3u}) {
+				Fixture    f;
+				const auto lo = f.UserData(0), hi = f.UserData(1), records = f.UserData(2);
+				const auto handle =
+				    buffer ? f.Buffer({lo, hi, records, Value(0u)}) : f.Address(lo, hi);
+				for (uint32_t i = 0; i < 16; ++i) {
+					MemoryInfo info;
+					info.kind   = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
+					info.offset = static_cast<uint32_t>(int64_t {immediate} + i * 4u);
+					info.planning_only = true;
+					const auto flags   = f.AddMemory(info, 0);
+					const auto value =
+					    buffer
+					        ? f.Emit(ValueOpcode::ReadConstBuffer, {handle, Value(offset)}, flags)
+					        : f.Emit(ValueOpcode::LoadAddressU32,
+					                 {handle, Value(offset), Value(0u), Value(true)}, flags);
+					f.program.srt_reads.push_back({value, i});
+				}
+				f.program.srt_plan_complete = true;
+				auto plan                   = ExtractResourcePlan(f.program);
+				Check(bool(plan.linear_srt), "boundary graph failed to compile");
+				for (uint64_t address: {0ull, 3ull, 0x1003ull, 0x0000ffffffffffb0ull,
+				                        0x0000fffffffffffcull, 0x1234000000000003ull})
+					for (uint32_t count: {0u, 4u, 63u, 64u, UINT32_MAX})
+						for (uint32_t stride: {0u, 1u, 0x3fffu}) {
+							const uint32_t data[] = {
+							    uint32_t(address), uint32_t(address >> 32) | (stride << 16), count};
+							Memory     expected, actual;
+							SrtRuntime runtime {
+							    .user_data = data, .read_memory = read, .userdata = &expected};
+							std::vector<uint32_t> ev {0xdeadbeefu}, av = ev;
+							auto                  compiled = std::move(plan.linear_srt);
+							const bool            ok       = WalkSrt(plan, runtime, ev);
+							plan.linear_srt                = std::move(compiled);
+							runtime.userdata               = &actual;
+							runtime.try_read_memory_span   = span;
+							const bool got                 = WalkSrt(plan, runtime, av);
+							used += actual.groups;
+							Check(ok == got && ev == av && expected.events == actual.events,
+							      "compiled span changed signed offset, masked base, extent "
+							      "or partial failure semantics");
+						}
+			}
+	// A completed group must still be counted if a later user-data access fails.
+	Fixture    fail;
+	const auto address = fail.Address(fail.UserData(0), Value(0u));
+	for (uint32_t i = 0; i < 2; ++i) {
+		MemoryInfo info;
+		info.kind          = ResourceKind::ScalarAddress;
+		info.offset        = i * 4;
+		info.planning_only = true;
+		const auto value =
+		    fail.Emit(ValueOpcode::LoadAddressU32, {address, Value(0u), Value(0u), Value(true)},
+		              fail.AddMemory(info, 0));
+		fail.program.srt_reads.push_back({value, i});
+	}
+	fail.program.srt_reads.push_back({fail.UserData(1), 2});
+	fail.program.srt_plan_complete = true;
+	auto                  plan     = ExtractResourcePlan(fail.program);
+	const uint32_t        data[]   = {0x1000};
+	Memory                memory;
+	std::vector<uint32_t> output {0xdeadbeef};
+	Check(!WalkSrt(plan,
+	               {.user_data            = data,
+	                .read_memory          = read,
+	                .userdata             = &memory,
+	                .try_read_memory_span = span},
+	               output) &&
+	          output == std::vector<uint32_t> {0xdeadbeef} &&
+	          memory.events == std::vector<uint64_t> {0x1000, 0x1004} && memory.groups == 1,
+	      "failed transaction lost completed span counters or published output");
+	Check(used > 0, "compiled boundary tests did not use generated groups");
+#endif
+}
+
+void TestLinearSrtSpans() {
+#if defined(__x86_64__) || defined(_M_X64)
+	struct Memory {
+		std::vector<std::pair<uint64_t, bool>> calls;
+		int                                    fail   = -1;
+		uint32_t                               probes = 0, spans = 0;
+		bool                                   accept = true;
+		static uint32_t                        Word(uint64_t a, bool clean) {
+            return uint32_t(a ^ (a >> 32)) ^ (clean ? 0x8761u : 0x9123u);
+		}
+		bool Read(uint64_t a, uint32_t* v, bool clean) {
+			calls.emplace_back(a, clean);
+			if (int(calls.size()) == fail) return false;
+			*v = Word(a, clean);
+			return true;
+		}
+	};
+	const auto raw = +[](void* p, uint64_t a, uint32_t* v) {
+		return static_cast<Memory*>(p)->Read(a, v, false);
+	};
+	const auto clean =
+	    +[](void* p, uint64_t a, uint32_t* v) { return static_cast<Memory*>(p)->Read(a, v, true); };
+	const auto span = +[](void* p, uint64_t a, uint32_t* v, uint32_t count, bool clean) {
+		auto& m = *static_cast<Memory*>(p);
+		++m.probes;
+		if (!m.accept || m.fail != -1) return false;
+		Check(count >= 2 && count <= 16, "invalid compiled span width");
+		++m.spans;
+		for (uint32_t i = 0; i < count; ++i) {
+			m.calls.emplace_back(a + i * 4, clean);
+			v[i] = Memory::Word(a + i * 4, clean);
+		}
+		return true;
+	};
+	for (bool buffer: {false, true})
+		for (bool mixed: {false, true})
+			for (uint32_t step: {4u, 8u}) {
+				Fixture    f;
+				const auto low = f.UserData(0), high = f.UserData(1), records = f.UserData(2);
+				const auto handle =
+				    buffer ? f.Buffer({low, high, records, Value(0u)}) : f.Address(low, high);
+				for (uint32_t i = 0; i < 32; ++i) {
+					MemoryInfo info;
+					info.kind   = buffer ? ResourceKind::ScalarBuffer : ResourceKind::ScalarAddress;
+					info.offset = i * step;
+					info.planning_only = true;
+					const auto flags   = f.AddMemory(info, 0);
+					const auto read =
+					    buffer ? f.Emit(ValueOpcode::ReadConstBuffer, {handle, Value(0u)}, flags)
+					           : f.Emit(ValueOpcode::LoadAddressU32,
+					                    {handle, Value(0u), Value(0u), Value(true)}, flags);
+					f.program.srt_reads.push_back({read, i});
+				}
+				f.program.srt_plan_complete = true;
+				auto plan                   = ExtractResourcePlan(f.program);
+				if (mixed) {
+					plan.clean_flat_slots.resize(32);
+					for (uint32_t i = 0; i < 16; ++i)
+						plan.clean_flat_slots[i] = 1;
+					BuildLinearSrtPlan(plan);
+				}
+				Check(bool(plan.linear_srt), "span fixture did not compile");
+				const auto compiled = plan.linear_srt;
+				for (uint32_t trial = 0; trial < 9; ++trial) {
+					// Disable/decline spans, fail an intermediate scalar read, and fail
+					// later bounds after earlier reads: all retain the evaluator's exact
+					// sequence.
+					const uint32_t data[] = {trial == 8 ? 0xfffffffcu : 0x1003u,
+					                         trial == 8 ? 0xffffu : 0u, trial == 7 ? 20u : 256u};
+					Memory reference, actual;
+					reference.fail = actual.fail = trial == 5 ? 3 : trial == 6 ? 17 : -1;
+					actual.accept                = trial != 4;
+					SrtRuntime                   r {.user_data                  = data,
+					                                .read_memory                = raw,
+					                                .userdata                   = &reference,
+					                                .read_specialization_memory = clean};
+					std::vector<DescriptorValue> er, ar;
+					std::vector<uint32_t>        ev {0xdeadbeef}, av = ev;
+					std::vector<uint8_t>         ea {99}, aa         = ea;
+					plan.linear_srt.reset();
+					const bool ok =
+					    EvaluateRuntimeSources(plan, {}, r, er, ev, plan.clean_flat_slots, ea);
+					r.userdata             = &actual;
+					r.try_read_memory_span = (trial == 1 || trial == 2) ? nullptr : span;
+					if (trial == 3) r.user_data = {};
+					plan.linear_srt = compiled;
+					const bool got =
+					    EvaluateRuntimeSources(plan, {}, r, ar, av, plan.clean_flat_slots, aa);
+					if (trial == 3)
+						Check(!got && av == std::vector<uint32_t> {0xdeadbeef} &&
+						          actual.calls.empty() && !actual.probes,
+						      "span read crossed failing user data access");
+					else
+						Check(ok == got && ev == av && ea == aa && reference.calls == actual.calls,
+						      "span execution changed data, read order, bounds or "
+						      "transaction failure");
+					if (trial == 0 && step == 4)
+						Check(actual.spans == 2 && actual.probes == 2,
+						      "contiguous scalar groups were not executed");
+					if (trial == 1 || trial == 2 || step == 8)
+						Check(!actual.spans, "disabled or noncontiguous span was read");
+					if (trial >= 4 && trial <= 6)
+						Check(!actual.spans, "declined probe performed a read");
+				}
+			}
+	Fixture    p;
+	MemoryInfo info;
+	info.kind          = ResourceKind::ScalarAddress;
+	info.planning_only = true;
+	auto load          = [&](Value handle, uint32_t offset) {
+        info.offset = offset;
+        return p.Emit(ValueOpcode::LoadAddressU32, {handle, Value(0u), Value(0u), Value(true)},
+		                       p.AddMemory(info, 0));
+	};
+	const auto parent           = load(p.Address(p.UserData(0), Value(0u)), 0);
+	const auto child            = p.Address(parent, Value(0u));
+	p.program.srt_reads         = {{parent, 0}, {load(child, 0), 1}, {load(child, 4), 2}};
+	p.program.srt_plan_complete = true;
+	auto plan                   = ExtractResourcePlan(p.program);
+	Check(bool(plan.linear_srt), "pointer span fixture did not compile");
+	struct Pointers {
+		uint32_t              base = 0x2000, probes = 0;
+		std::vector<uint64_t> calls;
+		const ResourcePlan*   plan = nullptr;
+	};
+	const auto pointer_read = +[](void* v, uint64_t a, uint32_t* word) {
+		auto& m = *static_cast<Pointers*>(v);
+		m.calls.push_back(a);
+		if (a == 0x1000) {
+			*word = m.base;
+			return true;
+		}
+		if (a == m.base || a == m.base + 4) {
+			*word = uint32_t(a);
+			return true;
+		}
+		return false;
+	};
+	const auto pointer_span = +[](void* v, uint64_t a, uint32_t* words, uint32_t n, bool clean) {
+		auto& m = *static_cast<Pointers*>(v);
+		++m.probes;
+		Check(!clean && a == m.base && n == 2,
+		      "span crossed a parent dependency or retained old child address");
+		// A span callback can reenter the same generated function with different
+		// inputs; nested scratch and outputs must not overwrite this transaction.
+		Pointers inner;
+		inner.base            = m.base + 0x1000;
+		const auto inner_read = +[](void* v, uint64_t a, uint32_t* word) {
+			auto& m = *static_cast<Pointers*>(v);
+			if (a == 0x1000) {
+				*word = m.base;
+				return true;
+			}
+			if (a == m.base || a == m.base + 4) {
+				*word = uint32_t(a);
+				return true;
+			}
+			return false;
+		};
+		const uint32_t        inputs[] = {0x1000};
+		std::vector<uint32_t> result;
+		const auto inner_span = +[](void* v, uint64_t a, uint32_t* words, uint32_t n, bool clean) {
+			auto& m = *static_cast<Pointers*>(v);
+			Check(!clean && a == m.base && n == 2, "nested span address mismatch");
+			for (uint32_t i = 0; i < n; ++i)
+				words[i] = uint32_t(a + i * 4);
+			return true;
+		};
+		Check(WalkSrt(*m.plan,
+		              {.user_data            = inputs,
+		               .read_memory          = inner_read,
+		               .userdata             = &inner,
+		               .try_read_memory_span = inner_span},
+		              result) &&
+		          result == std::vector<uint32_t> {inner.base, inner.base, inner.base + 4},
+		      "nested span evaluation failed");
+		for (uint32_t i = 0; i < n; ++i) {
+			m.calls.push_back(a + i * 4);
+			words[i] = uint32_t(a + i * 4);
+		}
+		return true;
+	};
+	Pointers memory;
+	memory.plan           = &plan;
+	const uint32_t data[] = {0x1000};
+	for (uint32_t base: {0x2000u, 0x4000u}) {
+		memory.base = base;
+		memory.calls.clear();
+		std::vector<uint32_t> values;
+		Check(WalkSrt(plan,
+		              {.user_data            = data,
+		               .read_memory          = pointer_read,
+		               .userdata             = &memory,
+		               .try_read_memory_span = pointer_span},
+		              values) &&
+		          values == std::vector<uint32_t> {base, base, base + 4} &&
+		          memory.calls == std::vector<uint64_t> {0x1000, base, base + 4},
+		      "pointer span read stale child data");
+	}
+	Check(memory.probes == 2, "dependent child groups were not executed");
+#endif
+}
+
 void TestLinearSrtReads() {
 #if defined(__x86_64__) || defined(_M_X64)
   struct Memory {std::vector<std::pair<uint64_t,bool>> calls;int fail=-1;uint32_t salt=0;};
@@ -3134,8 +3436,10 @@ int main(int argc, char** argv) {
     Run("controlled linear SRT", TestControlledLinearSrt);
     Run("linear SRT arithmetic", TestLinearSrtDifferential);
     Run("linear SRT reads", TestLinearSrtReads);
-    Run("private LDS scalar slots", TestFunctionLdsLayout);
-    Run("dense buffers", TestDenseBufferTracking);
+	Run("linear SRT grouped reads", TestLinearSrtSpans);
+	Run("compiled SRT span bounds", TestCompiledSrtSpanBounds);
+	Run("private LDS scalar slots", TestFunctionLdsLayout);
+	Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned greater equal", TestRuntimeUnsignedGreaterEqual);

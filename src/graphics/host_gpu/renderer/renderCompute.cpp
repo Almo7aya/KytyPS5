@@ -465,10 +465,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto bindings = PrepareBindings(input_info.stage);
 	FindBuffers(bindings);
 	PrepareBdaBindings(bindings);
+	// Materialize the persistent argument owner before final descriptor handles:
+	// a tiny CPU upload must not leave an indirect command using a stream slice
+	// that can be retired when preparation rotates the command buffer.
+	if (indirect_args != 0)
+		m_context.GetBufferCache().EnsureBufferContents(indirect_args, 3u * sizeof(uint32_t));
 	RebindBuffers(bindings);
 	RebindImages(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	vk::Buffer indirect_buffer = nullptr;
+	uint64_t indirect_offset = 0;
+	if (indirect_args != 0) {
+		auto& cache     = m_context.GetBufferCache();
+		auto& owner     = cache.GetBuffer(cache.FindBuffer(indirect_args, 3u * sizeof(uint32_t)));
+		indirect_buffer = owner.Handle();
+		indirect_offset = owner.Offset(indirect_args);
+	}
+
+	auto vk_buffer = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -488,8 +502,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (indirect_args != 0) {
-		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
 		vk::BufferMemoryBarrier args_barrier {};
 		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
 		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
@@ -498,13 +510,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
 		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		args_barrier.buffer              = args_buffer->Handle();
-		args_barrier.offset              = args_offset;
+		args_barrier.buffer              = indirect_buffer;
+		args_barrier.offset              = indirect_offset;
 		args_barrier.size                = 3u * sizeof(uint32_t);
 		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                          vk::PipelineStageFlagBits::eDrawIndirect,
 		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
-		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
 	} else {
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	}

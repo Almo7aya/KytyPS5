@@ -33,6 +33,7 @@ public:
 			m_runtime.read_specialization_memory =
 			    input.read_specialization_memory ? ReadClean : nullptr;
 			m_runtime.sync_memory = input.sync_memory ? Sync : nullptr;
+			m_runtime.try_read_memory_span = input.try_read_memory_span ? ReadSpan : nullptr;
 		}
 		Runtime(const Runtime&)                                                         = delete;
 		Runtime&                                              operator=(const Runtime&) = delete;
@@ -53,6 +54,15 @@ public:
 		}
 		static bool ReadRaw(void* userdata, uint64_t address, uint32_t* value) {
 			return Read(userdata, address, value, false);
+		}
+		static bool ReadSpan(void* userdata, uint64_t address, uint32_t* values, uint32_t count,
+		                     bool clean) {
+			auto& self = *static_cast<Runtime*>(userdata);
+			if (!self.m_original.try_read_memory_span(self.m_original.userdata, address, values,
+			                                          count, clean))
+				return false;
+			self.Observe(address, uint64_t(count) * 4);
+			return true;
 		}
 		static bool ReadClean(void* userdata, uint64_t address, uint32_t* value) {
 			return Read(userdata, address, value, true);

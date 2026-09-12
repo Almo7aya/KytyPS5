@@ -170,6 +170,24 @@ public:
 		return false;
 	}
 
+	[[nodiscard]] constexpr bool AllInRange(size_t start, size_t end) const {
+		if (start >= end || end > N) return false;
+		const auto first      = start / BITS_PER_WORD;
+		const auto last       = (end - 1) / BITS_PER_WORD;
+		const auto first_mask = ~uint64_t {0} << (start % BITS_PER_WORD);
+		const auto last_mask  = ~uint64_t {0} >> (BITS_PER_WORD - 1 - ((end - 1) % BITS_PER_WORD));
+		if (first == last) {
+			const auto mask = first_mask & last_mask;
+			return (m_data[first] & mask) == mask;
+		}
+		if ((m_data[first] & first_mask) != first_mask || (m_data[last] & last_mask) != last_mask)
+			return false;
+		for (auto word = first + 1; word < last; ++word) {
+			if (m_data[word] != ~uint64_t {0}) return false;
+		}
+		return true;
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

@@ -1365,6 +1365,23 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x100, 0x200) == 0x200,
 	      "ClampRangeSize did not cross adjacent committed mappings");
 	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x100,
+	      "cached committed interval changed a contained request");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(cached right mapping)");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x80,
+	      "unmap retained a cached committed interval");
+	right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "adjacent_right"),
+	        "KernelMapNamedFlexibleMemory(remap cached right)");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x100,
+	      "remap did not restore the complete committed interval");
+	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
 	                                                      Common::VirtualMemory::Mode::Read),
 	      "owner could not protect adjacent backing mappings");

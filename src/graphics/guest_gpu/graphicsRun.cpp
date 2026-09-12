@@ -1236,15 +1236,25 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 }
 
 void CommandProcessor::DispatchIndirect(uint32_t data_offset, uint32_t mode) {
-	struct DispatchIndirectArgs {
-		uint32_t thread_group_x;
-		uint32_t thread_group_y;
-		uint32_t thread_group_z;
-	};
-
 	EXIT_NOT_IMPLEMENTED(m_dispatch_indirect_args_base_addr == 0);
+	DispatchIndirectAddress(m_dispatch_indirect_args_base_addr + data_offset, mode);
+}
 
-	const auto args_addr = m_dispatch_indirect_args_base_addr + data_offset;
+void CommandProcessor::DispatchIndirectAddress(uint64_t args_addr, uint32_t mode) {
+	struct DispatchIndirectArgs {
+		uint32_t thread_group_x, thread_group_y, thread_group_z;
+	};
+	EXIT_NOT_IMPLEMENTED(args_addr == 0);
+	// Workgroup dimensions are consumed by Vulkan. Only thread-dimension mode
+	// needs CPU counts for specialization/conversion; do not download GPU-written
+	// arguments solely to pass unused group counts back to the indirect command.
+	if ((mode & 0x20u) == 0 && (args_addr & 3u) == 0 &&
+	    GetGpuResources().IsMapped(args_addr, sizeof(DispatchIndirectArgs)) &&
+	    !GetGpuResources().GetTextureCache().IsRegionGpuModified(args_addr,
+	                                                             sizeof(DispatchIndirectArgs))) {
+		DispatchDirect(1, 1, 1, mode, args_addr);
+		return;
+	}
 	if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
 		static std::atomic<uint32_t> sync_fallback_logs {0};
 		if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {

@@ -5,6 +5,7 @@
 #else
 
 #include "common/assert.h"
+#include "common/pageProtectionTable.h"
 #include "common/platform/sysVirtual.h"
 #include "common/virtualMemory.h"
 
@@ -32,7 +33,7 @@ namespace Common {
 
 static pthread_mutex_t              g_virtual_mutex {};
 static std::map<uintptr_t, size_t>* g_allocs   = nullptr;
-static std::map<uintptr_t, int>*    g_protects = nullptr;
+static PageProtectionTable*         g_protects = nullptr;
 
 void SysVirtualInit() {
 	pthread_mutexattr_t attr {};
@@ -47,7 +48,7 @@ void SysVirtualInit() {
 	pthread_mutexattr_destroy(&attr);
 
 	g_allocs   = new std::map<uintptr_t, size_t>;
-	g_protects = new std::map<uintptr_t, int>;
+	g_protects = new PageProtectionTable;
 }
 
 static int get_protection_flag(VirtualMemory::Mode mode) {
@@ -163,9 +164,7 @@ uint64_t SysVirtualAlloc(uint64_t address, uint64_t size, VirtualMemory::Mode mo
 		record_alloc(ret_addr, size);
 		uintptr_t page_start = ret_addr >> 12u;
 		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 		pthread_mutex_unlock(&g_virtual_mutex);
 	}
 
@@ -253,9 +252,7 @@ uint64_t SysVirtualAllocAligned(uint64_t address, uint64_t size, VirtualMemory::
 	record_alloc(ret_addr, size);
 	uintptr_t page_start = ret_addr >> 12u;
 	uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-	for (uintptr_t page = page_start; page <= page_end; page++) {
-		(*g_protects)[page] = protect;
-	}
+	g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 	pthread_mutex_unlock(&g_virtual_mutex);
 
 	return ret_addr;
@@ -339,9 +336,7 @@ bool SysVirtualAllocFixed(uint64_t address, uint64_t size, VirtualMemory::Mode m
 		record_alloc(ret_addr, size);
 		uintptr_t page_start = ret_addr >> 12u;
 		uintptr_t page_end   = (ret_addr + size - 1) >> 12u;
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = protect;
-		}
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(protect));
 		pthread_mutex_unlock(&g_virtual_mutex);
 
 		return true;
@@ -520,9 +515,7 @@ bool SysVirtualFree(uint64_t address) {
 		uintptr_t page_start = addr >> 12u;
 		uintptr_t page_end   = (addr + size - 1) >> 12u;
 		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			g_protects->erase(page);
-		}
+		g_protects->Erase(page_start, page_end);
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return true;
 	}
@@ -582,9 +575,7 @@ bool SysVirtualFreeRange(uint64_t address, uint64_t size) {
 	if (end < alloc_end) {
 		(*g_allocs)[end] = alloc_end - end;
 	}
-	for (uintptr_t page = addr >> 12u; page <= (end - 1u) >> 12u; page++) {
-		g_protects->erase(page);
-	}
+	g_protects->Erase(addr >> 12u, (end - 1u) >> 12u);
 	pthread_mutex_unlock(&g_virtual_mutex);
 	return true;
 }
@@ -595,11 +586,7 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 
 	pthread_mutex_lock(&g_virtual_mutex);
 	if (old_mode != nullptr) {
-		if (auto s = g_protects->find(addr >> 12u); s != g_protects->end()) {
-			*old_mode = get_protection_flag(s->second);
-		} else {
-			*old_mode = VirtualMemory::Mode::NoAccess;
-		}
+		*old_mode = get_protection_flag(g_protects->Get(addr >> 12u));
 	}
 	pthread_mutex_unlock(&g_virtual_mutex);
 
@@ -608,9 +595,7 @@ bool SysVirtualProtect(uint64_t address, uint64_t size, VirtualMemory::Mode mode
 	if (mprotect(reinterpret_cast<void*>(page_start << 12u), (page_end - page_start + 1) << 12u,
 	             get_protection_flag(mode)) == 0) {
 		pthread_mutex_lock(&g_virtual_mutex);
-		for (uintptr_t page = page_start; page <= page_end; page++) {
-			(*g_protects)[page] = get_protection_flag(mode);
-		}
+		g_protects->Set(page_start, page_end, static_cast<uint8_t>(get_protection_flag(mode)));
 		pthread_mutex_unlock(&g_virtual_mutex);
 		return true;
 	}

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "kernel/memory.h"
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
@@ -31,6 +32,37 @@ uint64_t GpuResourceManager::PreparationAliasEpoch() const noexcept {
 	return uint32_t(value) == 0 ? value : 0;
 }
 
+bool GpuResourceManager::TryInvalidateCpuWriteWindow(uint64_t fault) {
+	// A small window amortizes faults from sequential CPU writes. Expanding a
+	// fault is allowed only for mapped, unaliased pages with no GPU/image owner.
+	constexpr uint64_t window_size  = 4 * TRACKER_PAGE_SIZE;
+	const auto         window_begin = fault & ~(window_size - 1);
+	GuestRange         selected {};
+	uint64_t           mapping_epoch;
+	{
+		std::shared_lock mapped_lock(m_mapped_ranges_mutex);
+		mapping_epoch = m_mapping_epoch;
+		m_mapped_ranges.ForEachIntersection(window_begin, window_size, [&](RangeSet::Range range) {
+			if (fault >= range.address && fault - range.address < range.size) {
+				const auto begin =
+				    (range.address + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+				const auto end = (range.address + range.size) & ~(TRACKER_PAGE_SIZE - 1);
+				if (begin < end) selected = {begin, end - begin};
+			}
+		});
+	}
+	if (selected.size <= TRACKER_PAGE_SIZE || fault < selected.address ||
+	    fault - selected.address >= selected.size ||
+	    !LibKernel::Memory::IsUniqueGuestBackingRange(selected.address, selected.size))
+		return false;
+	// Kernel backing queries must not run while holding the resource-map lock.
+	std::shared_lock mapped_lock(m_mapped_ranges_mutex);
+	if (mapping_epoch != m_mapping_epoch ||
+	    !m_mapped_ranges.Contains(selected.address, selected.size))
+		return false;
+	return m_buffer_cache.TryInvalidateCpuWriteWindow(fault, selected.address, selected.size);
+}
+
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
@@ -39,6 +71,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
+		if (TryInvalidateCpuWriteWindow(fault_vaddr)) return true;
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {

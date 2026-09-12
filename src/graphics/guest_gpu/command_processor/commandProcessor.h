@@ -72,6 +72,7 @@ public:
 	void SetIndexBufferSize(uint32_t index_buffer_size);
 	void SetDrawIndirectArgsBaseAddress(uint64_t draw_indirect_args_base_addr);
 	void SetDispatchIndirectArgsBaseAddress(uint64_t dispatch_indirect_args_base_addr);
+	void     DispatchIndirectAddress(uint64_t args_address, uint32_t mode);
 	void SetNumInstances(uint32_t num_instances);
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);

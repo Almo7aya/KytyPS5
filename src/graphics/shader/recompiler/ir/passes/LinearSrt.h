@@ -31,6 +31,11 @@ struct LinearSrtPlan {
 		bool                    clean = false;
 	};
 	std::vector<Node>                                 nodes;
+	struct ReadGroup {
+		std::array<uint32_t, 16> indices {};
+		uint32_t                 count = 0;
+	};
+	std::vector<ReadGroup>                            read_groups;
 	std::vector<uint32_t>                             descriptor_words, flat_words, sources;
 	std::vector<uint8_t>                              clean_slots, descriptor_sizes;
 	std::vector<uint8_t>                              active_sources;
@@ -44,14 +49,12 @@ struct LinearSrtPlan {
 	std::unique_ptr<Xbyak::CodeGenerator> code;
 #endif
 
-	// Keep the exact scalar-read bounds/rounding of Evaluator::EvaluateRawRead.
-	static bool KYTY_SYSV_ABI Read(const SrtRuntime* runtime, const Node* node,
-	                               const uint64_t* values, uint64_t* output) {
+	// Keep exact scalar bounds and retain ordered scalar fallback on a rejected span.
+	static bool ReadAddress(const Node* node, const uint64_t* values, uint64_t& address) {
 		const auto     low = values[node->args[0]], high = values[node->args[1]];
 		const auto     offset = values[node->args[2]];
 		const uint64_t base   = ((high << 32) | static_cast<uint32_t>(low)) & 0x0000ffffffffffffull;
 		const auto     immediate = static_cast<int64_t>(static_cast<int32_t>(node->immediate));
-		uint64_t       address   = 0;
 		if (node->op == ValueOpcode::ReadConstBuffer) {
 			const auto records = static_cast<uint32_t>(values[node->args[3]]);
 			if (immediate < 0) return false;
@@ -73,6 +76,12 @@ struct LinearSrtPlan {
 				address = aligned_base + uint64_t(relative);
 			}
 		}
+		return true;
+	}
+	static bool KYTY_SYSV_ABI Read(const SrtRuntime* runtime, const Node* node,
+	                               const uint64_t* values, uint64_t* output) {
+		uint64_t address = 0;
+		if (!ReadAddress(node, values, address)) return false;
 		uint32_t   value = 0;
 		const auto reader =
 		    node->clean ? runtime->read_specialization_memory : runtime->read_memory;
@@ -84,6 +93,10 @@ struct LinearSrtPlan {
 		}
 		*output = value;
 		return true;
+	}
+	static bool KYTY_SYSV_ABI ReadSpan(const SrtRuntime* runtime, uint64_t address, uint32_t* words,
+	                                   uint32_t count, bool clean) {
+		return runtime->try_read_memory_span(runtime->userdata, address, words, count, clean);
 	}
 };
 
@@ -97,6 +110,122 @@ class LinearSrtCompiler {
 	static constexpr uint32_t                        Invalid = UINT32_MAX;
 	using Kind                                               = LinearSrtPlan::Kind;
 	using Node                                               = LinearSrtPlan::Node;
+
+	bool SameArgument(uint32_t a, uint32_t b) const {
+		return a == b || (result.nodes[a].kind == Kind::Immediate &&
+		                  result.nodes[b].kind == Kind::Immediate &&
+		                  result.nodes[a].immediate == result.nodes[b].immediate);
+	}
+	bool ConsecutiveRead(const Node& a, const Node& b) const {
+		if (a.op != b.op || !SameArgument(a.args[0], b.args[0]) ||
+		    !SameArgument(a.args[1], b.args[1]) ||
+		    (a.op == ValueOpcode::ReadConstBuffer && !SameArgument(a.args[3], b.args[3])))
+			return false;
+		if (result.nodes[a.args[2]].kind != Kind::Immediate ||
+		    result.nodes[b.args[2]].kind != Kind::Immediate)
+			return false;
+		const auto offset = [&](const Node& n) {
+			const int64_t immediate = static_cast<int32_t>(n.immediate);
+			const auto    value     = static_cast<uint32_t>(result.nodes[n.args[2]].immediate);
+			return n.op == ValueOpcode::ReadConstBuffer
+			           ? (immediate + value) & ~int64_t {3}
+			           : (immediate & ~int64_t {3}) + (value & ~3u);
+		};
+		if (a.op == ValueOpcode::ReadConstBuffer &&
+		    (static_cast<int32_t>(a.immediate) < 0 || static_cast<int32_t>(b.immediate) < 0))
+			return false;
+		return offset(b) == offset(a) + 4;
+	}
+	void GroupReads() {
+		// Move only infallible immediates across reads. Never cross user loads,
+		// computations, another reader policy, or a parent-pointer dependency.
+		for (uint32_t first = 0; first < result.nodes.size(); ++first) {
+			if (result.nodes[first].kind != Kind::Read) continue;
+			LinearSrtPlan::ReadGroup group {};
+			group.indices[group.count++] = first;
+			for (uint32_t next = first + 1; next < result.nodes.size() && group.count < 16;
+			     ++next) {
+				const auto& n = result.nodes[next];
+				if (n.kind == Kind::Immediate) continue;
+				if (n.kind != Kind::Read || n.clean != result.nodes[first].clean) break;
+				if (!ConsecutiveRead(result.nodes[group.indices[group.count - 1]], n)) break;
+				bool dependent = false;
+				for (const auto arg: n.args)
+					dependent |= arg >= first && result.nodes[arg].kind != Kind::Immediate;
+				if (dependent) break;
+				group.indices[group.count++] = next;
+			}
+			if (group.count < 2) continue;
+			first = group.indices[group.count - 1];
+			result.read_groups.push_back(group);
+		}
+	}
+	void EmitCompiledGroup(Xbyak::CodeGenerator& c, const LinearSrtPlan::ReadGroup& group,
+	                       Xbyak::Label& scalar, Xbyak::Label& after) {
+		using namespace Xbyak::util;
+		const auto& first    = result.nodes[group.indices[0]];
+		const auto& last     = result.nodes[group.indices[group.count - 1]];
+		const auto  relative = [&](const Node& n) -> int64_t {
+            const auto immediate = int64_t {static_cast<int32_t>(n.immediate)};
+            const auto offset = int64_t {static_cast<uint32_t>(result.nodes[n.args[2]].immediate)};
+            return n.op == ValueOpcode::ReadConstBuffer
+			            ? (immediate + offset) & ~int64_t {3}
+			            : (immediate & ~int64_t {3}) + (offset & ~int64_t {3});
+		};
+		const auto start = relative(first), end = relative(last);
+		// These are compiler invariants, not a relaxation of runtime bounds.
+		EXIT_IF(group.count < 2 || group.count > 16 || end - start != (group.count - 1) * 4u);
+		c.mov(rax, c.qword[r13 + first.args[1] * 8]);
+		c.shl(rax, 32);
+		c.mov(esi, c.dword[r13 + first.args[0] * 8]);
+		c.or_(rsi, rax);
+		c.mov(rax, 0x0000fffffffffffcull);
+		c.and_(rsi, rax);
+		if (first.op == ValueOpcode::ReadConstBuffer) {
+			EXIT_IF(start < 0 || static_cast<int32_t>(first.immediate) < 0);
+			c.mov(eax, c.dword[r13 + first.args[1] * 8]);
+			c.shr(eax, 16);
+			c.and_(eax, 0x3fff);
+			c.mov(edx, c.dword[r13 + first.args[3] * 8]);
+			Xbyak::Label no_stride;
+			c.test(eax, eax);
+			c.jz(no_stride);
+			c.imul(rdx, rax);
+			c.L(no_stride);
+			c.mov(rax, static_cast<uint64_t>(end) + 4u);
+			c.cmp(rdx, rax);
+			c.jb(scalar, Xbyak::CodeGenerator::T_NEAR);
+		} else {
+			if (start < 0) {
+				c.mov(rax, static_cast<uint64_t>(-start));
+				c.cmp(rsi, rax);
+				c.jb(scalar, Xbyak::CodeGenerator::T_NEAR);
+			}
+			if (end >= 0) {
+				c.mov(rax, 0x0000ffffffffffffull - static_cast<uint64_t>(end));
+				c.cmp(rsi, rax);
+				c.ja(scalar, Xbyak::CodeGenerator::T_NEAR);
+			}
+		}
+		if (start != 0) {
+			c.mov(rax, static_cast<uint64_t>(start));
+			c.add(rsi, rax);
+		}
+		c.mov(rdi, r12);
+		c.mov(rdx, rsp);
+		c.mov(ecx, group.count);
+		c.mov(r8d, first.clean ? 1 : 0);
+		// An explicit SysV helper bridges to the host callback ABI on Windows too.
+		c.mov(rax, reinterpret_cast<uint64_t>(&LinearSrtPlan::ReadSpan));
+		c.call(rax);
+		c.test(al, al);
+		c.jz(scalar, Xbyak::CodeGenerator::T_NEAR);
+		for (uint32_t j = 0; j < group.count; ++j) {
+			c.mov(eax, c.dword[rsp + j * 4]);
+			c.mov(c.qword[r13 + group.indices[j] * 8], rax);
+		}
+		c.jmp(after, Xbyak::CodeGenerator::T_NEAR);
+	}
 
 	static bool Binary(ValueOpcode op) {
 		switch (op) {
@@ -286,6 +415,7 @@ public:
 			result.flat_words[read.flat_offset] = index;
 		}
 		if (result.nodes.empty() && active_sources.empty()) return false;
+		GroupReads();
 		Xbyak::ClearError();
 		result.code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 		if (Xbyak::GetError() != 0 || !result.code->getCode()) {
@@ -295,14 +425,39 @@ public:
 		auto& c = *result.code;
 		using namespace Xbyak::util;
 		Xbyak::Label fail, done;
+		std::vector<Xbyak::Label> after_group(result.read_groups.size());
+		std::vector<uint32_t>     group_starts(result.nodes.size(), Invalid);
+		std::vector<uint32_t>     group_ends(result.nodes.size() + 1, Invalid);
+		for (uint32_t g = 0; g < result.read_groups.size(); ++g) {
+			const auto& group                              = result.read_groups[g];
+			group_starts[group.indices[0]]                 = g;
+			group_ends[group.indices[group.count - 1] + 1] = g;
+		}
 		c.push(r12);
 		c.push(r13);
-		c.sub(rsp, 8);
+		const uint32_t stack_size = result.read_groups.empty() ? 8 : 72;
+		c.sub(rsp, stack_size);
 		c.mov(r12, rdi);
 		c.mov(r13, rsi);
 		// SrtRuntime::user_data is a standard-library span. Its physical layout
 		// stays in a C++ accessor instead of embedding an ABI assumption here.
 		for (uint32_t i = 0; i < result.nodes.size(); ++i) {
+			if (group_ends[i] != Invalid) c.L(after_group[group_ends[i]]);
+			if (group_starts[i] != Invalid) {
+				const auto   g     = group_starts[i];
+				const auto&  group = result.read_groups[g];
+				Xbyak::Label scalar;
+				c.cmp(c.qword[r12 + offsetof(SrtRuntime, try_read_memory_span)], 0);
+				c.jz(scalar, Xbyak::CodeGenerator::T_NEAR);
+				// Only infallible immediates have moved across the ordered reads.
+				for (uint32_t j = i + 1; j < group.indices[group.count - 1]; ++j) {
+					if (result.nodes[j].kind != Kind::Immediate) continue;
+					c.mov(rax, result.nodes[j].immediate);
+					c.mov(c.qword[r13 + j * 8], rax);
+				}
+				EmitCompiledGroup(c, group, scalar, after_group[g]);
+				c.L(scalar);
+			}
 			const auto& n = result.nodes[i];
 			switch (n.kind) {
 				case Kind::Immediate: c.mov(rax, n.immediate); break;
@@ -423,12 +578,13 @@ public:
 			}
 			c.mov(c.qword[r13 + i * 8], rax);
 		}
+		if (group_ends.back() != Invalid) c.L(after_group[group_ends.back()]);
 		c.mov(eax, 1);
 		c.jmp(done);
 		c.L(fail);
 		c.xor_(eax, eax);
 		c.L(done);
-		c.add(rsp, 8);
+		c.add(rsp, stack_size);
 		c.pop(r13);
 		c.pop(r12);
 		c.ret();

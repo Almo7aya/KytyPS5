@@ -1332,29 +1332,8 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
 		const auto args_addr = buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u);
-		uint32_t   mode      = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args_addr == 0);
-		if (!Libs::LibKernel::Memory::SyncGpuCleanBacking(args_addr, sizeof(DispatchIndirectArgs))) {
-			static std::atomic<uint32_t> sync_fallback_logs {0};
-			if (sync_fallback_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-				LOGF("DispatchIndirect: failed to synchronise indirect arguments at 0x%016" PRIx64
-				     " (image-owned range, reading guest memory)\n",
-				     args_addr);
-			}
-		}
-		DispatchIndirectArgs args {};
-		std::memcpy(&args, reinterpret_cast<const void*>(args_addr), sizeof(args));
-		cp.DispatchDirect(args.thread_group_x, args.thread_group_y, args.thread_group_z, mode,
-		                  args_addr);
-
+		cp.DispatchIndirectAddress(args_addr, buffer[2]);
 		return 3;
 	}
 

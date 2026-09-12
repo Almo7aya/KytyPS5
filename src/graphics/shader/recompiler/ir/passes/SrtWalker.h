@@ -12,6 +12,8 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
 using SrtMemorySync   = bool (*)(void* userdata, uint64_t address, uint64_t size);
+// A rejected probe performs no read/sync; the original scalar sequence follows.
+using SrtMemorySpan = bool (*)(void*, uint64_t, uint32_t*, uint32_t count, bool clean);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -20,6 +22,7 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	SrtMemorySync             sync_memory                = nullptr;
+	SrtMemorySpan             try_read_memory_span       = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
