@@ -11,6 +11,26 @@ GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandSchedule
 
 GpuResourceManager::~GpuResourceManager() = default;
 
+void GpuResourceManager::BeginAliasWrite() noexcept {
+	{
+		const auto old = m_preparation_alias_epoch.fetch_add((uint64_t{1} << 32u) + 1u,
+		    std::memory_order_acq_rel);
+		EXIT_IF(uint32_t(old >> 32u) == UINT32_MAX || uint32_t(old) == UINT32_MAX);
+	}
+}
+
+void GpuResourceManager::EndAliasWrite() noexcept {
+	{
+		const auto old = m_preparation_alias_epoch.fetch_sub(1u, std::memory_order_release);
+		EXIT_IF(uint32_t(old) == 0);
+	}
+}
+
+uint64_t GpuResourceManager::PreparationAliasEpoch() const noexcept {
+	const auto value = m_preparation_alias_epoch.load(std::memory_order_acquire);
+	return uint32_t(value) == 0 ? value : 0;
+}
+
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.

@@ -1026,6 +1026,8 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	const auto phys = static_cast<uint64_t>(phys_addr);
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 4),
 	      "direct mapping escaped the guest owner");
+	Check(test, Libs::LibKernel::Memory::IsUniqueGuestBackingRange(base, SceKernelPageSize),
+	      "single mapping should establish a unique backing range");
 	void* alias = nullptr;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
@@ -1033,6 +1035,9 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            "prospero_direct_alias"),
 	        "KernelMapNamedDirectMemory(alias)");
 	const auto alias_base = reinterpret_cast<uint64_t>(alias);
+	Check(test, !Libs::LibKernel::Memory::IsUniqueGuestBackingRange(base, SceKernelPageSize) &&
+	      !Libs::LibKernel::Memory::IsUniqueGuestBackingRange(alias_base, SceKernelPageSize),
+	      "new physical alias must invalidate cached uniqueness");
 
 	constexpr uint64_t alias_test_value = 0x4b595459444d454dull; // "KYTYDMEM"
 	*reinterpret_cast<uint64_t*>(base)  = alias_test_value;
@@ -1104,6 +1109,8 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	    test,
 	    Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize * 2),
 	    "KernelMunmap(direct right cleanup)");
+	Check(test, Libs::LibKernel::Memory::IsUniqueGuestBackingRange(alias_base, SceKernelPageSize),
+	      "removing original mappings must invalidate cached alias ranges");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias_base, SceKernelPageSize * 4),
 	        "KernelMunmap(direct alias cleanup)");
 	CheckOk(test,

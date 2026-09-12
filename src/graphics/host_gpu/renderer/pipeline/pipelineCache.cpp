@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderReadObserver.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
@@ -325,12 +326,14 @@ struct PipelineCache::ProgramCache {
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		const ShaderRecompiler::IR::SrtRuntime       input_runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .sync_memory                = SyncShaderGuestMemory,
 		};
+		ShaderReadObserver::Runtime observed_runtime(input_runtime);
+		const auto& runtime = observed_runtime.Get();
 		ShaderRecompiler::IR::MaterializeReport report;
 		if (entry != programs.end()) {
 			ReportMaterialization(label, stage, params.hash, report,

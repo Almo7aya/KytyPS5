@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/renderDraw.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -1536,10 +1537,11 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test, bool lod_stats = false) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test, bool lod_stats = false, bool lod_subgroup = false) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
+  pixel_info.lod_stats_subgroup = lod_subgroup;
   pixel_info.input_num =
       test.pixel_interpolator_settings.empty()
           ? 1u
@@ -12117,13 +12119,14 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
-  void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false) {
+  void CheckRasterization(bool depth_feedback, bool lod_stats = false, uint32_t lod_extent = 8, bool packed_vertex_color = false, bool lod_subgroup = false) {
     const char *name = packed_vertex_color ? "PackedFloatVertexColor" : lod_stats ? "GpuLodStatsFeedback" :
         (depth_feedback ? "DepthAttachmentFeedback" : "PolygonModeRasterization");
     const uint32_t extent = lod_stats ? lod_extent : (depth_feedback ? 8 : 32);
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x20000;
     EnsureRuntimeContext();
+    if (lod_subgroup && !m_runtime_context.fragment_subgroup_reduction) return;
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -12211,7 +12214,7 @@ public:
     test.fragment_code.push_back(packed_vertex_color ? EncodeExp1(0, 1, 2, 3)
                                                     : EncodeExp1(0, 0, 0, 0));
     AppendEnd(&test.fragment_code);
-    auto fragment = CompileFragmentCase(test, lod_stats);
+    auto fragment = CompileFragmentCase(test, lod_stats, lod_subgroup);
     const auto vertex_spirv = TestSpv::MakePassthroughVertexSpirv(false);
     const ShaderProgram vertex_shader{1, CreateShaderModule(name, vertex_spirv)};
     const ShaderProgram pixel_shader{2, CreateShaderModule(name, fragment.spirv)};
@@ -13713,6 +13716,15 @@ private:
     m_runtime_context.device = m_device;
     m_physical_device.getProperties(
         &m_runtime_context.physical_device_properties);
+    vk::PhysicalDeviceSubgroupProperties subgroup{};
+    vk::PhysicalDeviceProperties2 properties{};
+    properties.pNext = &subgroup;
+    m_physical_device.getProperties2(&properties);
+    constexpr auto reduction_operations = vk::SubgroupFeatureFlagBits::eBasic |
+        vk::SubgroupFeatureFlagBits::eVote | vk::SubgroupFeatureFlagBits::eArithmetic;
+    m_runtime_context.fragment_subgroup_reduction =
+        bool(subgroup.supportedStages & vk::ShaderStageFlagBits::eFragment) &&
+        (subgroup.supportedOperations & reduction_operations) == reduction_operations;
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
@@ -29789,6 +29801,78 @@ void CheckPm4CeCompletion(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4CeCompletion");
 }
 
+void CheckDrawRunArguments() {
+  constexpr const char *name = "DrawRunArguments";
+  const std::array<uint64_t, 3> starts{0x200009004ull, 0x200009018ull, 0x200009030ull};
+  std::array<DrawIndexArgs, 3> arguments;
+  for (size_t i = 0; i < arguments.size(); ++i)
+    arguments[i] = {.index_count = 3,
+                    .index_addr = reinterpret_cast<void *>(starts[i]),
+                    .instance_count = i == 1 ? 2u : 1u,
+                    .index_type_and_size = 1,
+                    .base_vertex = static_cast<int32_t>(3 * i) - 1,
+                    .first_instance = i == 0   ? 7u
+                                      : i == 1 ? 3u
+                                               : 1u,
+                    .offset_source = DrawOffsetSource::IndirectArgs};
+  DrawIndexRun run;
+  Require(name, "draw-run lowering",
+          BuildDrawIndexRun(arguments, run) && run.indices.address == starts[0] &&
+              run.indices.size == 56 &&
+              run.commands[0] == vk::DrawIndexedIndirectCommand{3, 1, 0, -1, 7} &&
+              run.commands[1] == vk::DrawIndexedIndirectCommand{3, 2, 5, 2, 3} &&
+              run.commands[2] == vk::DrawIndexedIndirectCommand{3, 1, 11, 5, 1},
+          "index relocation, signed vertex offset or instance arguments changed");
+  const auto saved_run = run;
+  for (unsigned scenario = 0; scenario < 7; ++scenario) {
+    auto invalid = arguments;
+    auto &item = invalid[1];
+    switch (scenario) {
+    case 0:
+      item.index_count = 0;
+      break;
+    case 1:
+      item.instance_count = 0;
+      break;
+    case 2:
+      item.index_type_and_size = 0;
+      break;
+    case 3:
+      item.offset_source = DrawOffsetSource::DrawState;
+      break;
+    case 4:
+      item.index_addr = reinterpret_cast<void *>(starts[1] + 1);
+      break;
+    case 5:
+      item.index_addr = reinterpret_cast<void *>(UINT64_MAX - 3);
+      break;
+    case 6:
+      item.index_addr = reinterpret_cast<void *>(starts[1] + (32u << 20));
+      break;
+    }
+    Require(name, "draw-run rejection",
+            !BuildDrawIndexRun(invalid, run) && run.commands == saved_run.commands &&
+                run.indices.address == saved_run.indices.address &&
+                run.indices.size == saved_run.indices.size,
+            "invalid run was accepted or partially published");
+  }
+  std::array<DrawIndexArgs, 65> boundary;
+  boundary.fill(arguments[0]);
+  Require(name, "draw-run capacity",
+          !BuildDrawIndexRun({}, run) && !BuildDrawIndexRun(std::span{boundary}.first(1), run) &&
+              BuildDrawIndexRun(std::span{boundary}.first(64), run) &&
+              !BuildDrawIndexRun(boundary, run),
+          "run count bound was lost");
+  Require(name, "restore run", BuildDrawIndexRun(arguments, run), "valid run no longer lowers");
+
+  for (auto &item : arguments)
+    item.index_type_and_size = 0;
+  Require(name, "16-bit offsets",
+          BuildDrawIndexRun(arguments, run) && run.commands[1].firstIndex == 10 &&
+              run.indices.guest_element_size == 2,
+          "16-bit index displacement was not scaled");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -29798,6 +29882,7 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  CheckDrawRunArguments();
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckPackedTextureComponents();
@@ -29807,6 +29892,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckRasterization(true, true);
     vulkan.CheckRasterization(true, true, 7);
+    vulkan.CheckRasterization(true, true, 8, false, true);
+    vulkan.CheckRasterization(true, true, 7, false, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--lodstats-emission-only") == 0) {

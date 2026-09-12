@@ -169,6 +169,8 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 
 private:
+	bool TryDrawIndexRun(uint64_t submit_id, CommandBuffer& buffer, std::span<const DrawIndexArgs> draws,
+	                     std::span<const uint64_t> argument_addresses);
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 
@@ -191,7 +193,7 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          bool log_setup_phases, DrawRenderState& state);
-	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	bool ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable, bool log_pipeline_phase,
