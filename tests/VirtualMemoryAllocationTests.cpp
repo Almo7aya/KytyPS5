@@ -768,6 +768,14 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestStackExitLifecycle() {
+	const char* test = "GuestStackExitLifecycle";
+	Check(test, Libs::LibKernel::TestGuestStackExitLifecycle(),
+	      "normal return or explicit pthread exit lost its host frame/TLS/return "
+	      "value");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
 
@@ -2517,6 +2525,10 @@ void TestModuleRelocationUsesWritableHostMapping() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-exit-only") == 0) {
+		RunTest(TestGuestStackExitLifecycle);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -2534,6 +2546,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
+	RunTest(TestGuestStackExitLifecycle);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);
