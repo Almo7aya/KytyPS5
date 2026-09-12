@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -2893,6 +2894,210 @@ void TestFunctionLdsLayout() {
 
 } // namespace
 
+void TestControlledLinearSrt() {
+#if defined(__x86_64__) || defined(_M_X64)
+  struct Memory {
+    int first=0,second=0,fail=0;
+    std::vector<std::pair<uint64_t,bool>> calls;
+  };
+  const auto raw=+[](void* ptr,uint64_t address,uint32_t* word) {
+    auto& memory=*static_cast<Memory*>(ptr);memory.calls.emplace_back(address,false);
+    if(int(memory.calls.size())==memory.fail)return false;
+    *word=uint32_t(address)^0x73846521u;return true;
+  };
+  const auto clean=+[](void* ptr,uint64_t address,uint32_t* word) {
+    auto& memory=*static_cast<Memory*>(ptr);memory.calls.emplace_back(address,true);
+    const auto flag=address==0x8000u ? memory.first : memory.second;
+    if(flag<0 || int(memory.calls.size())==memory.fail)return false;
+    *word=uint32_t(flag);return true;
+  };
+  for(const bool loop:{false,true}) {
+    Fixture fixture;
+    auto& plan=fixture.program;
+    const auto read=[&](uint32_t address) {
+      MemoryInfo info;info.kind=ResourceKind::ScalarAddress;
+      return fixture.Emit(ValueOpcode::LoadAddressU32,
+        {fixture.Address(Value(address),Value(0u)),Value(0u),Value(0u),Value(true)},fixture.AddMemory(info,0));
+    };
+    const auto a=fixture.Emit(ValueOpcode::INotEqual32,{read(0x8000),Value(0u)});
+    const auto b=fixture.Emit(ValueOpcode::INotEqual32,{read(0x8004),Value(0u)});
+    plan.descriptor_sources.resize(4);
+    for(uint32_t i=0;i<4;++i) {
+      auto& source=plan.descriptor_sources[i];source.dword_count=1;
+      source.dwords[0]=read(0x1000u*(i+1));
+    }
+    // Duplicate descriptor sources share a read; inactive descriptors are zero.
+    // Flat values still execute in their original order, even if a related
+    // descriptor is inactive. Back edges must terminate by the visited mask.
+    plan.materialization_sources={3,1,0,2,1};
+    plan.srt_reads={{plan.descriptor_sources[0].dwords[0],0},
+                    {plan.descriptor_sources[3].dwords[0],1}};
+    plan.control_flow={{a,{1,2},{0}},{b,{3,2},{1}},{{},{},{2}},
+                       {{},{loop?0u:2u},{3}}};
+    plan.srt_plan_complete=true;
+    BuildLinearSrtPlan(plan);
+    Check(plan.linear_srt && !plan.linear_srt->control_variants.empty() &&
+      plan.linear_srt->control_variants.size()<=9,"conditional source combinations did not compile");
+    const auto compiled=plan.linear_srt;
+    for(const int first:{0,1,-1})for(const int second:{0,1,-1})
+      for(const int fail:{0,1,2,3,4,5,6,7,8})for(const bool clean_reader:{false,true}) {
+        Memory original{first,second,fail},native=original;
+        SrtRuntime runtime{.read_memory=raw,.userdata=&original,
+                           .read_specialization_memory=clean_reader?clean:nullptr};
+        std::vector<DescriptorValue> expected(1),actual=expected;
+        expected[0].dwords[0]=actual[0].dwords[0]=0xdeadbeefu;
+        std::vector<uint32_t> expected_flat{0x1234},actual_flat=expected_flat;
+        std::vector<uint8_t> expected_active{7},actual_active=expected_active;
+        plan.linear_srt.reset();
+        const bool reference=EvaluateRuntimeSources(plan,plan.materialization_sources,runtime,
+          expected,expected_flat,{},expected_active);
+        runtime.userdata=&native;plan.linear_srt=compiled;
+        const bool result=EvaluateRuntimeSources(plan,plan.materialization_sources,runtime,
+          actual,actual_flat,{},actual_active);
+        Check(reference==result && expected==actual && expected_flat==actual_flat &&
+          expected_active==actual_active && original.calls==native.calls,
+          "controlled graph changed predicates, inactive reads, memoization, failure output or read order");
+      }
+    plan.clean_flat_slots={1,0};BuildLinearSrtPlan(plan);
+    Check(!plan.linear_srt,"conditional graph with shared clean-flat memo was accepted");
+    plan.clean_flat_slots.clear();plan.control_flow.push_back({a,{0,1},{}});
+    BuildLinearSrtPlan(plan);
+    Check(!plan.linear_srt,"unbounded conditional variant enumeration was accepted");
+  }
+  auto optional=ConditionalBufferPlan(ConditionalBufferUse::Optional);
+  Check(optional.linear_srt && !optional.linear_srt->control_variants.empty(),
+    "production-extracted conditional resource plan did not compile");
+#endif
+}
+
+
+void TestLinearSrtDifferential() {
+#if defined(__x86_64__) || defined(_M_X64)
+  Fixture fixture;
+  const auto a=fixture.Emit(ValueOpcode::CompositeConstructU64,{fixture.UserData(0),fixture.UserData(1)});
+  const auto b=fixture.Emit(ValueOpcode::CompositeConstructU64,{fixture.UserData(2),fixture.UserData(3)});
+  const ValueOpcode operations[] {
+    ValueOpcode::IAdd32,ValueOpcode::IAdd64,ValueOpcode::ISub32,ValueOpcode::ISub64,
+    ValueOpcode::IMul32,ValueOpcode::IMul64,ValueOpcode::BitwiseAnd32,ValueOpcode::BitwiseAnd64,
+    ValueOpcode::BitwiseOr32,ValueOpcode::BitwiseXor32,ValueOpcode::ShiftLeftLogical32,
+    ValueOpcode::ShiftLeftLogical64,ValueOpcode::ShiftRightLogical32,ValueOpcode::ShiftRightLogical64,
+    ValueOpcode::ShiftRightArithmetic32,ValueOpcode::ShiftRightArithmetic64,ValueOpcode::CompositeConstructU64,
+    ValueOpcode::IEqual32,ValueOpcode::INotEqual32,ValueOpcode::ULessThan32,ValueOpcode::UGreaterThan32,
+    ValueOpcode::UGreaterThanEqual32,ValueOpcode::UMin32,ValueOpcode::LogicalAnd,ValueOpcode::LogicalOr,ValueOpcode::LogicalXor};
+  auto output=[&](Value value){fixture.program.srt_reads.push_back({value,uint32_t(fixture.program.srt_reads.size())});};
+  for(const auto op:operations) {
+    const auto v=fixture.Emit(op,{a,b});output(v);
+    output(fixture.Emit(ValueOpcode::CompositeExtractU64,{v,Value(1u)}));
+  }
+  output(fixture.Emit(ValueOpcode::BitwiseNot32,{a}));
+  output(fixture.Emit(ValueOpcode::LogicalNot,{a}));
+  output(fixture.Emit(ValueOpcode::SelectU32,{fixture.UserData(0),a,b}));
+  fixture.program.srt_plan_complete=true;
+  auto plan=ExtractResourcePlan(fixture.program);
+  Check(plan.linear_srt!=nullptr,"whole-graph arithmetic fixture did not compile");
+  const auto compiled=plan.linear_srt;
+  uint32_t seed=0x743512fe;
+  for(uint32_t trial=0;trial<1024;++trial) {
+    std::array<uint32_t,4> data;
+    for(auto& word:data){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;word=seed;}
+    if(trial<128)data[2]=trial;
+    if(trial==128)data.fill(0);
+    if(trial==129)data.fill(UINT32_MAX);
+    std::vector<uint32_t> expected{0xdeadbeef},actual=expected;
+    const auto words=trial%23==0?std::span<const uint32_t>{}:std::span<const uint32_t>{data};
+    plan.linear_srt.reset();const bool old_ok=WalkSrt(plan,{.user_data=words},expected);
+    plan.linear_srt=compiled;const bool new_ok=WalkSrt(plan,{.user_data=words},actual);
+    Check(old_ok==new_ok && expected==actual,"linear native arithmetic/failure differs from evaluator");
+  }
+#endif
+}
+
+void TestLinearSrtReads() {
+#if defined(__x86_64__) || defined(_M_X64)
+  struct Memory {std::vector<std::pair<uint64_t,bool>> calls;int fail=-1;uint32_t salt=0;};
+  const auto raw=+[](void* p,uint64_t a,uint32_t* v){
+    auto& m=*static_cast<Memory*>(p);m.calls.emplace_back(a,false);
+    if(int(m.calls.size())==m.fail)return false;*v=uint32_t(a^(a>>32))^m.salt^0x6821u;return true;
+  };
+  const auto clean=+[](void* p,uint64_t a,uint32_t* v){
+    auto& m=*static_cast<Memory*>(p);m.calls.emplace_back(a,true);
+    if(int(m.calls.size())==m.fail)return false;*v=uint32_t(a^(a>>32))^m.salt^0x1847u;return true;
+  };
+  for(bool buffer:{false,true})for(uint32_t immediate:{0u,4u,0x7ffffffcu,0xfffffffcu}) {
+    Fixture f;
+    MemoryInfo info;info.kind=buffer?ResourceKind::ScalarBuffer:ResourceKind::ScalarAddress;info.offset=immediate;info.planning_only=true;
+    const auto flags=f.AddMemory(info,0);
+    const auto handle=buffer?f.Buffer({f.UserData(0),f.UserData(1),f.UserData(3),f.UserData(4)}):f.Address(f.UserData(0),f.UserData(1));
+    const auto value=buffer?f.Emit(ValueOpcode::ReadConstBuffer,{handle,f.UserData(2)},flags):
+      f.Emit(ValueOpcode::LoadAddressU32,{handle,f.UserData(2),Value(0u),Value(true)},flags);
+    const auto alias=f.Emit(ValueOpcode::ReadConst,{Value(0u),Value(0u)});
+    f.program.srt_reads={{value,0},{value,1},{alias,2}};f.program.srt_plan_complete=true;
+    auto plan=ExtractResourcePlan(f.program);
+    // Distinct raw/clean evaluator caches must be preserved when the same
+    // raw node is reached through a clean alias and as a raw output.
+    plan.clean_flat_slots={1,0,0};BuildLinearSrtPlan(plan);
+    Check(plan.linear_srt!=nullptr,"whole-graph scalar fixture did not compile");
+    const auto compiled=plan.linear_srt;
+    uint32_t seed=0x37bf5182;
+    for(uint32_t trial=0;trial<256;++trial) {
+      std::array<uint32_t,5> data;
+      for(auto& word:data){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;word=seed;}
+      if(trial<64){data[0]=0x1000;data[1]&=0xffff;data[2]=trial;data[3]=trial/2;}
+      if(trial==64){data[0]=0;data[1]=0;data[2]=0;}
+      if(trial==65){data[0]=0xfffffffc;data[1]=0xffff;data[2]=UINT32_MAX;}
+      Memory reference,native;reference.fail=native.fail=trial%7==0?1:trial%7==1?2:-1;reference.salt=native.salt=trial;
+      std::vector<DescriptorValue> ev,av;std::vector<uint32_t> expected{1234},actual=expected;std::vector<uint8_t> ea{9},aa=ea;
+      SrtRuntime r{.user_data=data,.read_memory=raw,.userdata=&reference,.read_specialization_memory=clean};
+      plan.linear_srt.reset();
+      const bool old_ok=EvaluateRuntimeSources(plan,{},r,ev,expected,plan.clean_flat_slots,ea);
+      r.userdata=&native;plan.linear_srt=compiled;
+      const bool new_ok=EvaluateRuntimeSources(plan,{},r,av,actual,plan.clean_flat_slots,aa);
+      Check(old_ok==new_ok && expected==actual && ea==aa && reference.calls==native.calls,
+            "linear scalar read changed reader, order, memoization, address, or failure");
+      Check(native.calls.size()<=2,"shared read was repeated inside a graph");
+    }
+  }
+  // Reader callbacks may reenter evaluation. Each invocation needs distinct
+  // scratch storage even when both calls execute the same generated function.
+  Fixture reentrant;
+  MemoryInfo read_info;read_info.kind=ResourceKind::ScalarAddress;read_info.planning_only=true;
+  const auto read_flags=reentrant.AddMemory(read_info,0);
+  const auto address=reentrant.Address(reentrant.UserData(0),Value(0u));
+  const auto read=reentrant.Emit(ValueOpcode::LoadAddressU32,{address,Value(0u),Value(0u),Value(true)},read_flags);
+  const auto sum=reentrant.Emit(ValueOpcode::IAdd32,{reentrant.UserData(1),read});
+  reentrant.program.srt_reads={{sum,0},{read,1}};reentrant.program.srt_plan_complete=true;
+  auto reentrant_plan=ExtractResourcePlan(reentrant.program);
+  Check(reentrant_plan.linear_srt!=nullptr,"reentrant graph was not compiled");
+  struct Nested {const ResourcePlan* plan;bool nested=false,ok=false;uint32_t calls=0;};
+  Nested nested{&reentrant_plan};
+  const auto recursive=+[](void* data,uint64_t address,uint32_t* output) {
+    auto& state=*static_cast<Nested*>(data);++state.calls;
+    if(state.nested){*output=17;return true;}
+    state.nested=true;
+    const uint32_t words[]={0x2000,99};std::vector<uint32_t> result;
+    const auto inner=+[](void* data,uint64_t address,uint32_t* output){
+      auto& state=*static_cast<Nested*>(data);++state.calls;*output=17;return address==0x2000 && state.nested;
+    };
+    state.ok=WalkSrt(*state.plan,{.user_data=words,.read_memory=inner,.userdata=data},result) &&
+             result==std::vector<uint32_t>{116,17};
+    state.nested=false;*output=31;return state.ok && address==0x1000;
+  };
+  const uint32_t inputs[]={0x1000,7};std::vector<uint32_t> reentrant_result;
+  Check(WalkSrt(reentrant_plan,{.user_data=inputs,.read_memory=recursive,.userdata=&nested},reentrant_result) &&
+        nested.ok && nested.calls==2 && reentrant_result==std::vector<uint32_t>{38,31},
+        "reader reentry corrupted an outer graph or repeated a shared load");
+  // Reject unsupported graphs before evaluating anything; never partially run
+  // a generated prefix and then retry the original reader sequence.
+  Fixture unsupported;unsupported.program.srt_plan_complete=true;
+  unsupported.program.srt_reads={{unsupported.Emit(ValueOpcode::UndefU32,{}),0}};
+  auto no_plan=ExtractResourcePlan(unsupported.program);
+  Check(!no_plan.linear_srt,"unsupported graph acquired executable code");
+  std::vector<uint32_t> unchanged{0xbeef};
+  Check(!WalkSrt(no_plan,{},unchanged) && unchanged==std::vector<uint32_t>{0xbeef},"fallback changed failed output");
+#endif
+}
+
+
 int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--benchmark-srt") == 0) {
     Fixture fixture;
@@ -2926,6 +3131,9 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("controlled linear SRT", TestControlledLinearSrt);
+    Run("linear SRT arithmetic", TestLinearSrtDifferential);
+    Run("linear SRT reads", TestLinearSrtReads);
     Run("private LDS scalar slots", TestFunctionLdsLayout);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);

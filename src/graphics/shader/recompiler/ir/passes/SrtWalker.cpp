@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/passes/LinearSrt.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include "common/assert.h"
@@ -1144,6 +1145,28 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
+static void EvaluateSourceActivity(const ResourcePlan& program, const SrtRuntime& runtime,
+                                    Evaluator& clean_evaluator, std::vector<uint8_t>& active) {
+    active.assign(program.descriptor_sources.size(),1u);
+    for(const auto& block:program.control_flow)
+        for(const auto source:block.sources)active.at(source)=0u;
+    if(program.control_flow.empty())return;
+    std::vector<uint8_t> visited(program.control_flow.size());
+    std::vector<uint32_t> pending{0};
+    while(!pending.empty()) {
+        const auto index=pending.back();pending.pop_back();
+        if(visited.at(index))continue;
+        visited[index]=1u;
+        const auto& block=program.control_flow[index];
+        for(const auto source:block.sources)active[source]=1u;
+        uint32_t condition=0;
+        if(!block.condition.IsEmpty() && runtime.read_specialization_memory!=nullptr &&
+            clean_evaluator.Evaluate(block.condition,condition))
+            pending.push_back(block.successors[condition!=0u?0u:1u]);
+        else pending.insert(pending.end(),block.successors.begin(),block.successors.end());
+    }
+}
+
 bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uint32_t> sources,
                                 const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                                 std::vector<uint32_t>& flat, bool evaluate_flat,
@@ -1161,38 +1184,7 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 	Evaluator            clean_evaluator(program, clean_runtime);
 	Evaluator            evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	std::vector<uint8_t> active;
-	if (evaluate_flat) {
-		active.assign(program.descriptor_sources.size(), 1u);
-	}
-	if (evaluate_flat && !program.control_flow.empty()) {
-		for (const auto& block: program.control_flow) {
-			for (const auto source: block.sources) {
-				active.at(source) = 0u;
-			}
-		}
-		std::vector<uint8_t>  visited(program.control_flow.size());
-		std::vector<uint32_t> pending {0};
-		while (!pending.empty()) {
-			const auto index = pending.back();
-			pending.pop_back();
-			if (visited.at(index)) {
-				continue;
-			}
-			visited[index]    = 1u;
-			const auto& block = program.control_flow[index];
-			for (const auto source: block.sources) {
-				active[source] = 1u;
-			}
-			uint32_t condition = 0;
-			// A missing clean reader must never fall through to the evaluator's raw-memory path.
-			if (!block.condition.IsEmpty() && runtime.read_specialization_memory != nullptr &&
-			    clean_evaluator.Evaluate(block.condition, condition)) {
-				pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
-			} else {
-				pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-			}
-		}
-	}
+	if (evaluate_flat) EvaluateSourceActivity(program, runtime, clean_evaluator, active);
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(sources.size());
 	for (const auto source_index: sources) {
@@ -1233,6 +1225,103 @@ bool EvaluateRuntimeSourcesImpl(const ResourcePlan& program, std::span<const uin
 }
 
 } // namespace
+
+#if defined(__x86_64__) || defined(_M_X64)
+static std::shared_ptr<LinearSrtPlan> BuildControlledLinearSrt(const ResourcePlan& program) {
+    if(!program.srt_plan_complete || program.control_flow.empty() || program.control_flow.size()>256 ||
+        program.descriptor_sources.empty() ||
+        std::ranges::any_of(program.clean_flat_slots,[](uint8_t value){return value!=0;}))return {};
+    // Predicate reads and raw transaction reads use separate memo domains in
+    // the interpreter. Exclude clean flat slots until that shared memo can be
+    // represented without duplicating a clean callback or changing its order.
+    std::vector<uint32_t> conditional;
+    for(uint32_t i=0;i<program.control_flow.size();++i) {
+        const auto& block=program.control_flow[i];
+        if(std::ranges::any_of(block.sources,[&](uint32_t id){return id>=program.descriptor_sources.size();}) ||
+            std::ranges::any_of(block.successors,[&](uint32_t id){return id>=program.control_flow.size();}))return {};
+        if(!block.condition.IsEmpty()) {
+            if(block.successors.size()!=2)return {};
+            conditional.push_back(i);
+        }
+    }
+    if(conditional.empty() || conditional.size()>2)return {};
+    auto root=std::make_shared<LinearSrtPlan>();
+    root->sources=program.materialization_sources;root->clean_slots=program.clean_flat_slots;
+    uint32_t combinations=1;
+    for(size_t i=0;i<conditional.size();++i)combinations*=3;
+    for(uint32_t combination=0;combination<combinations;++combination) {
+        // Three outcomes include failed/missing predicates: the existing
+        // interpreter then visits both successors conservatively.
+        std::vector<uint8_t> choices(program.control_flow.size(),2u);
+        auto encoded=combination;
+        for(const auto index:conditional){choices[index]=encoded%3;encoded/=3;}
+        std::vector<uint8_t> active(program.descriptor_sources.size(),1u),visited(program.control_flow.size());
+        for(const auto& block:program.control_flow)for(const auto source:block.sources)active[source]=0;
+        std::vector<uint32_t> pending{0};
+        while(!pending.empty()) {
+            const auto index=pending.back();pending.pop_back();
+            if(visited[index])continue;
+            visited[index]=1;
+            const auto& block=program.control_flow[index];
+            for(const auto source:block.sources)active[source]=1;
+            if(choices[index]<2)pending.push_back(block.successors[choices[index]]);
+            else pending.insert(pending.end(),block.successors.begin(),block.successors.end());
+        }
+        if(std::ranges::any_of(root->control_variants,[&](const auto& variant){return variant->active_sources==active;}))continue;
+        auto leaf=std::make_shared<LinearSrtPlan>();
+        if(!LinearSrtCompiler(program,*leaf,active).Build())return {};
+        root->control_variants.push_back(std::move(leaf));
+    }
+    return root;
+}
+#endif
+
+void BuildLinearSrtPlan(ResourcePlan& program) {
+    program.linear_srt.reset();
+#if defined(__x86_64__) || defined(_M_X64)
+    auto compiled=std::make_shared<LinearSrtPlan>();
+    if (LinearSrtCompiler(program,*compiled).Build()) program.linear_srt=std::move(compiled);
+    else program.linear_srt=BuildControlledLinearSrt(program);
+#endif
+}
+
+static bool LinearMaskMatches(std::span<const uint8_t> a,std::span<const uint8_t> b) {
+    for(size_t i=0;i<std::max(a.size(),b.size());++i)
+        if((i<a.size() && a[i]!=0)!=(i<b.size() && b[i]!=0))return false;
+    return true;
+}
+
+static bool EvaluateLinearSrt(const LinearSrtPlan& plan,const SrtRuntime& runtime,
+                             std::vector<DescriptorValue>& results,std::vector<uint32_t>& flat,
+                             std::vector<uint8_t>& active_sources) {
+    // A separate lease for each invocation also protects against reader reentry.
+    thread_local std::vector<std::vector<uint64_t>> pool;
+    std::vector<uint64_t> values;
+    if(!pool.empty()){values=std::move(pool.back());pool.pop_back();}
+    struct Recycle {
+        std::vector<std::vector<uint64_t>>& pool;std::vector<uint64_t>& values;
+        ~Recycle(){if(pool.size()<8)pool.push_back(std::move(values));}
+    } recycle{pool,values};
+    values.resize(plan.nodes.size());
+    if(!plan.function(&runtime,values.data())) return false;
+    std::vector<DescriptorValue> evaluated(plan.descriptor_sizes.size());
+    size_t cursor=0;
+    for(size_t i=0;i<evaluated.size();++i) {
+        auto& output=evaluated[i];output.dword_count=plan.descriptor_sizes[i];
+        for(uint32_t j=0;j<output.dword_count;++j) {
+            const auto node=plan.descriptor_words[cursor++];
+            output.dwords[j]=node==UINT32_MAX ? 0u : static_cast<uint32_t>(values[node]);
+        }
+    }
+    std::vector<uint32_t> flattened(plan.flat_words.size());
+    for(size_t i=0;i<flattened.size();++i)
+        if(plan.flat_words[i]!=UINT32_MAX)flattened[i]=static_cast<uint32_t>(values[plan.flat_words[i]]);
+    results=std::move(evaluated);flat=std::move(flattened);
+    if(plan.active_sources.empty())active_sources.assign(plan.active_count,1u);
+    else active_sources=plan.active_sources;
+    return true;
+}
+
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
                           std::string* reason) {
@@ -1295,6 +1384,26 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
                             const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
                             std::vector<uint8_t>& active_sources) {
+    {
+        const auto& linear=program.linear_srt;
+        if(linear && std::ranges::equal(sources,linear->sources) && LinearMaskMatches(clean_flat_slots,linear->clean_slots)) {
+            if(!program.srt_plan_complete || (runtime.read_specialization_memory==nullptr &&
+                std::ranges::any_of(clean_flat_slots,[](uint8_t v){return v!=0;})))return false;
+            if(!linear->control_variants.empty()) {
+                auto clean=runtime;clean.read_memory=runtime.read_specialization_memory;
+                Evaluator predicate_evaluator(program,clean);
+                std::vector<uint8_t> active;
+                EvaluateSourceActivity(program,runtime,predicate_evaluator,active);
+                const auto leaf=std::ranges::find_if(linear->control_variants,
+                    [&](const auto& candidate){return candidate->active_sources==active;});
+                EXIT_IF(leaf==linear->control_variants.end());
+                return EvaluateLinearSrt(**leaf,runtime,results,flat,active_sources);
+            }
+            // A runtime failure is final: replaying the original evaluator could
+            // duplicate a reader's side effects or mask a failed ownership check.
+            return EvaluateLinearSrt(*linear,runtime,results,flat,active_sources);
+        }
+    }
 	return EvaluateRuntimeSourcesImpl(program, sources, runtime, results, flat, true,
 	                                  clean_flat_slots, active_sources);
 }

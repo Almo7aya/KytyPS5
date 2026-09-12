@@ -520,6 +520,7 @@ struct UniformFillPlan {
 
 // Immutable runtime resource analysis retained by the shader cache. It owns descriptor/SRT,
 // uniform condition and fill values without retaining translated blocks.
+struct LinearSrtPlan;
 struct ResourcePlan {
 	ResourcePlan() = default;
 	~ResourcePlan();
@@ -534,6 +535,7 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	std::list<Inst>                     value_storage;
+	std::shared_ptr<const LinearSrtPlan> linear_srt;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;

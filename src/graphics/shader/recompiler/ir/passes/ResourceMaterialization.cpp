@@ -1284,6 +1284,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			                   plan.clean_flat_slots);
 		}
 	}
+	BuildLinearSrtPlan(plan);
 	return plan;
 }
 
