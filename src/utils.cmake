@@ -76,6 +76,10 @@ set(KYTY_WARNINGS_ARE_ERRORS OFF)
 set(KYTY_C_FLAGS "")
 set(KYTY_CPP_FLAGS "")
 
+if(WIN32)
+	add_compile_definitions(NOMINMAX)
+endif()
+
 # Apple's /usr/bin/ar does not understand @response-file syntax, and macOS has a
 # large ARG_MAX so response files aren't needed. Note: the Ninja generator forces a
 # response file whenever CMAKE_NINJA_FORCE_RESPONSE_FILE is *defined* (it tests

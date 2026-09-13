@@ -74,7 +74,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) return true;
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-	} else {
+	} else if (access != PageFaultAccess::Execute) {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

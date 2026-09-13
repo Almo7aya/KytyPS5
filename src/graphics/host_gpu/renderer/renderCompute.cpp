@@ -465,6 +465,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
+	const auto& limits = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	if (thread_group_x > limits.maxComputeWorkGroupCount[0] ||
+	    thread_group_y > limits.maxComputeWorkGroupCount[1] ||
+	    thread_group_z > limits.maxComputeWorkGroupCount[2]) {
+		EXIT("unsupported compute dispatch: shader=0x%016" PRIx64
+		     " groups=%ux%ux%u local=%ux%ux%u mode=0x%08" PRIx32 "\n",
+		     program.shader_hash, thread_group_x, thread_group_y, thread_group_z,
+		     input_info.threads_num[0], input_info.threads_num[1], input_info.threads_num[2], mode);
+	}
+
 	buffer.EndRendering();
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);

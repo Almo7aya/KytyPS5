@@ -102,7 +102,7 @@ public:
 			return false;
 		}
 
-		const uint32_t erase_count = std::min(count, Size() - index);
+		const uint32_t erase_count = (std::min)(count, Size() - index);
 		m_data.erase(m_data.begin() + index, m_data.begin() + index + erase_count);
 		return true;
 	}

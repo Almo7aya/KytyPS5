@@ -6,6 +6,9 @@
 #ifndef XBYAK_NO_EXCEPTION
 #define XBYAK_NO_EXCEPTION
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <xbyak/xbyak.h>
 #endif
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"

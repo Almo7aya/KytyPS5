@@ -109,7 +109,7 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size, bool synchronize = false);
 // Avoid false-sharing read faults only when exact ownership proves clean.
 bool TryReadGpuCleanBackingOnWatchedPage(uint64_t vaddr, void* data, uint64_t size);
 bool TryReadGpuShaderSpan(uint64_t vaddr, void* data, uint64_t size, bool clean);

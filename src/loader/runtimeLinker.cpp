@@ -731,7 +731,7 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 		if (region_end <= current) {
 			return false;
 		}
-		current = std::min(region_end, end);
+		current = (std::min)(region_end, end);
 	}
 #elif defined(__APPLE__)
 	// Walk the Mach regions covering the range and require read permission. The fatal
@@ -2148,7 +2148,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			EXIT_IF(phdr[i].p_vaddr >= program->base_size);
 
 			program->tls.image_vaddr = phdr[i].p_vaddr + program->base_vaddr;
-			program->tls.init_size   = std::min(phdr[i].p_filesz, GetAlignedSize(phdr + i));
+			program->tls.init_size   = (std::min)(phdr[i].p_filesz, GetAlignedSize(phdr + i));
 			program->tls.image_size  = GetAlignedSize(phdr + i);
 			program->tls.tcb_offset  = program->tls.image_size;
 

@@ -91,6 +91,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	    !program.srt_reads.empty() ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_search_iterations != 0u;
+	     }) ||
+	     std::ranges::any_of(program.info.buffers, [](const IR::BufferResource& buffer) {
+		     return buffer.indirect_search_iterations != 0u;
 	     });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
@@ -228,9 +231,6 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-						if (program.stage != ShaderType::Compute) {
-							Fail(program, "buffer ADD_TID is only valid for compute shaders");
-						}
 						requirements.subgroup_local_invocation_id = true;
 					}
 				}

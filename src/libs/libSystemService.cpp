@@ -235,6 +235,23 @@ static int KYTY_SYSV_ABI SystemServiceReportAbnormalTermination(const void* info
 	return OK;
 }
 
+static int KYTY_SYSV_ABI SystemServiceLoadExec(const char* path, const char* const* argv) {
+	PRINT_NAME();
+
+	if (path == nullptr || path[0] == '\0') {
+		return SYSTEM_SERVICE_ERROR_PARAMETER;
+	}
+
+	LOGF("\t path = %s\n", path);
+	if (argv != nullptr) {
+		for (int i = 0; argv[i] != nullptr; ++i) {
+			LOGF("\t argv[%d] = %s\n", i, argv[i]);
+		}
+	}
+
+	return OK;
+}
+
 } // namespace SystemService
 
 namespace SystemGesture {
@@ -546,6 +563,7 @@ LIB_DEFINE(InitSystemService_1) {
 	LIB_FUNC("Q3utJvma4Mo", SystemService::SystemServiceSetNoticeScreenSkipFlag);
 	LIB_FUNC("XbbJC3E+L5M", SystemService::SystemServicePowerTick);
 	LIB_FUNC("3s8cHiCBKBE", SystemService::SystemServiceReportAbnormalTermination);
+	LIB_FUNC("JoBqSQt1yyA", SystemService::SystemServiceLoadExec);
 	SystemGesture::InitSystemGesture_1(s);
 }
 
