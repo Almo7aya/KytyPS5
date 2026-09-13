@@ -374,6 +374,10 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		read_cache.Reset();
+		std::array<uint32_t, 3> workgroup_size {};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			std::copy_n(input_info.threads_num, 3, workgroup_size.begin());
+		}
 		const ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data                  = params.user_data,
 		    .shader_base                = params.Base(),
@@ -383,6 +387,7 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_range  = ReadShaderGuestRange,
 		    .is_memory_mapped           = IsShaderMemoryMapped,
 		    .workgroup_count            = workgroup_count,
+		    .workgroup_size             = workgroup_size,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
