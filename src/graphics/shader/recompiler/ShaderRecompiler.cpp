@@ -610,6 +610,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	const auto* compute = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
 	IR::TrackResources(ir,
 	                   compute ? std::array {compute->threads_num[0], compute->threads_num[1],
 	                                         compute->threads_num[2]}

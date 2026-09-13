@@ -680,7 +680,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.memory_override      = nullptr;
 			return result;
 		};
-		std::vector<uint32_t> phi_words {spv::OpPhi, ctx.TypeId(inst.GetType()),
+		std::vector<uint32_t> phi_words {spv::OpPhi, TypeId(state, inst.GetType()),
 		                                 state.builder.AllocateId()};
 		EmitLabel(state, default_label);
 		phi_words.push_back(EmitCandidate(image.indirect_resources[0]));

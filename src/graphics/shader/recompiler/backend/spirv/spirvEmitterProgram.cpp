@@ -293,11 +293,11 @@ bool EmitIndirectBufferInstruction(ValueEmitContext& ctx, const IR::Inst& inst) 
 			}
 			const auto LoadMapping = [&](uint32_t index) {
 				const auto pointer = state.builder.AllocateId();
-				state.builder.AddFunction({spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+				state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 				                           pointer, state.flattened_srt_variable,
-				                           ConstantU32(state, 0), index});
+				                           ConstantU32(state, 0), index);
 				const auto value = state.builder.AllocateId();
-				state.builder.AddFunction({spv::OpLoad, TypeU32(state), value, pointer});
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 				return value;
 			};
 			const auto mapping  = ConstantU32(state, buffer.indirect_mapping_offset);
@@ -344,12 +344,12 @@ bool EmitIndirectBufferInstruction(ValueEmitContext& ctx, const IR::Inst& inst) 
 				branch.push_back(candidate);
 				branch.push_back(labels[candidate]);
 			}
-			state.builder.AddFunction({spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone});
+			state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
 			state.builder.AddFunction(branch);
 			const bool            has_result = inst.GetType() != IR::Type::Void;
 			std::vector<uint32_t> phi;
 			if (has_result) {
-				phi = {spv::OpPhi, ctx.TypeId(inst.GetType()), state.builder.AllocateId()};
+				phi = {spv::OpPhi, TypeId(state, inst.GetType()), state.builder.AllocateId()};
 			}
 			IR::Inst access(op, inst.Flags<uint64_t>());
 			for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
@@ -367,7 +367,7 @@ bool EmitIndirectBufferInstruction(ValueEmitContext& ctx, const IR::Inst& inst) 
 					phi.push_back(state.current_label);
 					ctx.definitions.erase(&access);
 				}
-				state.builder.AddFunction({spv::OpBranch, merge});
+				state.builder.AddFunction(spv::OpBranch, merge);
 			}
 			ctx.memory_override      = nullptr;
 			ctx.memory_override_inst = nullptr;

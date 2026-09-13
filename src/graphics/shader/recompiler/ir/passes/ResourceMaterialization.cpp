@@ -468,7 +468,7 @@ private:
 		    !EvaluateUniformValues(m_program, roots, m_runtime, descriptor.fields,
 		                           &m_invariants->uniform_values))
 			return false;
-		const auto rows = ScalarBufferSize(descriptor) / sizeof(uint32_t);
+		const auto rows = descriptor.GetSize() / sizeof(uint32_t);
 		if (rows > MaxValues) return false;
 		// The output must require a loop index, so an out-of-bounds zero count
 		// cannot contribute a resource through an unrelated select/phi branch.
@@ -872,7 +872,7 @@ private:
 			}
 			std::vector<uint32_t> offsets;
 			if (!Evaluate(inst.Arg(1), offsets)) {
-				const auto         size          = ScalarBufferSize(descriptor) & ~uint64_t {3};
+				const auto         size          = descriptor.GetSize() & ~uint64_t {3};
 				constexpr uint64_t MaxIndexBytes = 4u * 1024u * 1024u;
 				if (m_read_failed || size > MaxIndexBytes) {
 					return false;
