@@ -16,6 +16,7 @@
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -171,10 +172,8 @@ private:
 		}
 
 		static void MixStaticParams(std::size_t& hash, const PipelineStaticParameters& params) {
-			const auto* bytes = reinterpret_cast<const uint8_t*>(&params);
-			for (std::size_t i = 0; i < sizeof(params); i++) {
-				Mix(hash, bytes[i]);
-			}
+			// The packed representation is also used by operator==.
+			Mix(hash, static_cast<std::size_t>(XXH3_64bits(&params, sizeof(params))));
 		}
 
 		static void MixRendering(std::size_t& hash, const PipelineRenderingState& rendering) {
@@ -217,6 +216,8 @@ private:
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
+	// Map elements remain stable across rehash; ready pipelines live until destruction.
+	decltype(m_graphics_pipelines)::value_type* m_last_graphics_pipeline = nullptr;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	std::unordered_map<GraphicsPipelineKey, std::future<std::unique_ptr<Pipeline>>,
 	                   GraphicsPipelineKeyHash>

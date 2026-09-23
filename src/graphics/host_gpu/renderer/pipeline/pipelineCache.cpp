@@ -1020,7 +1020,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		EXIT_IF(attributes_num != static_cast<uint32_t>(vs_input_info.resources_num));
 	}
 
+	if (m_last_graphics_pipeline && m_last_graphics_pipeline->first == key) {
+		return m_last_graphics_pipeline->second.get();
+	}
 	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+		m_last_graphics_pipeline = &*iter;
 		return iter->second.get();
 	}
 
@@ -1031,7 +1035,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 			}
 			auto pipeline = pending->second.get();
 			m_pending_pipelines.erase(pending);
-			return m_graphics_pipelines.emplace(key, std::move(pipeline)).first->second.get();
+			const auto iter = m_graphics_pipelines.emplace(key, std::move(pipeline)).first;
+			m_last_graphics_pipeline = &*iter;
+			return iter->second.get();
 		}
 		std::vector<ShaderVertexInputInfo>  vertices(vertex_info.begin(), vertex_info.end());
 		std::optional<ShaderPixelInputInfo> pixel;
@@ -1073,6 +1079,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	m_last_graphics_pipeline = &*iter;
 
 	return iter->second.get();
 }
