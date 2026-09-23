@@ -187,7 +187,11 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 // Jobs own all guest inputs. Only the calling thread adopts results into the caches.
 struct PipelineCache::AsyncCompiler {
 	AsyncCompiler() {
-		const auto count = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
+		const auto cores = std::thread::hardware_concurrency();
+		const auto count = std::clamp(cores / 2, 1u, 8u);
+		std::printf("Async shaders enabled (--async-shaders): %u worker threads, "
+		            "%u logical CPU cores available.\n",
+		            count, cores);
 		for (uint32_t i = 0; i < count; ++i) {
 			workers.emplace_back([this] {
 				for (;;) {
@@ -253,6 +257,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		double                                       elapsed_ms       = 0;
+		bool                                         used             = false;
+		bool                                         cache_hit_logged = false;
 	};
 
 	struct PendingPermutation {
@@ -264,6 +271,7 @@ struct PipelineCache::ProgramCache {
 	struct Translation {
 		ShaderRecompiler::TranslateResult  shader;
 		ShaderRecompiler::IR::ResourcePlan plan;
+		double                             elapsed_ms = 0;
 	};
 
 	struct SourceEntry {
@@ -279,6 +287,7 @@ struct PipelineCache::ProgramCache {
 		std::future<Translation>                         translation;
 		std::optional<ShaderRecompiler::TranslateResult> initial_translation;
 		std::vector<PendingPermutation>                  pending;
+		double                                           initial_translation_ms = 0;
 	};
 
 	struct ProgramKeyHash {
@@ -296,6 +305,29 @@ struct PipelineCache::ProgramCache {
 			return hash;
 		}
 	};
+
+	static double ElapsedMs(std::chrono::steady_clock::time_point start) {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+		    .count();
+	}
+
+	void LogShader(const char* status, double elapsed_ms) const {
+		const auto count = [this](ShaderType stage) {
+			return compiled_counts[static_cast<size_t>(stage)];
+		};
+		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu"
+		            " | Status: %s | Time: %.3f ms\n",
+		            count(ShaderType::Vertex), count(ShaderType::Pixel), count(ShaderType::Compute),
+		            count(ShaderType::Mesh), count(ShaderType::Local),
+		            count(ShaderType::TessellationControl),
+		            count(ShaderType::TessellationEvaluation), status, elapsed_ms);
+	}
+
+	void Adopt(SourceEntry& source, Permutation permutation, const char* status) {
+		++compiled_counts[static_cast<size_t>(permutation.program.stage)];
+		source.permutations.push_back(std::move(permutation));
+		LogShader(status, source.permutations.back().elapsed_ms);
+	}
 
 	static constexpr std::size_t MaxStaticKeyWords = 13 + ShaderVertexInputInfo::RES_MAX * 13;
 
@@ -368,6 +400,7 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
+		const auto lookup_start = std::chrono::steady_clock::now();
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -435,13 +468,14 @@ struct PipelineCache::ProgramCache {
 		const bool asynchronous = compiler != nullptr && stage != ShaderType::Compute;
 		if (asynchronous && entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key).first;
-			entry->second.translation =
-			    Submit(params, input_info, make_options(),
-			           [](const ShaderParams& owned, const ShaderRecompiler::CompileOptions& opts) {
-				           auto shader = ShaderRecompiler::TranslateProgram(owned.code, opts);
-				           auto plan   = ShaderRecompiler::IR::ExtractResourcePlan(shader.program);
-				           return Translation {std::move(shader), std::move(plan)};
-			           });
+			entry->second.translation = Submit(
+			    params, input_info, make_options(),
+			    [](const ShaderParams& owned, const ShaderRecompiler::CompileOptions& opts) {
+				    const auto start  = std::chrono::steady_clock::now();
+				    auto       shader = ShaderRecompiler::TranslateProgram(owned.code, opts);
+				    auto       plan   = ShaderRecompiler::IR::ExtractResourcePlan(shader.program);
+				    return Translation {std::move(shader), std::move(plan), ElapsedMs(start)};
+			    });
 			return {};
 		}
 		if (entry != programs.end()) {
@@ -450,13 +484,14 @@ struct PipelineCache::ProgramCache {
 				if (!Ready(source.translation)) {
 					return {};
 				}
-				auto translated            = source.translation.get();
-				source.resource_plan       = std::move(translated.plan);
-				source.initial_translation = std::move(translated.shader);
+				auto translated               = source.translation.get();
+				source.resource_plan          = std::move(translated.plan);
+				source.initial_translation    = std::move(translated.shader);
+				source.initial_translation_ms = translated.elapsed_ms;
 			}
 			for (auto job = source.pending.begin(); job != source.pending.end();) {
 				if (Ready(job->result)) {
-					source.permutations.push_back(job->result.get());
+					Adopt(source, job->result.get(), "Async");
 					job = source.pending.erase(job);
 				} else {
 					++job;
@@ -478,6 +513,12 @@ struct PipelineCache::ProgramCache {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				// Report the first reuse, not every draw that binds the same shader.
+				if (permutation->used && !permutation->cache_hit_logged) {
+					LogShader("Cached", ElapsedMs(lookup_start));
+					permutation->cache_hit_logged = true;
+				}
+				permutation->used = true;
 				return permutation->handle;
 			}
 		}
@@ -492,22 +533,29 @@ struct PipelineCache::ProgramCache {
 			}
 			auto result =
 			    Submit(params, input_info, make_options(),
-			           [this, translated = std::move(source.initial_translation),
+			           [this, translation_ms = source.initial_translation_ms,
+			            translated     = std::move(source.initial_translation),
 			            specialization = source.specialization,
 			            push_data_cursor](const ShaderParams&                     owned,
 			                              const ShaderRecompiler::CompileOptions& opts) mutable {
+				           const auto start = std::chrono::steady_clock::now();
 				           auto ir = translated
 				                         ? std::move(*translated)
 				                         : ShaderRecompiler::TranslateProgram(owned.code, opts);
-				           return CompilePermutation(owned, opts, std::move(ir),
-				                                     std::move(specialization), push_data_cursor);
+				           auto permutation =
+				               CompilePermutation(owned, opts, std::move(ir),
+				                                  std::move(specialization), push_data_cursor);
+				           permutation.elapsed_ms = translation_ms + ElapsedMs(start);
+				           return permutation;
 			           });
 			source.initial_translation.reset();
+			source.initial_translation_ms = 0;
 			source.pending.push_back({source.specialization, push_data_cursor, std::move(result)});
 			return {};
 		}
-		const auto options    = make_options();
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		const auto compile_start = std::chrono::steady_clock::now();
+		const auto options       = make_options();
+		auto translated          = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -515,8 +563,11 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 		}
-		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		auto compiled       = CompilePermutation(params, options, std::move(translated),
+		                                         entry->second.specialization, push_data_cursor);
+		compiled.elapsed_ms = ElapsedMs(compile_start);
+		compiled.used       = true;
+		Adopt(entry->second, std::move(compiled), "Sync");
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -532,7 +583,7 @@ struct PipelineCache::ProgramCache {
 		for (auto& [key, entry]: programs) {
 			(void)key;
 			for (auto& job: entry.pending) {
-				entry.permutations.push_back(job.result.get());
+				Adopt(entry, job.result.get(), "Async");
 			}
 			for (const auto& permutation: entry.permutations) {
 				device.destroyShaderModule(permutation.handle.module, nullptr);
@@ -545,6 +596,8 @@ struct PipelineCache::ProgramCache {
 	vk::Device                                                  device;
 	std::atomic_uint64_t                                        next_shader_id {0};
 	AsyncCompiler*                                              compiler;
+	std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1>
+	    compiled_counts {};
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
