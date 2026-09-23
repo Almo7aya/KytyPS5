@@ -81,7 +81,7 @@ static void PrintUsage() {
 	    "  --async-shaders <true|false>         Experimental: skip draws while shaders compile.\n"
 	    "                                       Default: false.\n");
 	::printf("  --hot-pages <true|false>             Keep frequently rewritten pages writable. "
-	         "Default: true.\n");
+	         "Default: false.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
