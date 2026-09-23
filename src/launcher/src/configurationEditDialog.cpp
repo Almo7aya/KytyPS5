@@ -251,6 +251,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
+	m_ui->checkBox_async_shaders->setChecked(info.async_shaders);
 	ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
@@ -387,6 +388,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
+	info.async_shaders = ui.checkBox_async_shaders->isChecked();
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(

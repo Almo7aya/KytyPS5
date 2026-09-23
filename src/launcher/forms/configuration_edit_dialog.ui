@@ -173,6 +173,12 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_async_shaders">
+          <property name="toolTip"><string>Compile graphics shaders in the background. Objects may appear late while their shaders compile. Disabled by default.</string></property>
+          <property name="text"><string>Async shaders (experimental)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
