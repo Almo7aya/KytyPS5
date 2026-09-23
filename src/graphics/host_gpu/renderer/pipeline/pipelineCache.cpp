@@ -977,8 +977,14 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
-	static_params.depth_min_bounds         = depth.depth_min_bounds;
-	static_params.depth_max_bounds         = depth.depth_max_bounds;
+#if defined(__APPLE__)
+	static_params.depth_min_bounds = depth.depth_min_bounds;
+	static_params.depth_max_bounds = depth.depth_max_bounds;
+#else
+	// Per-draw bounds must not create new pending pipelines as a model moves.
+	static_params.depth_min_bounds = 0.0f;
+	static_params.depth_max_bounds = 1.0f;
+#endif
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.cull_back  = !rect_list && mc.cull_back;
 	static_params.cull_front = !rect_list && mc.cull_front;

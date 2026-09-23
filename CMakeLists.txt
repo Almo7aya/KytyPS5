@@ -561,7 +561,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME async_shaders
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-shaders-only)
-	set_tests_properties(async_shaders PROPERTIES FAIL_REGULAR_EXPRESSION "Validation Error:")
+	add_test(NAME async_shaders_hot_pages
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --async-hot-pages-only)
+	set_tests_properties(async_shaders async_shaders_hot_pages
+		PROPERTIES FAIL_REGULAR_EXPRESSION "Validation Error:")
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets

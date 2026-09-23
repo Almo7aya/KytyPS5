@@ -13612,6 +13612,27 @@ public:
       }
     };
     auto &filled = pipeline(true, 2, 2);
+#if !defined(__APPLE__)
+    // Once warm, changing per-draw depth bounds must not defer the model again.
+    const auto original_bounds_enabled = depth.depth_bounds_test_enable;
+    for (const bool bounds_enabled: {false, true}) {
+      depth.depth_bounds_test_enable = bounds_enabled;
+      auto &warm = pipeline(true, 2, 2);
+      for (uint32_t i = 1; i <= 32; ++i) {
+        depth.depth_min_bounds = static_cast<float>(i) / 128.0f;
+        depth.depth_max_bounds = 1.0f - static_cast<float>(i) / 128.0f;
+        auto *reused = context.GetPipelineCache().GetGraphicsPipeline(
+            std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
+            vk::PrimitiveTopology::eTriangleList, false,
+            PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+        Require(name, "depth bounds pipeline reuse", reused == &warm,
+                "changing depth bounds queued a new pipeline or skipped a warm draw");
+      }
+    }
+    depth.depth_bounds_test_enable = original_bounds_enabled;
+    depth.depth_min_bounds = 0.0f;
+    depth.depth_max_bounds = 1.0f;
+#endif
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
@@ -13645,6 +13666,9 @@ public:
       cmd.setDepthTestEnable(depth.depth_test_enable);
       cmd.setDepthWriteEnable(depth.depth_write_enable);
       cmd.setDepthCompareOp(depth.depth_compare_op);
+#if !defined(__APPLE__)
+      cmd.setDepthBounds(depth.depth_min_bounds, depth.depth_max_bounds);
+#endif
       cmd.setDepthBiasEnable(false);
       cmd.setStencilTestEnable(depth.stencil_test_enable);
       if (depth.stencil_test_enable) {
@@ -15770,6 +15794,11 @@ private:
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+#if !defined(__APPLE__)
+    Require("VulkanHarness", "depth bounds", available_features.depthBounds == true,
+            "depth bounds are not supported");
+    device_features.depthBounds = true;
+#endif
     device_features.shaderClipDistance = true;
     device_features.independentBlend = true;
     device_features.vertexPipelineStoresAndAtomics = true;
@@ -33228,11 +33257,13 @@ int main(int argc, char **argv) {
     CheckEmbeddedFetchVertexOffset();
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--async-shaders-only") == 0) {
+  if (argc == 2 && (std::strcmp(argv[1], "--async-shaders-only") == 0 ||
+                    std::strcmp(argv[1], "--async-hot-pages-only") == 0)) {
     EnsureConfigInitialized();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
     options.async_shaders = true;
+    options.hot_page_tracking = std::strcmp(argv[1], "--async-hot-pages-only") == 0;
     Config::Load(options);
     VulkanHarness vulkan;
     vulkan.CheckAsyncPrograms();
