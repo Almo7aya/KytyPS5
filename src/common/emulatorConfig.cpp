@@ -139,6 +139,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool AsyncShadersEnabled() {
+	return g_config->async_shaders;
+}
+
 bool HotPageTrackingEnabled() {
 	return g_config->hot_page_tracking;
 }

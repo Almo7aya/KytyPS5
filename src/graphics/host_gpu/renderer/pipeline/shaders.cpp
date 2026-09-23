@@ -95,11 +95,10 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 	const auto fmt        = res.Format();
 	const auto raw_format = res.RawFormat();
 	if (raw_format == kTemporaryVertexAttribFormat113) {
-		static bool logged_113 = false;
-		if (!logged_113) {
+		static std::atomic_bool logged_113 = false;
+		if (!logged_113.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: temporary: accepting invalid PS5 buffer format 113 as "
 			     "vk::Format::eR32G32B32A32Sfloat\n");
-			logged_113 = true;
 		}
 		format = vk::Format::eR32G32B32A32Sfloat;
 		size   = 4;
@@ -110,10 +109,9 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		return;
 	}
 	if (raw_format == kTemporaryPs5BufferFormat121) {
-		static bool logged_121 = false;
-		if (!logged_121) {
+		static std::atomic_bool logged_121 = false;
+		if (!logged_121.exchange(true, std::memory_order_relaxed)) {
 			LOGF("InputFormat: accepting PS5 buffer format 121 as vk::Format::eR16G16Sfloat\n");
-			logged_121 = true;
 		}
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
@@ -319,11 +317,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		}
 
 		if (vs_input_info.resources[index].OutOfBounds() != 0) {
-			static bool logged = false;
-			if (!logged) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
 				LOGF("VertexInput: temporary: accepting PS5 out-of-bounds behavior %" PRIu8 "\n",
 				     vs_input_info.resources[index].OutOfBounds());
-				logged = true;
 			}
 		}
 

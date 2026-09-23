@@ -13304,6 +13304,118 @@ public:
     m_device.destroyShaderModule(module, nullptr);
   }
 
+  void CheckAsyncPrograms() {
+    const char *name = "AsyncShaderPrograms";
+    EnsureRuntimeContext();
+    PipelineCache cache(m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+    registers.SetViewportTransformControl(0x300);
+      static const auto native_vertex = [] {
+        std::vector<u32> code;
+        AppendVMovLiteral(&code, 1, 0xbf800000u);
+        AppendVMovLiteral(&code, 2, 0x40400000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 5));
+        code.push_back(EncodeVop2(0x01, 3, Vgpr(1), 2));
+        code.push_back(EncodeVopc(0xc2, InlineU32(2), 5));
+        code.push_back(EncodeVop2(0x01, 4, Vgpr(1), 2));
+        AppendVMovU32(&code, 0, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.push_back(EncodeExp0(0x0c, 0xf));
+        code.push_back(EncodeExp1(3, 4, 0, 6));
+        for (u32 parameter = 0; parameter < 8; parameter++) {
+          code.push_back(EncodeExp0(0x20 + parameter, 0xf));
+          code.push_back(EncodeExp1(0, 0, 0, 0));
+        }
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto native_pixel = [] {
+        std::vector<u32> code;
+        AppendVMovU32(&code, 0, 0);
+        AppendSMovLiteral(&code, 107, 0x3e800000u);
+        code.push_back(EncodeVopc(0xc2, InlineU32(1), 0));
+        code.push_back(EncodeVop1(0x01, 1, 107));
+        AppendVMovLiteral(&code, 2, 0x3f800000u);
+        code.push_back(EncodeExp0(0x00, 0xf));
+        code.push_back(EncodeExp1(1, 1, 1, 2));
+        AppendEnd(&code);
+        return code;
+      }();
+      static ShaderUserData native_user_data{};
+      const auto vertex_address = reinterpret_cast<uint64_t>(native_vertex.data());
+      const auto pixel_address = reinterpret_cast<uint64_t>(native_pixel.data());
+      ShaderMapUserData(vertex_address,
+          {.type = Prospero::ShaderBinaryType::kGs,
+           .user_data = &native_user_data,
+           .code_size_bytes = static_cast<uint32_t>(native_vertex.size() * sizeof(u32))});
+      ShaderMapUserData(pixel_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<uint32_t>(native_pixel.size() * sizeof(u32))});
+      HW::VertexShaderInfo native_vertex_regs{};
+      native_vertex_regs.es_regs.data_addr = vertex_address;
+      HW::PixelShaderInfo native_pixel_regs{};
+      native_pixel_regs.ps_regs.data_addr = pixel_address;
+
+    std::array<Prospero::ColorComponentMapping, 8> mapping{};
+    std::array<ShaderVertexInputInfo, 3> vertices{};
+    ShaderPixelInputInfo pixel{};
+    const auto get = [&] {
+      return cache.GetGraphicsPrograms(native_vertex_regs, native_pixel_regs,
+          registers.GetShaderRegisters(), registers, user_config, mapping,
+          true, vertices, pixel);
+    };
+    registers.SetPsInControl(0x0008);
+    Require(name, "cold translation", !get().vertex[0],
+            "async cold lookup did not return pending");
+    const auto wait = [&] {
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      for (;;) {
+        auto programs = get();
+        if (programs.vertex[0]) {
+          return programs;
+        }
+        Require(name, "completion", std::chrono::steady_clock::now() < deadline,
+                "shader jobs did not finish");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    };
+    const auto first = wait();
+    Require(name, "wave64", pixel.stage.program->wave_size == 64,
+            "async pixel metadata lost wave size");
+    const auto *stable_program = vertices[0].stage.program;
+    registers.SetPsInControl(0x8008);
+    const auto second = wait();
+    Require(name, "wave32 specialization", pixel.stage.program->wave_size == 32 &&
+                second.pixel.id != first.pixel.id,
+            "distinct shader state reused the wrong program");
+    registers.SetPsInControl(0x0008);
+    const auto reused = get();
+    Require(name, "cache reuse", reused.vertex[0].id == first.vertex[0].id &&
+                reused.pixel.id == first.pixel.id && vertices[0].stage.program == stable_program,
+            "completed shader handles or program addresses changed");
+    static constexpr std::array<u32, 1> compute_code{0xbf810000u};
+    HW::ComputeShaderInfo compute_regs{};
+    compute_regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(compute_code.data());
+    compute_regs.cs_regs.num_thread_x = 64;
+    compute_regs.cs_regs.num_thread_y = compute_regs.cs_regs.num_thread_z = 1;
+    compute_regs.cs_regs.tgid_x_en = 1;
+    ShaderMapUserData(compute_regs.cs_regs.data_addr,
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(sizeof(compute_code))});
+    ShaderComputeInputInfo compute_info{};
+    const auto compute = cache.GetComputeProgram(
+        compute_regs, registers.GetShaderRegisters(), compute_info);
+    Require(name, "synchronous compute", static_cast<bool>(compute) &&
+                cache.GetComputePipeline(compute_info, compute).pipeline != nullptr,
+            "async graphics mode deferred a compute dispatch");
+    // Leave a new translation pending to exercise destruction with outstanding work.
+    registers.SetPsInControl(0x0004);
+    (void)get();
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRasterization(bool depth_feedback, bool packed_vertex_color = false) {
     const char *name = packed_vertex_color ? "PackedFloatVertexColor"
                       : depth_feedback ? "DepthAttachmentFeedback"
@@ -13484,10 +13596,20 @@ public:
       mode.polymode_back_ptype = back;
       mode.provoking_vtx_last = provoking_last;
       registers.SetModeControl(mode);
-      return context.GetPipelineCache().GetGraphicsPipeline(
-          std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
-          topology, false,
-          PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      for (;;) {
+        auto *ready = context.GetPipelineCache().GetGraphicsPipeline(
+            std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &pixel,
+            topology, false,
+            PipelineCache::GraphicsPrograms{{vertex_shader}, pixel_shader});
+        if (ready) {
+          return *ready;
+        }
+        Require(name, "async pipeline completion", Config::AsyncShadersEnabled() &&
+                    std::chrono::steady_clock::now() < deadline,
+                "pipeline did not complete");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3) {
@@ -15580,6 +15702,8 @@ private:
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
                 available_features.tessellationShader &&
+                available_features.shaderClipDistance && available_features.independentBlend &&
+                available_features.vertexPipelineStoresAndAtomics &&
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -15646,6 +15770,9 @@ private:
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+    device_features.shaderClipDistance = true;
+    device_features.independentBlend = true;
+    device_features.vertexPipelineStoresAndAtomics = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -15653,6 +15780,7 @@ private:
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
+        VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
@@ -33098,6 +33226,17 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--async-shaders-only") == 0) {
+    EnsureConfigInitialized();
+    Config::ConfigOptions options;
+    options.printf_direction = Config::LogDirection::Silent;
+    options.async_shaders = true;
+    Config::Load(options);
+    VulkanHarness vulkan;
+    vulkan.CheckAsyncPrograms();
+    vulkan.CheckRasterization(false, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {

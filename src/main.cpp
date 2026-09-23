@@ -77,6 +77,9 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf(
+	    "  --async-shaders <true|false>         Experimental: skip draws while shaders compile.\n"
+	    "                                       Default: false.\n");
 	::printf("  --hot-pages <true|false>             Keep frequently rewritten pages writable. "
 	         "Default: true.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
@@ -329,6 +332,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.printf_output_file = Common::PathFromUtf8(value);
 		} else if (arg == "--spirv-debug-printf") {
 			if (!ParseBool(value, options.config.spirv_debug_printf_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--async-shaders") {
+			if (!ParseBool(value, options.config.async_shaders)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

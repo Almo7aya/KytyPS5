@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -135,7 +136,8 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
 
-	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	// Returns nullptr while an asynchronous pipeline is being built.
+	Pipeline* GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,
 	                              std::span<const ShaderVertexInputInfo> vertex_info,
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
@@ -145,6 +147,7 @@ public:
 	                             const ShaderProgram&          compute_program);
 
 private:
+	struct AsyncCompiler;
 	struct ProgramCache;
 
 	struct GraphicsPipelineKey {
@@ -208,12 +211,17 @@ private:
 	};
 
 	GraphicContext&               m_graphics;
+	std::unique_ptr<AsyncCompiler> m_async_compiler;
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unordered_map<GraphicsPipelineKey, std::future<std::unique_ptr<Pipeline>>,
+	                   GraphicsPipelineKeyHash>
+	              m_pending_pipelines;
+	Common::Mutex m_driver_mutex;
 	Common::Mutex m_mutex;
 
 	void InitializeDriverCache();
