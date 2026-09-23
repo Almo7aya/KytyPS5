@@ -94,6 +94,7 @@ public:
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   async_shaders               = false;
+	bool                   hot_pages                   = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -126,6 +127,7 @@ public:
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
 		async_shaders               = other.async_shaders;
+		hot_pages                   = other.hot_pages;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -173,6 +175,7 @@ public:
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
 		KYTY_CFG_SET(async_shaders);
+		KYTY_CFG_SET(hot_pages);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -216,6 +219,7 @@ public:
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
 		async_shaders = s->value("async_shaders", false).toBool();
+		hot_pages = s->value("hot_pages", false).toBool();
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

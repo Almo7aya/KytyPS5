@@ -179,6 +179,12 @@
           <property name="text"><string>Async shaders (experimental)</string></property>
          </widget>
         </item>
+        <item row="9" column="1">
+         <widget class="QCheckBox" name="checkBox_hot_pages">
+          <property name="toolTip"><string>Keep frequently rewritten memory pages writable to reduce memory-tracking overhead. Disabled by default.</string></property>
+          <property name="text"><string>Hot pages</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
