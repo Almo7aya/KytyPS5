@@ -139,6 +139,10 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
+bool HotPageTrackingEnabled() {
+	return g_config->hot_page_tracking;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

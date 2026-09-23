@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -387,6 +388,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
+	RegionManager::AdvanceGeneration();
 	m_command.m_buffer = nullptr;
 	return tick;
 }

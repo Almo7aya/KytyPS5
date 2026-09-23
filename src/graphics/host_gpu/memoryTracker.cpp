@@ -7,7 +7,8 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
+MemoryTracker::MemoryTracker(PageManager& page_manager, bool hot_pages)
+    : m_page_manager(page_manager), m_hot_pages(hot_pages) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 }
 
@@ -59,7 +60,8 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
-	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
+	auto manager =
+	    std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE, m_hot_pages);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
@@ -106,6 +108,14 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::ClearHotPages(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::vector<RegionManager*> managers;
@@ -126,6 +136,7 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
 	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		manager->ClearHot(manager->GetCpuAddr() + offset, bytes);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
 }

@@ -5,9 +5,12 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <utility>
+#include <xxhash.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
@@ -72,8 +75,8 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 
 class RegionManager final {
 public:
-	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
-	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr) {
+	RegionManager(PageManager& page_manager, uint64_t cpu_addr, bool hot_pages = false)
+	    : m_page_manager(page_manager), m_cpu_addr(cpu_addr), m_hot_pages(hot_pages) {
 		if (m_cpu_addr % TRACKER_REGION_SIZE != 0) {
 			EXIT("invalid region tracking manager construction\n");
 		}
@@ -92,18 +95,35 @@ public:
 		return RegionBits(bits, start, end).Any();
 	}
 
-	template <DirtySource source, bool enable>
+	static void AdvanceGeneration() noexcept {
+		s_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	void ClearHot(uint64_t vaddr, uint64_t size) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		m_hot.UnsetRange(start, end);
+		m_recent_faults.UnsetRange(start, end);
+		m_hash_valid.UnsetRange(start, end);
+	}
+
+	template <DirtySource source, bool enable, bool from_fault = false>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (RegionBits(m_gpu_dirty, start, end).Any()) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
+			if constexpr (from_fault) {
+				NoteCpuFault(start, end);
+			} else {
+				m_hash_valid.UnsetRange(start, end);
+			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
 			if (RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
+			ClearHot(vaddr, size);
 		}
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
@@ -119,13 +139,37 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
+	                          bool preserve_hot = false) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				// Writable pages cannot fault again; compare their contents on every reuse.
+				if (preserve_hot && m_hot.Any()) {
+					if (!m_hashes) {
+						m_hashes = std::make_unique<std::array<uint64_t, TRACKER_REGION_PAGES>>();
+					}
+					const RegionBits hot(m_hot, start, end);
+					for (const auto [first, last]: hot) {
+						for (auto page = first; page < last; ++page) {
+							bits.Set(page);
+							const auto hash =
+							    XXH3_64bits(reinterpret_cast<const void*>(m_cpu_addr +
+							                                              page * TRACKER_PAGE_SIZE),
+							                TRACKER_PAGE_SIZE);
+							if (m_hash_valid.Get(page) && (*m_hashes)[page] == hash) {
+								mask.Unset(page);
+							}
+							(*m_hashes)[page] = hash;
+							m_hash_valid.Set(page);
+						}
+					}
+				} else if (!preserve_hot) {
+					ClearHot(vaddr, size);
+				}
 				UpdateProtection<true, false>();
 			} else {
 				UpdateProtection<false, true>();
@@ -179,12 +223,35 @@ private:
 		        static_cast<size_t>((offset + size + TRACKER_PAGE_SIZE - 1) / TRACKER_PAGE_SIZE)};
 	}
 
+	void NoteCpuFault(size_t start, size_t end) {
+		if (!m_hot_pages) {
+			return;
+		}
+		const auto generation = s_generation.load(std::memory_order_relaxed);
+		if (generation - m_fault_generation >= 16) {
+			m_recent_faults.Clear();
+			m_fault_generation = generation;
+		}
+		const RegionBits recent(m_recent_faults, start, end);
+		for (const auto [first, last]: recent) {
+			m_hot.SetRange(first, last);
+		}
+		m_recent_faults.SetRange(start, end);
+	}
+
+	inline static std::atomic_uint64_t                          s_generation {0};
+	RegionBits                                                  m_hot;
+	RegionBits                                                  m_recent_faults;
+	RegionBits                                                  m_hash_valid;
+	std::unique_ptr<std::array<uint64_t, TRACKER_REGION_PAGES>> m_hashes;
+	uint64_t                                                    m_fault_generation = 0;
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	bool                                                        m_hot_pages;
 };
 
 } // namespace Libs::Graphics

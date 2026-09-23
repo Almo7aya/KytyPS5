@@ -18,7 +18,7 @@ namespace Libs::Graphics {
 
 class MemoryTracker final {
 public:
-	explicit MemoryTracker(PageManager& page_manager);
+	explicit MemoryTracker(PageManager& page_manager, bool hot_pages = false);
 	~MemoryTracker();
 
 	KYTY_CLASS_NO_COPY(MemoryTracker);
@@ -29,6 +29,7 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	void               ClearHotPages(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -44,7 +45,8 @@ public:
 				if (manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
 					return true;
 				}
-				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				manager->ChangeState<DirtySource::Cpu, true, true>(manager->GetCpuAddr() + offset,
+				                                                   bytes);
 				return false;
 			}();
 			if (should_flush) {
@@ -87,7 +89,7 @@ public:
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			                                                      bytes, range_func, !is_written);
 			if (!is_written) {
 				manager->lock.unlock();
 			}
@@ -151,6 +153,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	bool                                           m_hot_pages;
 };
 
 } // namespace Libs::Graphics

@@ -186,6 +186,48 @@ void Release(uint8_t *memory) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestHotPages() {
+  PageManager manager;
+  MemoryTracker tracker(manager, true);
+  auto *memory = Allocate(manager, 1);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto size = manager.GetPageSize();
+  unsigned uploads = 0;
+  auto upload = [&](bool written = false) {
+    tracker.ForEachUploadRange(address, size, written,
+      [&](uint64_t, uint64_t) noexcept { ++uploads; }, []() noexcept {});
+  };
+  upload();
+  for (int i = 0; i < 2; ++i) {
+    tracker.InvalidateRegion(address, size, []() noexcept {});
+    memory[0] = static_cast<uint8_t>(i + 1);
+    upload();
+  }
+  Check(IsWritable(memory), "hot page was reprotected");
+  const auto previous = uploads;
+  upload();
+  Check(uploads == previous, "unchanged hot page uploaded again");
+  memory[0] = 42;
+  upload();
+  Check(uploads == previous + 1, "write within one submission was missed");
+  tracker.ClearHotPages(address, size);
+  upload();
+  Check(uploads == previous + 2 && !IsWritable(memory),
+        "buffer replacement reused hot hash or protection");
+  for (int i = 0; i < 2; ++i) {
+    tracker.InvalidateRegion(address, size, []() noexcept {});
+    memory[0]++;
+    upload();
+  }
+  upload(true);
+  Check(tracker.IsRegionGpuModified(address, size) &&
+            !tracker.IsRegionCpuModified(address, size),
+        "GPU write did not end hot ownership");
+  tracker.UnmarkRegionAsGpuModified(address, size);
+  tracker.UntrackMemory(address, size);
+  Release(memory);
+}
+
 void TestRangeSet() {
   RangeSet ranges;
   ranges.Add(0x1000, 0x80);
@@ -926,6 +968,7 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestHotPages();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
