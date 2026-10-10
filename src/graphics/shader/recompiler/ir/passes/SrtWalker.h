@@ -76,6 +76,11 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// The straight-line refresh of a plan without control flow; Unsupported leaves it to the walker.
+	enum class TapeResult { Done, Failed, Unsupported };
+	TapeResult RefreshFlatBufferTape(std::vector<uint32_t>& flat);
+	void Remember(const Inst& inst, uint64_t value);
+	[[nodiscard]] bool Recall(const Inst& inst, uint64_t& value) const;
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;

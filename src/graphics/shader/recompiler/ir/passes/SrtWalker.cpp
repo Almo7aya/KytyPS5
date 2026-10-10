@@ -7,6 +7,8 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -498,6 +500,47 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
+// The address of a scalar raw read (s_load from an address, or s_buffer_load from a V#), from
+// its evaluated operands. Const-buffer reads are bounded by the V#.
+static bool ScalarReadAddress(bool const_buffer, uint32_t memory_offset, uint64_t low, uint64_t high,
+                              uint64_t records, uint64_t offset, uint64_t& address) {
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(memory_offset));
+	if (const_buffer) {
+		if (immediate < 0) {
+			return false;
+		}
+		const auto byte_offset =
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto size   = stride == 0u
+		                        ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                        : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			return false;
+		}
+		address = (base & ~uint64_t {3}) + byte_offset;
+		return true;
+	}
+	const auto relative =
+	    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	return AddSignedAddress(base & ~uint64_t {3}, relative, address);
+}
+
+// A scalar read through the runtime's ordinary reader; without one, unmapped memory reads as zero.
+static bool ReadScalarWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
+	word = 0;
+	if (runtime.read_memory != nullptr) {
+		return runtime.read_memory(runtime.userdata, address, {&word, 1});
+	}
+	// As in SrtReadCapture::ReadOrdinary: a pointer on a path the GPU does not take can be
+	// garbage, and no mapped memory reads as zero.
+	if (runtime.is_mapped == nullptr || runtime.is_mapped(address, sizeof(word))) {
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	return true;
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto flags = inst.Flags<SrtReadFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
@@ -524,57 +567,42 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+	if (!vector) {
+		const bool const_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+		uint64_t   records      = 0;
+		uint64_t   word3        = 0;
+		uint64_t   address      = 0;
+		uint32_t   word         = 0;
+		if ((const_buffer && (handle->NumArgs() != 4u || !Arg(*handle, 2, records) ||
+		                      !Arg(*handle, 3, word3))) ||
+		    !ScalarReadAddress(const_buffer, mem.offset, low, high, records, offset, address) ||
+		    !ReadScalarWord(m_runtime, address, word)) {
 			return false;
 		}
-		if (immediate < 0) {
-			return false;
-		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		if (vector) {
-			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
-				return false;
-			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
-				result = 0u;
-				return true;
-			}
-		}
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
-		}
-		address = (base & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
-		}
+		result = word;
+		return true;
 	}
-	uint32_t word = 0;
-	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
-	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
-	} else {
-		if (vector) return false;
-		// As in SrtReadCapture::ReadOrdinary: a pointer on a path the GPU does not take can be
-		// garbage, and no mapped memory reads as zero.
-		if (m_runtime.is_mapped == nullptr || m_runtime.is_mapped(address, sizeof(word))) {
-			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-		}
+	// A structured vector DWORD: only its uniform, unswizzled address is evaluated on the host.
+	uint64_t records = 0;
+	uint64_t word3   = 0;
+	if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3) ||
+	    static_cast<int32_t>(mem.offset) < 0) {
+		return false;
+	}
+	if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u) {
+		return false;
+	}
+	const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+	if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
+		result = 0u;
+		return true;
+	}
+	uint64_t address = 0;
+	uint32_t word    = 0;
+	if (!ScalarReadAddress(true, mem.offset, low, high, records, offset, address) ||
+	    m_runtime.read_specialization_memory == nullptr ||
+	    !m_runtime.read_specialization_memory(m_runtime.userdata, address, {&word, 1})) {
+		return false;
 	}
 	result = word;
 	return true;
@@ -965,8 +993,375 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
+// The walker evaluates a plan's value graph recursively, memoizing every node, for every draw;
+// that cost Uncharted about a quarter of its command processor. Most plans have no control flow
+// and read scalar memory through plain integer arithmetic. For those, the refresh is compiled
+// once into nodes in the walker's own depth-first evaluation order, so they read memory in the
+// same order and through the same readers, then evaluated without recursion or memo lookups.
+// The results seed the walkers' memos for the descriptor evaluation that follows.
+struct SrtTape {
+	enum class Op : uint8_t {
+		Const,
+		UserData,
+		ShaderBase,
+		Copy,
+		Add32,
+		Add64,
+		Sub32,
+		Sub64,
+		Mul32,
+		Shl32,
+		Shl64,
+		Shr32,
+		Shr64,
+		And32,
+		And64,
+		Or32,
+		Xor32,
+		BitFieldUExtract,
+		Pack64,
+		Extract64,
+		AddCarry,
+		ScalarRead,
+		ConstBufferRead,
+	};
+	struct Node {
+		Op          op;
+		bool        clean = false;
+		uint32_t    a = 0, b = 0, c = 0, d = 0, e = 0;
+		uint64_t    immediate = 0;
+		const Inst* inst      = nullptr;
+		// Also memoized by the ordinary walker, which delegates clean reads.
+		bool        seed_ordinary = false;
+	};
+	std::vector<Node>                          nodes;
+	std::vector<std::pair<uint32_t, uint32_t>> slots; // flat offset, node
+	bool                                       has_clean = false;
+};
+
+namespace {
+
+class SrtTapeCompiler {
+public:
+	SrtTapeCompiler(const ResourcePlan& program, bool has_clean): m_program(program) {
+		m_tape.has_clean = has_clean;
+	}
+
+	std::shared_ptr<const SrtTape> Compile() {
+		if (!m_program.control_flow.empty()) return nullptr;
+		for (const auto& read: m_program.srt_reads) {
+			const auto* inst = read.value.Resolve().TryInstruction();
+			const bool  clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+			// The walker fails a clean slot it has no clean reader for; leave that to it.
+			if ((clean && !m_tape.has_clean) || read.flat_offset >= m_program.srt_reads.size()) {
+				return nullptr;
+			}
+			uint32_t node = 0;
+			if (!Node(read.value, clean, node)) return nullptr;
+			m_tape.slots.emplace_back(read.flat_offset, node);
+		}
+		return std::make_shared<const SrtTape>(std::move(m_tape));
+	}
+
+private:
+	using Op = SrtTape::Op;
+
+	static Op BinaryOp(ValueOpcode opcode) {
+		switch (opcode) {
+			case ValueOpcode::IAdd32: return Op::Add32;
+			case ValueOpcode::IAdd64: return Op::Add64;
+			case ValueOpcode::ISub32: return Op::Sub32;
+			case ValueOpcode::ISub64: return Op::Sub64;
+			case ValueOpcode::IMul32: return Op::Mul32;
+			case ValueOpcode::ShiftLeftLogical32: return Op::Shl32;
+			case ValueOpcode::ShiftLeftLogical64: return Op::Shl64;
+			case ValueOpcode::ShiftRightLogical32: return Op::Shr32;
+			case ValueOpcode::ShiftRightLogical64: return Op::Shr64;
+			case ValueOpcode::BitwiseAnd32: return Op::And32;
+			case ValueOpcode::BitwiseAnd64: return Op::And64;
+			case ValueOpcode::BitwiseOr32: return Op::Or32;
+			case ValueOpcode::BitwiseXor32: return Op::Xor32;
+			default: return Op::Pack64;
+		}
+	}
+
+	uint32_t Emit(SrtTape::Node node) {
+		m_tape.nodes.push_back(node);
+		return static_cast<uint32_t>(m_tape.nodes.size() - 1u);
+	}
+
+	bool Args(const Inst& inst, bool clean, std::initializer_list<uint32_t*> outputs) {
+		uint32_t index = 0;
+		for (auto* output: outputs) {
+			if (!Node(inst.Arg(index++), clean, *output)) return false;
+		}
+		return true;
+	}
+
+	bool Node(Value value, bool clean, uint32_t& result) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			uint64_t bits = 0;
+			switch (value.GetType()) {
+				case Type::U1: bits = value.U1(); break;
+				case Type::U8: bits = value.U8(); break;
+				case Type::U16: bits = value.U16(); break;
+				case Type::U32: bits = value.U32(); break;
+				case Type::U64: bits = value.U64(); break;
+				case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); break;
+				default: return false;
+			}
+			result = Emit({.op = Op::Const, .immediate = bits});
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		// The ordinary walker hands a clean read, and everything it depends on, to the clean one.
+		const bool clean_read = m_tape.has_clean && inst->Flags<SrtReadFlags>().clean != 0u &&
+		                        (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+		                         inst->GetOpcode() == ValueOpcode::ReadConstBuffer);
+		const bool mode = clean || clean_read;
+		const auto key  = std::pair {inst, mode};
+		if (const auto found = m_nodes.find(key); found != m_nodes.end()) {
+			result = found->second;
+			if (!clean && mode) m_tape.nodes[result].seed_ordinary = true;
+			return true;
+		}
+		SrtTape::Node node {.clean = mode, .inst = inst};
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::GetUserData: {
+				const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+				if (reg < m_program.user_data_base) return false;
+				node.op = Op::UserData;
+				node.a  = reg - m_program.user_data_base;
+				break;
+			}
+			case ValueOpcode::GetShaderBase: node.op = Op::ShaderBase; break;
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+				node.op = Op::Copy;
+				if (!Args(*inst, mode, {&node.a})) return false;
+				break;
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::IAdd64:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::ISub64:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftLeftLogical64:
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::ShiftRightLogical64:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseAnd64:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::CompositeConstructU64:
+				node.op = BinaryOp(inst->GetOpcode());
+				if (!Args(*inst, mode, {&node.a, &node.b})) return false;
+				break;
+			case ValueOpcode::BitFieldUExtract:
+				node.op = Op::BitFieldUExtract;
+				if (!Args(*inst, mode, {&node.a, &node.b, &node.c})) return false;
+				break;
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2: {
+				// As SrtWalker::EvaluateExtract.
+				const auto index = inst->Arg(1).Resolve();
+				if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+					return false;
+				}
+				const auto component = index.U32();
+				if (inst->GetOpcode() == ValueOpcode::CompositeExtractU64) {
+					node.op        = Op::Extract64;
+					node.immediate = component;
+					if (!Node(inst->Arg(0), mode, node.a)) return false;
+					break;
+				}
+				const auto source = inst->Arg(0).Resolve();
+				const auto* pair  = source.TryInstruction();
+				if (pair == nullptr) return false;
+				if (pair->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+					node.op = Op::Copy;
+					if (!Node(pair->Arg(component), mode, node.a)) return false;
+				} else if (pair->GetOpcode() == ValueOpcode::IAddCarry32) {
+					node.op        = Op::AddCarry;
+					node.immediate = component;
+					if (!Args(*pair, mode, {&node.a, &node.b})) return false;
+				} else {
+					return false;
+				}
+				break;
+			}
+			case ValueOpcode::LoadAddressU32:
+			case ValueOpcode::ReadConstBuffer: {
+				if (!IsRawRead(m_program, *inst)) return false;
+				const auto* handle = inst->Arg(0).ResolveInstruction();
+				if (handle == nullptr) return false;
+				const auto& memory = m_program.memory_info[inst->Flags<SrtReadFlags>().index];
+				node.immediate     = memory.offset;
+				// The walker evaluates the base, the offset, then a const buffer's size words.
+				if (!Node(handle->Arg(0), mode, node.a) || !Node(handle->Arg(1), mode, node.b) ||
+				    !Node(inst->Arg(1), mode, node.c)) {
+					return false;
+				}
+				if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+					node.op = Op::ConstBufferRead;
+					if (handle->NumArgs() != 4u || !Node(handle->Arg(2), mode, node.d) ||
+					    !Node(handle->Arg(3), mode, node.e)) {
+						return false;
+					}
+				} else {
+					node.op = Op::ScalarRead;
+				}
+				break;
+			}
+			default: return false;
+		}
+		node.seed_ordinary = !clean && mode;
+		result             = Emit(node);
+		m_nodes.emplace(key, result);
+		return true;
+	}
+
+	struct KeyHash {
+		size_t operator()(const std::pair<const Inst*, bool>& key) const {
+			return std::hash<const Inst*> {}(key.first) * 2u + key.second;
+		}
+	};
+
+	const ResourcePlan&                                                    m_program;
+	SrtTape                                                                m_tape;
+	std::unordered_map<std::pair<const Inst*, bool>, uint32_t, KeyHash>   m_nodes;
+};
+
+} // namespace
+
+bool SrtWalker::Recall(const Inst& inst, uint64_t& value) const {
+	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size() || m_context.values[index].generation != m_context.generation) {
+		return false;
+	}
+	value = m_context.values[index].value;
+	return true;
+}
+
+void SrtWalker::Remember(const Inst& inst, uint64_t value) {
+	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	m_context.values[index] = {value, m_context.generation};
+}
+
+SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& flat) {
+	const bool has_clean = m_clean_evaluator != nullptr;
+	if (!m_program.srt_tape_built) {
+		m_program.srt_tape_built = true;
+		m_program.srt_tape       = SrtTapeCompiler(m_program, has_clean).Compile();
+	}
+	const auto* tape = m_program.srt_tape.get();
+	if (tape == nullptr || tape->has_clean != has_clean || !m_active_mask.IsEmpty()) {
+		return TapeResult::Unsupported;
+	}
+	if (has_clean && m_clean_evaluator->m_runtime.read_specialization_memory == nullptr) {
+		return TapeResult::Unsupported;
+	}
+	auto& values = m_program.srt_tape_values;
+	values.resize(tape->nodes.size());
+	for (size_t index = 0; index < tape->nodes.size(); ++index) {
+		const auto& node = tape->nodes[index];
+		// A value the walkers already evaluated in this session is not read again.
+		if (node.inst != nullptr &&
+		    ((node.seed_ordinary && Recall(*node.inst, values[index])) ||
+		     (node.clean ? m_clean_evaluator : this)->Recall(*node.inst, values[index]))) {
+			continue;
+		}
+		const auto  a = values[node.a];
+		const auto  b = values[node.b];
+		uint64_t    out = 0;
+		switch (node.op) {
+			case SrtTape::Op::Const: out = node.immediate; break;
+			case SrtTape::Op::UserData:
+				if (node.a >= m_runtime.user_data.size()) return TapeResult::Failed;
+				out = m_runtime.user_data[node.a];
+				break;
+			case SrtTape::Op::ShaderBase: out = m_runtime.shader_base; break;
+			case SrtTape::Op::Copy: out = a; break;
+			case SrtTape::Op::Add32: out = static_cast<uint32_t>(a + b); break;
+			case SrtTape::Op::Add64: out = a + b; break;
+			case SrtTape::Op::Sub32: out = static_cast<uint32_t>(a - b); break;
+			case SrtTape::Op::Sub64: out = a - b; break;
+			case SrtTape::Op::Mul32: out = static_cast<uint32_t>(a * b); break;
+			case SrtTape::Op::Shl32: out = static_cast<uint32_t>(a) << (b & 31u); break;
+			case SrtTape::Op::Shl64: out = a << (b & 63u); break;
+			case SrtTape::Op::Shr32: out = static_cast<uint32_t>(a) >> (b & 31u); break;
+			case SrtTape::Op::Shr64: out = a >> (b & 63u); break;
+			case SrtTape::Op::And32: out = static_cast<uint32_t>(a & b); break;
+			case SrtTape::Op::And64: out = a & b; break;
+			case SrtTape::Op::Or32: out = static_cast<uint32_t>(a | b); break;
+			case SrtTape::Op::Xor32: out = static_cast<uint32_t>(a ^ b); break;
+			case SrtTape::Op::BitFieldUExtract: {
+				const auto offset = static_cast<uint32_t>(b);
+				const auto width  = static_cast<uint32_t>(values[node.c]);
+				if (offset > 32u || width > 32u - offset) return TapeResult::Failed;
+				const auto mask = width == 32u  ? UINT32_MAX
+				                  : width == 0u ? 0u
+				                                : (uint32_t {1} << width) - 1u;
+				out = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+				break;
+			}
+			case SrtTape::Op::Pack64:
+				out = static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+				break;
+			case SrtTape::Op::Extract64: out = static_cast<uint32_t>(a >> (node.immediate * 32u)); break;
+			case SrtTape::Op::AddCarry: {
+				const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
+				out = node.immediate == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
+				break;
+			}
+			case SrtTape::Op::ScalarRead:
+			case SrtTape::Op::ConstBufferRead: {
+				const bool const_buffer = node.op == SrtTape::Op::ConstBufferRead;
+				uint64_t   address      = 0;
+				uint32_t   word         = 0;
+				const auto& runtime = node.clean ? m_clean_evaluator->m_runtime : m_runtime;
+				if (!ScalarReadAddress(const_buffer, static_cast<uint32_t>(node.immediate), a, b,
+				                       const_buffer ? values[node.d] : 0u, values[node.c], address) ||
+				    !ReadScalarWord(runtime, address, word)) {
+					return TapeResult::Failed;
+				}
+				out = word;
+				break;
+			}
+		}
+		values[index] = out;
+	}
+	flat.resize(m_program.srt_reads.size());
+	for (const auto& [offset, node]: tape->slots) {
+		flat[offset] = static_cast<uint32_t>(values[node]);
+	}
+	m_program.active_sources.clear();
+	for (size_t index = 0; index < tape->nodes.size(); ++index) {
+		const auto& node = tape->nodes[index];
+		if (node.inst == nullptr) continue;
+		if (node.clean) {
+			m_clean_evaluator->Remember(*node.inst, values[index]);
+			if (node.seed_ordinary) Remember(*node.inst, values[index]);
+		} else {
+			Remember(*node.inst, values[index]);
+		}
+	}
+	return TapeResult::Done;
+}
+
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	// The tape fails exactly where the walker would, after the same reads.
+	switch (RefreshFlatBufferTape(flat)) {
+		case TapeResult::Done: return true;
+		case TapeResult::Failed: return false;
+		case TapeResult::Unsupported: break;
+	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;
 		const auto& read = m_program.srt_reads[slot];
