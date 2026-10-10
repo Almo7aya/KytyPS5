@@ -690,20 +690,31 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT("unknown mount mode: %u", mount->mount_mode);
 	}
 
-	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
+	const bool directory_exists = Common::File::IsDirectoryExisting(mount_dir);
+	if (open && !directory_exists) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
-	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
+	// A directory without save metadata is not a save: DirNameSearch does not report it, so the
+	// game creates the save instead. It is an interrupted creation or a host directory from an
+	// older layout, and creating the save adopts it rather than failing with EXISTS forever.
+	const bool save_exists =
+	    directory_exists && Common::File::IsFileExisting(save_param_path(mount_dir));
+	if (create && save_exists) {
 		return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
-	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
+	if ((create || create2) && !save_exists) {
 		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		const auto metadata = mount_dir / "sce_sys";
+		// Only remove what this call created; an adopted directory keeps its files.
+		const auto discard = [&] {
+			std::error_code ignored;
+			std::filesystem::remove_all(directory_exists ? metadata : mount_dir, ignored);
+		};
 		std::error_code error;
 		std::filesystem::create_directories(metadata, error);
 		if (error) {
@@ -712,14 +723,14 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
 		                                   sizeof(mount->blocks));
 		if (status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			discard();
 			return status;
 		}
 		const SaveDataParam initial {};
 		const int param_status = write_save_file(save_param_path(mount_dir), &initial,
 		                                         sizeof(initial));
 		if (param_status != OK) {
-			std::filesystem::remove_all(mount_dir, error);
+			discard();
 			return param_status;
 		}
 		created = true;
