@@ -765,11 +765,15 @@ public:
 		});
 	}
 
+	// Splitting a Windows view briefly removes its surviving neighbours from the backing map.
+	// Transfers wait for such a mapping transaction instead of failing on a mapped range.
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
+		std::shared_lock lock(m_mutex);
 		return m_backing->TryWriteBacking(vaddr, data, size);
 	}
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
+		std::shared_lock lock(m_mutex);
 		return m_backing->TryReadBacking(vaddr, data, size);
 	}
 
@@ -791,7 +795,10 @@ public:
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
 	}
 
-	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
+	bool BackingContains(uint64_t vaddr, uint64_t size) {
+		std::shared_lock lock(m_mutex);
+		return m_backing->Contains(vaddr, size);
+	}
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
