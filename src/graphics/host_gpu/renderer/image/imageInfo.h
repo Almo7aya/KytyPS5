@@ -530,8 +530,15 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 		clear = vk::ClearColorValue {};
 		return true;
 	}
-	// A 64-bit pixel sees the fill word in both halves.
-	return DecodePackedColorClear(format, uint64_t {packed} * 0x100000001ull, clear);
+	// A consumed fill replaces the guest memory write with an image clear. Accepting these
+	// formats here crashed Uncharted at boot on garbage descriptors, so they stay register-only.
+	switch (format) {
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR32G32Sfloat: return false;
+		default: break;
+	}
+	return DecodePackedColorClear(format, packed, clear);
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

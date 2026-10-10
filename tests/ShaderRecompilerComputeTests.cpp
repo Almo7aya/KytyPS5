@@ -10560,11 +10560,12 @@ public:
               "register clear lost channel order, sign, range or unused-channel zeros");
     }
     vk::ClearColorValue clear{};
-    Require(name, "64-bit DWORD fill",
-            DecodeColorDwordFill(vk::Format::eR16G16B16A16Unorm, 0x0000ffffu, clear) &&
-                std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
-                    std::bit_cast<std::array<uint32_t, 4>>(std::array{1.0f, 0.0f, 1.0f, 0.0f}),
-            "a DWORD fill did not repeat across both halves of a 64-bit pixel");
+    for (const auto format : {vk::Format::eB10G11R11UfloatPack32,
+                              vk::Format::eR16G16B16A16Unorm, vk::Format::eR32G32Sfloat}) {
+      Require(name, "register-only clear format",
+              !DecodeColorDwordFill(format, 0u, clear),
+              "a DWORD fill of a register-only clear format was consumed as an image clear");
+    }
     Require(name, "half NaN clear",
             DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
                 std::isnan(clear.float32[0]),
