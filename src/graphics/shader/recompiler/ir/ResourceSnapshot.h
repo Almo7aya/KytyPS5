@@ -36,6 +36,8 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	// Evaluated ResourcePlan::address_bases; they do not affect specialization.
+	std::vector<uint64_t>        address_bases;
 	UniformFill                 uniform_fill;
 };
 
