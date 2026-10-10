@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -166,6 +167,84 @@ static bool TryConsumeComputeBufferFill(RenderContext& context, const ShaderComp
 		return false;
 	}
 	context.GetBufferCache().FillBuffer(destination.address, destination.size, fill.value, false);
+	return true;
+}
+
+// Naughty Dog's engine applies small CPU-staged updates with a batched DWORD-copy kernel: for up
+// to eight segments, a table holds the source V#s at +0x000, the destination V#s at +0x080, the
+// DWORD counts at +0x100 and the segment count at +0x120, and lane `gid` copies element `gid` of
+// every segment longer than it. Uncharted runs it dozens of times a frame and reads the results
+// on the CPU, each read draining the GPU. As a DMA copy, the destinations stay CPU-visible.
+static bool TryConsumeComputeSegmentCopy(RenderContext& context, const ShaderComputeInputInfo& input,
+                                         uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                         uint32_t mode) {
+	constexpr uint64_t SegmentCopyKernel = 0xb3ade16b0485b3bdull;
+	constexpr uint32_t MaxSegments       = 8;
+	const auto&        resources         = *input.stage.resources;
+	if (input.stage.program->shader_hash != SegmentCopyKernel || resources.user_data.size() < 2 ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || input.threads_num[1] != 1 ||
+	    input.threads_num[2] != 1 || group_y != 1 || group_z != 1) {
+		return false;
+	}
+	auto&          cache = context.GetBufferCache();
+	const uint64_t table =
+	    (uint64_t {resources.user_data[1]} << 32u | resources.user_data[0]) & 0xffffffffffffull;
+	std::array<uint32_t, 0x124 / sizeof(uint32_t)> words {};
+	if (table == 0 || (table & 3u) != 0 || !context.IsMapped(table, sizeof(words)) ||
+	    cache.IsRegionGpuModified(table, sizeof(words)) ||
+	    !Libs::LibKernel::Memory::TryReadBacking(table, words.data(), sizeof(words))) {
+		return false;
+	}
+	const auto segments = words[0x120 / 4];
+	const auto lanes    = uint64_t {group_x} * input.threads_num[0];
+	if (segments == 0 || segments > MaxSegments) {
+		return false;
+	}
+	struct Copy {
+		uint64_t source, destination, bytes;
+	};
+	std::array<Copy, MaxSegments> copies {};
+	const auto decode = [&](uint32_t first, uint64_t count, uint64_t& base) {
+		ShaderRecompiler::IR::DescriptorValue value {.dword_count = 4};
+		std::copy_n(words.begin() + first, 4, value.dwords.begin());
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+		base                  = descriptor.Base48();
+		return descriptor.Type() == 0u && descriptor.Stride() == 4u && !descriptor.SwizzleEnabled() &&
+		       !descriptor.AddTid() && descriptor.Format() != Prospero::BufferFormat::kInvalid &&
+		       base != 0 && (base & 3u) == 0 && count <= descriptor.NumRecords();
+	};
+	for (uint32_t i = 0; i < segments; ++i) {
+		auto&      copy  = copies[i];
+		const auto count = std::min<uint64_t>(words[0x100 / 4 + i], lanes);
+		if (!decode(i * 4, count, copy.source) || !decode(0x80 / 4 + i * 4, count, copy.destination)) {
+			return false;
+		}
+		copy.bytes = count * sizeof(uint32_t);
+	}
+	// Lanes run the segments concurrently: every write must miss every read and the table.
+	const auto overlaps = [](uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+		return a_size != 0 && b_size != 0 && a < b + b_size && b < a + a_size;
+	};
+	for (uint32_t i = 0; i < segments; ++i) {
+		const auto& write = copies[i];
+		if (write.bytes == 0) continue;
+		if (!context.IsMapped(write.destination, write.bytes) ||
+		    !context.IsMapped(write.source, write.bytes) ||
+		    overlaps(write.destination, write.bytes, table, sizeof(words))) {
+			return false;
+		}
+		for (uint32_t j = 0; j < segments; ++j) {
+			if (overlaps(write.destination, write.bytes, copies[j].source, copies[j].bytes) ||
+			    (j != i && overlaps(write.destination, write.bytes, copies[j].destination, copies[j].bytes))) {
+				return false;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < segments; ++i) {
+		if (copies[i].bytes != 0) {
+			cache.CopyBuffer(copies[i].destination, copies[i].source, copies[i].bytes, false, false);
+		}
+	}
 	return true;
 }
 
@@ -351,6 +430,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// Reads only its own validated table, never the specialized snapshot.
+	if (TryConsumeComputeSegmentCopy(m_context, input_info, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
