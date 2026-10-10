@@ -192,6 +192,14 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_texture_cache.ProcessDownloadImages();
+	// The caches age resources in collections, and this runs after every guest submission:
+	// Uncharted submits about 27 times a frame, so its buffers and images were retired after
+	// a fraction of a second unused and recreated and uploaded again. Collect once per frame.
+	const auto frame = m_gpu != nullptr ? m_gpu->GetFrameNum() : 0;
+	if (frame == m_gc_frame) {
+		return;
+	}
+	m_gc_frame = frame;
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
 }

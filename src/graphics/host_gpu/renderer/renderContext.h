@@ -88,6 +88,7 @@ private:
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	int                       m_gc_frame              = -1;
 	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
