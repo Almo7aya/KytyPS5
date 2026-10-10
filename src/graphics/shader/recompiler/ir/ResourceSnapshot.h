@@ -25,6 +25,8 @@ struct UniformFill {
 	std::array<uint32_t, 3> group_stride {};
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
+	// Elements a guarded buffer fill writes at most; unguarded fills cover the dispatch.
+	uint32_t                 count        = UINT32_MAX;
 
 	bool operator==(const UniformFill&) const = default;
 };
