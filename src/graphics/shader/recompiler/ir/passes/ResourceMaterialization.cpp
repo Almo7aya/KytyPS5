@@ -875,6 +875,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
 	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
+	if (key_count == 0u) {
+		// No key selects anything; the root the shader falls back to must be null.
+		descriptors[resource_index] = {.dword_count = dword_count};
+	}
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
 		const auto key = sources.empty() ? keys[entry] : entry;
 		DescriptorValue candidate;
@@ -1198,7 +1202,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program,
 		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
 		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
 		                           : 0u;
-		if (key_count == 0u ||
+		const bool speculative =
+		    IsSpeculativeImageTable(Source(program, program.info.images[root_index].source));
+		// A speculative table keeps its padded mapping when the GPU-written data selects nothing.
+		if (root.indirect_mapping_offset >= snapshot.flattened_srt.size() ||
+		    (key_count == 0u && !speculative) ||
 		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
 		            static_cast<size_t>(key_count) * (root.indirect_search_iterations == 0u ? 1u : 2u) >
 		        snapshot.flattened_srt.size()) {
@@ -1215,7 +1223,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program,
 				}
 			}
 		};
-		if (IsSpeculativeImageTable(Source(program, program.info.images[root_index].source))) {
+		if (speculative) {
 			// Table entries over-approximate the descriptors the GPU selects. Keep one class of
 			// entries one operation can sample alike and null the others: the previous dispatch's
 			// class while it still has entries, so the shader does not alternate, else the largest.
