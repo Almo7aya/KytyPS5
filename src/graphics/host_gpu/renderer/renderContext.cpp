@@ -58,7 +58,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (!IsMapped(fault_vaddr, fault_size)) {
+	// Only a page watcher makes a fault the caches' to resolve. Any other fault in GPU-visible
+	// memory (a guest protection, or a page briefly absent while its view is remapped) must not
+	// create cache state here: before the first submission there is no command buffer for it.
+	if (!IsWatched(access, fault_vaddr) || !IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
@@ -68,6 +71,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+bool RenderContext::IsWatched(PageFaultAccess access, uint64_t fault_vaddr) const noexcept {
+	return m_page_manager.IsWatched(fault_vaddr, access);
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
