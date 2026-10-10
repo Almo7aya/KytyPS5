@@ -1813,7 +1813,7 @@ private:
 			} else if (std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
-					       return consumer.user->GetOpcode() != ValueOpcode::StoreBufferU32;
+					       return BufferAccessOf(consumer.user->GetOpcode()) != BufferAccess::Write;
 				       });
 			    })) {
 				return false;
@@ -1920,11 +1920,12 @@ private:
 		bool linear = true;
 		for (const auto& use: handle.Uses()) {
 			const auto& inst = *use.user;
-			if (inst.GetOpcode() != ValueOpcode::StoreBufferU32) return false;
+			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) return false;
 			const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
 			uint32_t scalar = 1u;
 			if (memory.kind != ResourceKind::Buffer) return false;
-			linear &= !memory.typed && !memory.formatted && !memory.idxen && memory.offen &&
+			linear &= inst.GetOpcode() == ValueOpcode::StoreBufferU32 && !memory.typed &&
+			          !memory.formatted && !memory.idxen && memory.offen &&
 			          ImmediateU32(inst.Arg(3), scalar) && scalar == 0u;
 		}
 		DescriptorSource table_source;
@@ -2229,7 +2230,7 @@ private:
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if ((ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None &&
-				     inst.GetOpcode() != ValueOpcode::StoreBufferU32) ||
+				     BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write) ||
 				    inst.NumArgs() == 0u) {
 					continue;
 				}
@@ -2255,7 +2256,7 @@ private:
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
 				};
-				plan_handle(inst.Arg(0), inst.GetOpcode() == ValueOpcode::StoreBufferU32 ? 4u : 8u,
+				plan_handle(inst.Arg(0), BufferAccessOf(inst.GetOpcode()) == BufferAccess::Write ? 4u : 8u,
 				            memory.resource * 4u, false);
 				if (inst.GetOpcode() == ValueOpcode::ImageSampleRaw &&
 				    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) == 0u)
