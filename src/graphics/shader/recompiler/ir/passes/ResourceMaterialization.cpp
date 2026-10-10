@@ -746,11 +746,17 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			// Descriptor bytes are refreshed together. The GPU selects the DWORD address;
 			// no material selector or unused table field is interpreted on the CPU.
+			// A table V# that is stale or not yet written can describe memory the host cannot read
+			// or a size no descriptor heap has. Like an invalid one, it provides no descriptor.
+			constexpr uint64_t MaxTableBytes = 16u << 20u;
+			if (table_size > MaxTableBytes) {
+				descriptors[resource_index] = {.dword_count = dword_count};
+				return true;
+			}
 			keys.resize(table_size / 4u);
 			if (!ReadScalarTable(table_base, table_size, 0u, runtime, keys)) {
-				return SpecializationFail(fmt::format(
-				    "shader 0x{:016x}: cannot read descriptor table at 0x{:x}, size 0x{:x}",
-				    program.shader_hash, table_base, table_size));
+				descriptors[resource_index] = {.dword_count = dword_count};
+				return true;
 			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			descriptors[resource_index] = {.dword_count = dword_count};
