@@ -1149,12 +1149,14 @@ static void LayOutSpeculativeImages(const ResourcePlan&                         
 		root.dimension               = capacity.begin()->first.first;
 		root.cube                    = capacity.begin()->first.second;
 		descriptors[root_index]      = {.dword_count = 8u};
+		// Appending the children reallocates images; keep the root by value.
+		const auto layout = root;
 		std::vector<uint32_t> remap(members.size(), 0u); // Null and dropped entries select the root.
 		uint32_t              ordinal = 1;
 		for (const auto& [kind, slots]: capacity) {
 			const auto run = runs.find(kind);
 			for (uint32_t slot = 0; slot < slots; slot++, ordinal++) {
-				auto child                       = root;
+				auto child                       = layout;
 				child.dimension                  = kind.first;
 				child.cube                       = kind.second;
 				child.indirect_mapping_offset    = plan.indirect_mapping_offset;
@@ -1168,8 +1170,8 @@ static void LayOutSpeculativeImages(const ResourcePlan&                         
 				images.push_back(child);
 			}
 		}
-		auto       mapping = std::span(snapshot.flattened_srt).subspan(root.indirect_mapping_offset);
-		const bool direct  = root.indirect_search_iterations == 0u;
+		auto       mapping = std::span(snapshot.flattened_srt).subspan(layout.indirect_mapping_offset);
+		const bool direct  = layout.indirect_search_iterations == 0u;
 		for (uint32_t entry = 0; entry < mapping[0]; entry++) {
 			auto& selected = mapping[direct ? 1u + entry : 2u + entry * 2u];
 			selected       = selected < remap.size() ? remap[selected] : 0u;
