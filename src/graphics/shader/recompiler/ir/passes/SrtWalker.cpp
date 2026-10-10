@@ -567,7 +567,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// As in SrtReadCapture::ReadOrdinary: a pointer on a path the GPU does not take can be
+		// garbage, and no mapped memory reads as zero.
+		if (m_runtime.is_mapped == nullptr || m_runtime.is_mapped(address, sizeof(word))) {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
 	}
 	result = word;
 	return true;
