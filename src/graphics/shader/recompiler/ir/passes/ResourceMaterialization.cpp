@@ -780,13 +780,21 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		}
 		if (!indirect.selector_value.IsEmpty()) {
 			// The GPU computes the key; its value set is enumerated from the guest memory it reads.
+			// A key derived from data the GPU writes earlier in the frame has no such value set.
+			// Sampled entries are validated on the host, so an image table is then scanned from its
+			// start instead; unused and foreign entries become null candidates.
+			constexpr uint32_t ScannedImageKeys = 1024;
 			if (indirect.table_stride == 0u) return false;
 			if (!KeySetEvaluator(program, runtime, clean)
 			         .Run(indirect.selector_value, indirect.selector_ranges, keys)) {
-				return SpecializationFail(fmt::format(
-				    "shader 0x{:016x} resource {}: GPU-selected descriptor key has no bounded "
-				    "value set",
-				    program.shader_hash, resource_index));
+				if (dword_count != 8u) {
+					return SpecializationFail(fmt::format(
+					    "shader 0x{:016x} resource {}: GPU-selected descriptor key has no bounded "
+					    "value set",
+					    program.shader_hash, resource_index));
+				}
+				keys.resize(ScannedImageKeys);
+				std::iota(keys.begin(), keys.end(), 0u);
 			}
 		} else if (selector == nullptr) {
 			uint32_t key_count = 0;
