@@ -175,7 +175,10 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
-static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+// Returns false for an unsupported speculative candidate, which the caller binds as null: a
+// table can hold entries the GPU never selects for this operation, such as a color view of a
+// depth target. Any other unsupported binding is fatal.
+static bool ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
                                         const ShaderTextureResource& descriptor, const Image& image,
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
@@ -183,7 +186,10 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
-		return;
+		return true;
+	}
+	if (resource.speculative) {
+		return false;
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
@@ -205,6 +211,7 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	     descriptor_pitch, image.info.pitch, descriptor.Base40(), size, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
 	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	return false;
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
@@ -637,7 +644,16 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	const auto null_binding = [&] {
+		auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto null_id   = texture_cache.FindImage(null_desc);
+		return TextureBinding {null_id, nullptr, std::move(null_desc)};
+	};
+	auto id = resource.speculative ? texture_cache.FindSpeculativeImage(desc, shader_conversion)
+	                               : texture_cache.FindImage(desc, shader_conversion);
+	if (!id) {
+		return null_binding();
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -647,8 +663,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                            desc.info.data.size);
+		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		                                 desc.info.data.size)) {
+			return null_binding();
+		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {

@@ -1128,6 +1128,7 @@ static void LayOutSpeculativeImages(const ResourcePlan&                         
 		root.conversion_format       = exemplar.conversion_format;
 		root.shader_swizzle          = exemplar.shader_swizzle;
 		root.fmask                   = false;
+		root.speculative             = true;
 		root.dimension               = capacity.begin()->first.first;
 		root.cube                    = capacity.begin()->first.second;
 		descriptors[root_index]      = {.dword_count = 8u};
@@ -1973,6 +1974,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.speculative                = source.speculative;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
