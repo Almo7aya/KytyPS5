@@ -42,6 +42,7 @@ public:
 	[[nodiscard]] Inst*     TryInstruction() const;
 	[[nodiscard]] Inst*     ResolveInstruction() const;
 	[[nodiscard]] Value     Resolve() const;
+	[[nodiscard]] Inst*     ResolveInstructionSlow() const;
 	[[nodiscard]] ScalarReg ScalarRegister() const;
 	[[nodiscard]] VectorReg VectorRegister() const;
 	[[nodiscard]] bool      U1() const;
@@ -225,10 +226,10 @@ inline Inst* Value::TryInstruction() const {
 }
 
 inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	const auto value = Resolve();
-	EXIT_IF(value.type != Type::Opaque);
-	return value.inst;
+	if (type == Type::Opaque && inst->GetOpcode() != ValueOpcode::Identity) [[likely]] {
+		return inst;
+	}
+	return ResolveInstructionSlow();
 }
 
 inline uint32_t Value::U32() const {

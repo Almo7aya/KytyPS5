@@ -30,6 +30,13 @@ Inst* Value::Instruction() const {
 	return inst;
 }
 
+Inst* Value::ResolveInstructionSlow() const {
+	EXIT_IF(type != Type::Opaque);
+	const auto value = Resolve();
+	EXIT_IF(value.type != Type::Opaque);
+	return value.inst;
+}
+
 ScalarReg Value::ScalarRegister() const {
 	EXIT_IF(type != Type::ScalarReg);
 	return scalar_reg;
