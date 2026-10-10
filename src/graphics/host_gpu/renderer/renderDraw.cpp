@@ -459,7 +459,10 @@ DrawRenderState& RenderExecutor::BeginDrawState() {
 	// whole state for every draw cost Uncharted about 2% of the command processor.
 	auto& state = *m_draw_state;
 	state.depth_info  = {};
-	std::ranges::fill(state.color_info, RenderColorInfo {});
+	// Targets are resolved in order into color_info[color_count]; the slot after the last counted
+	// one may hold a target that was rejected.
+	std::fill_n(state.color_info, std::min(state.color_count + 1u, RENDER_COLOR_ATTACHMENTS_MAX),
+	            RenderColorInfo {});
 	state.color_count = 0;
 	state.ps_active   = true;
 	return state;
