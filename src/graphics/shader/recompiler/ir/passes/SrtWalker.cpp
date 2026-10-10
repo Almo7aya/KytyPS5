@@ -33,6 +33,12 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else if (capture.m_source.is_mapped != nullptr &&
+	           !capture.m_source.is_mapped(address, values.size_bytes())) {
+		// Reads are evaluated on every path, including ones the GPU does not take with this data;
+		// a pointer there can be stale or garbage. No mapped memory reads as zero.
+		std::ranges::fill(values, 0u);
+		return true;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
