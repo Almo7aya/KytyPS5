@@ -18357,7 +18357,7 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              return LibKernel::Memory::HandleMemoryFault(access, info.access_violation_vaddr);
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;

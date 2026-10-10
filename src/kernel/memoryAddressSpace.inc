@@ -26,6 +26,25 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	return size != 0 && VirtualFree(reinterpret_cast<void*>(vaddr), size,
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
+
+static bool HostProtectionAllows(DWORD protect, Graphics::PageFaultAccess access) {
+	using Access = Graphics::PageFaultAccess;
+	if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+		return false;
+	}
+	switch (access) {
+		case Access::Read:
+			return (protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+			                   PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+		case Access::Write:
+			return (protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE |
+			                   PAGE_EXECUTE_WRITECOPY)) != 0;
+		case Access::Execute:
+			return (protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+			                   PAGE_EXECUTE_WRITECOPY)) != 0;
+		default: return false;
+	}
+}
 #endif
 
 class GuestBackingStore {
@@ -800,6 +819,72 @@ public:
 		return m_backing->Contains(vaddr, size);
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Waits for an in-flight mapping transaction, then checks the page's current protection.
+	bool HostAccessAllowed(uint64_t vaddr, Graphics::PageFaultAccess access) {
+		std::shared_lock lock(m_mutex);
+		const bool owned = std::any_of(m_owned.begin(), m_owned.end(), [vaddr](const auto& range) {
+			return vaddr >= range.first && vaddr - range.first < range.second;
+		});
+		MEMORY_BASIC_INFORMATION info {};
+		return owned &&
+		       VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0 &&
+		       info.State == MEM_COMMIT && HostProtectionAllows(info.Protect, access);
+	}
+#endif
+
+	// A fixed mapping over live memory replaces it in two transactions on Windows: the old
+	// mappings are released, then the new view is mapped. Accesses in the window wait for it.
+	void BeginReplacement(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_replacement_mutex);
+		m_replacing.emplace_back(vaddr, size);
+	}
+
+	void EndReplacement(uint64_t vaddr, uint64_t size) {
+		{
+			std::lock_guard lock(m_replacement_mutex);
+			const auto      found =
+			    std::find(m_replacing.begin(), m_replacing.end(), std::pair(vaddr, size));
+			EXIT_IF(found == m_replacing.end());
+			m_replacing.erase(found);
+			m_replacement_generation++;
+		}
+		m_replacement_done.notify_all();
+	}
+
+	// Resolves a fault no page watcher claimed but that a mapping change may have caused: a view
+	// split briefly unmaps its surviving fragments, and a fixed replacement unmaps its range.
+	// Waits for either, then retries the access if the page permits it now.
+	bool ResolveTransientFault(uint64_t vaddr, Graphics::PageFaultAccess access) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		const auto replacing = [&] {
+			return std::any_of(m_replacing.begin(), m_replacing.end(), [vaddr](const auto& range) {
+				return vaddr >= range.first && vaddr - range.first < range.second;
+			});
+		};
+		for (;;) {
+			uint64_t generation = 0;
+			{
+				std::lock_guard lock(m_replacement_mutex);
+				generation = m_replacement_generation;
+			}
+			if (HostAccessAllowed(vaddr, access)) {
+				return true;
+			}
+			std::unique_lock lock(m_replacement_mutex);
+			if (!replacing() && m_replacement_generation == generation) {
+				return false;
+			}
+			m_replacement_done.wait(lock, [&] { return !replacing(); });
+		}
+#else
+		// Other hosts replace mappings atomically.
+		(void)vaddr;
+		(void)access;
+		return false;
+#endif
+	}
+
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -1414,6 +1499,10 @@ private:
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
+	std::mutex                                 m_replacement_mutex;
+	std::condition_variable                    m_replacement_done;
+	std::vector<std::pair<uint64_t, uint64_t>> m_replacing;
+	uint64_t                                   m_replacement_generation = 0;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
 };
