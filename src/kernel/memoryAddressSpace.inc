@@ -27,6 +27,47 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 	                                MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0;
 }
 
+// Current page protections of a committed range. Guest mprotect and GPU page watches both live
+// only in these protections, so a view that is recreated must get them back explicitly.
+struct HostProtection {
+	uint64_t vaddr   = 0;
+	uint64_t size    = 0;
+	DWORD    protect = 0;
+};
+
+static bool CaptureHostProtection(uint64_t vaddr, uint64_t size,
+                                  std::vector<HostProtection>& ranges) {
+	const auto end = vaddr + size;
+	while (vaddr < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT) {
+			return false;
+		}
+		const auto next =
+		    std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+		ranges.push_back({vaddr, next - vaddr, info.Protect});
+		vaddr = next;
+	}
+	return true;
+}
+
+// Reapplies the captured protections inside [vaddr, vaddr + size). Runs that already match the
+// protection the view was mapped with need no call.
+static bool RestoreHostProtection(const std::vector<HostProtection>& ranges, uint64_t vaddr,
+                                  uint64_t size, DWORD mapped) {
+	for (const auto& range: ranges) {
+		const auto begin = std::max(vaddr, range.vaddr);
+		const auto end   = std::min(vaddr + size, range.vaddr + range.size);
+		DWORD      old   = 0;
+		if (begin < end && range.protect != mapped &&
+		    VirtualProtect(reinterpret_cast<void*>(begin), end - begin, range.protect, &old) == 0) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static bool HostProtectionAllows(DWORD protect, Graphics::PageFaultAccess access) {
 	using Access = Graphics::PageFaultAccess;
 	if ((protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
@@ -452,6 +493,16 @@ public:
 			return true;
 		}
 
+		// A view can only be unmapped whole, so its surviving fragments are briefly absent and are
+		// recreated with the view's mapping protection. Restore what they had before; a racing
+		// access during the gap is retried by ResolveTransientFault.
+		std::vector<HostProtection> protection;
+		if (!CaptureHostProtection(old.vaddr, old.size, protection)) {
+			std::lock_guard lock(m_mutex);
+			m_maps.emplace(old.vaddr, old);
+			return false;
+		}
+		const auto mapped_protect = GetProtect(old.mode);
 		if (UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size)) {
 			bool ok = true;
 			if (left_size != 0 && left_size != old.size) {
@@ -469,6 +520,8 @@ public:
 				     ok;
 			}
 			if (ok) {
+				EXIT_IF(!RestoreHostProtection(protection, old.vaddr, left_size, mapped_protect));
+				EXIT_IF(!RestoreHostProtection(protection, right_addr, right_size, mapped_protect));
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -484,6 +537,7 @@ public:
 			EXIT_IF(VirtualFree(reinterpret_cast<void*>(old.vaddr), old.size,
 			                    MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) == 0);
 			EXIT_IF(!MapFixed(old.vaddr, old.size, old.backing_offset, old.mode));
+			EXIT_IF(!RestoreHostProtection(protection, old.vaddr, old.size, mapped_protect));
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
