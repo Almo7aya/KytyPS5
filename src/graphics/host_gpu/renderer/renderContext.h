@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
 
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
 #include <span>
@@ -82,6 +83,8 @@ private:
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	// Moves on every map and unmap, under m_mapped_ranges_mutex.
+	std::atomic<uint64_t>     m_mapping_generation {0};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
