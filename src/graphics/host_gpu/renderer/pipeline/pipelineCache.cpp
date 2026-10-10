@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -108,6 +109,41 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// A texture the texture cache can place: its view lies within its physical mips, and its image
+// is mapped and aligned for its tiling block.
+bool IsPlaceableTexture(std::span<const uint32_t, 8> words) {
+	ShaderTextureResource descriptor;
+	std::ranges::copy(words, descriptor.fields);
+	const auto type = descriptor.Type();
+	const auto base = descriptor.BaseLevel();
+	const auto last = descriptor.LastLevel();
+	// Multisampled descriptors encode log2(samples) in their level fields.
+	const bool msaa = type == Prospero::ImageType::kColor2DMsaa ||
+	                  type == Prospero::ImageType::kColor2DMsaaArray;
+	if (msaa ? base != 0 || last == 0 || last > 3 || descriptor.MaxMip() != last
+	         : base > last || last > descriptor.MaxMip()) {
+		return false;
+	}
+	// Destination selects 2 and 3 are reserved.
+	for (const auto select: {descriptor.DstSelX(), descriptor.DstSelY(), descriptor.DstSelZ(),
+	                         descriptor.DstSelW()}) {
+		if (select == 2u || select == 3u) {
+			return false;
+		}
+	}
+	const auto address = descriptor.Base40();
+	if (!Libs::LibKernel::Memory::IsGpuMemoryMapped(address, 1)) {
+		return false;
+	}
+	if (descriptor.TileMode() == Prospero::TileMode::kLinear) {
+		return (address & 255u) == 0;
+	}
+	TileTextureBlockLayout layout;
+	return TileGetTextureBlockLayout(descriptor.Format(), descriptor.TileMode(),
+	                                 descriptor.Type() == Prospero::ImageType::kColor3D, layout) &&
+	       layout.block.block_size != 0 && (address & (layout.block.block_size - 1u)) == 0;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -342,6 +378,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .is_mapped                  = Libs::LibKernel::Memory::IsGpuMemoryMapped,
+		    .is_placeable_texture       = IsPlaceableTexture,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;

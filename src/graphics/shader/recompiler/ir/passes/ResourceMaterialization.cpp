@@ -660,6 +660,13 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
 }
 
+// Candidates read from a descriptor table can include entries the GPU never selects (unused
+// slots, other operations' resources); only finite descriptor choices are all reachable.
+bool IsSpeculativeImageTable(const DescriptorSource* source) {
+	return source != nullptr && source->indirect_descriptor &&
+	       source->indirect_descriptor->sources.empty();
+}
+
 template <typename Specialization, typename Normalize>
 bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
                                    const DescriptorSource::IndirectDescriptor& indirect,
@@ -944,12 +951,81 @@ private:
 	uint32_t                                    count = 0;
 };
 
+// Derives an image's specialization from its descriptor, or returns why it cannot be bound.
+static std::optional<std::string> ClassifyImage(const ResourcePlan& program, uint32_t i,
+                                                const ImageResource&      base,
+                                                const DescriptorValue&    descriptor,
+                                                ResourceSpecialization::Image& image) {
+	image.mip_count = ImageMipCount(base, descriptor);
+	if (image.mip_count == 0u) {
+		return fmt::format("image descriptor {} has an invalid mip range", i);
+	}
+	if (NullImageDescriptor(descriptor)) {
+		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
+		                                  : Prospero::TextureNumericClass::Float;
+		image.dimension     = Decoder::ImageDimension::Dim2D;
+		image.cube          = false;
+		return std::nullopt;
+	}
+	const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
+	if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
+		return fmt::format(
+		    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"
+		    "{:08x},{:08x},{:08x},{:08x}",
+		    i, (descriptor.dwords[3] >> 28u) & 0xfu, descriptor.dwords[0], descriptor.dwords[1],
+		    descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+		    descriptor.dwords[6], descriptor.dwords[7]);
+	}
+	image.dimension = descriptor_dimension;
+	image.cube      = DescriptorIsCube(descriptor);
+	const auto format =
+	    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	if (base.atomic &&
+	    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+	                   : format != Prospero::BufferFormat::k32UInt &&
+	                         format != Prospero::BufferFormat::k32Float)) {
+		return fmt::format("atomic image descriptor {} uses unsupported format {}", i,
+		                   static_cast<uint32_t>(format));
+	}
+	const bool storage = base.resource_class == ImageResourceClass::Storage;
+	image.fmask        = Prospero::IsFmaskTextureFormat(format);
+	if (image.fmask) {
+		if (storage || base.depth_compare || image.indirect_root != ImageResource::NoIndirectImage ||
+		    std::ranges::any_of(program.info.sampled_pairs,
+		                        [&](const auto& pair) { return pair.image == i; })) {
+			return std::string("FMASK requires a direct image load");
+		}
+	}
+	image.conversion_format = ImageConversionFormat(format);
+	if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
+		image.shader_swizzle = DescriptorImageSwizzle(descriptor);
+	}
+	const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
+	                              base.written && !base.read && !base.atomic;
+	image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+	if (storage) {
+		if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
+		    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			return fmt::format("storage image descriptor {} uses unsupported format {}", i,
+			                   static_cast<uint32_t>(format));
+		}
+		if (raw_sint_storage || base.atomic) {
+			image.numeric_class = Prospero::TextureNumericClass::Uint;
+		}
+	} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
+	           (base.depth_compare && image.numeric_class != Prospero::TextureNumericClass::Float)) {
+		return fmt::format("sampled image descriptor {} uses unsupported format {}", i,
+		                   static_cast<uint32_t>(format));
+	}
+	return std::nullopt;
+}
+
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
-		const auto& descriptor = snapshot.images[i];
-		auto&       image      = specialization.images[i];
-		const auto  base_index = i < program.info.images.size() ? i : image.indirect_root;
+		auto&      descriptor = snapshot.images[i];
+		auto&      image      = specialization.images[i];
+		const auto base_index = i < program.info.images.size() ? i : image.indirect_root;
 		if (base_index >= program.info.images.size()) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid root", i));
 		}
@@ -958,72 +1034,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
-		image.mip_count = ImageMipCount(base, descriptor);
-		if (image.mip_count == 0u) {
-			return SpecializationFail(
-			    fmt::format("image descriptor {} has an invalid mip range", i));
+		const auto initial = image;
+		auto       error   = ClassifyImage(program, i, base, descriptor, image);
+		if (error && IsSpeculativeImageTable(Source(program, base.source))) {
+			// The GPU never selects a table entry this operation cannot use.
+			descriptor.dwords.fill(0u);
+			image = initial;
+			error = ClassifyImage(program, i, base, descriptor, image);
 		}
-		if (NullImageDescriptor(descriptor)) {
-			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
-			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
-			image.cube          = false;
-			continue;
-		}
-		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
-		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {
-			return SpecializationFail(fmt::format(
-			    "image descriptor {} has unsupported type {}: {:08x},{:08x},{:08x},{:08x},"
-			    "{:08x},{:08x},{:08x},{:08x}",
-			    i, (descriptor.dwords[3] >> 28u) & 0xfu, descriptor.dwords[0], descriptor.dwords[1],
-			    descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4],
-			    descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]));
-		}
-		image.dimension = descriptor_dimension;
-		image.cube      = DescriptorIsCube(descriptor);
-		const auto format =
-		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic &&
-		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
-		                   : format != Prospero::BufferFormat::k32UInt &&
-		                         format != Prospero::BufferFormat::k32Float)) {
-			return SpecializationFail(
-			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
-		}
-		const bool storage      = base.resource_class == ImageResourceClass::Storage;
-		image.fmask             = Prospero::IsFmaskTextureFormat(format);
-		if (image.fmask) {
-			if (storage || base.depth_compare ||
-			    image.indirect_root != ImageResource::NoIndirectImage ||
-			    std::ranges::any_of(program.info.sampled_pairs,
-			                        [&](const auto& pair) { return pair.image == i; })) {
-				return SpecializationFail("FMASK requires a direct image load");
-			}
-		}
-		image.conversion_format = ImageConversionFormat(format);
-		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
-			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
-		}
-		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
-		if (storage) {
-			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
-			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
-				return SpecializationFail(
-				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
-				                static_cast<uint32_t>(format)));
-			}
-			if (raw_sint_storage || base.atomic) {
-				image.numeric_class = Prospero::TextureNumericClass::Uint;
-			}
-		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
-		           (base.depth_compare &&
-		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
-			return SpecializationFail(
-			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
-			                static_cast<uint32_t>(format)));
+		if (error) {
+			return SpecializationFail(*error);
 		}
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
@@ -1040,6 +1060,45 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		        snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
+		const auto is_2d = [](Decoder::ImageDimension dimension) {
+			return dimension == Decoder::ImageDimension::Dim2D ||
+			       dimension == Decoder::ImageDimension::Dim2DArray;
+		};
+		const auto compatible = [&](const auto& a, const auto& b) {
+			const bool same_coordinates = a.dimension == b.dimension && a.cube == b.cube;
+			return a.numeric_class == b.numeric_class &&
+			       (same_coordinates || (is_2d(a.dimension) && is_2d(b.dimension))) &&
+			       a.mip_count == b.mip_count && a.conversion_format == b.conversion_format &&
+			       a.shader_swizzle == b.shader_swizzle;
+		};
+		const auto candidates = [&](auto&& visit) {
+			for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
+				if (specialization.images[resource].indirect_root == root_index &&
+				    !NullImageDescriptor(snapshot.images[resource])) {
+					visit(resource);
+				}
+			}
+		};
+		if (IsSpeculativeImageTable(Source(program, program.info.images[root_index].source))) {
+			// Table entries over-approximate the descriptors the GPU selects. Keep the largest
+			// group of entries one operation can sample alike; the others become null.
+			uint32_t best = ImageResource::NoIndirectImage, best_count = 0;
+			candidates([&](uint32_t resource) {
+				uint32_t count = 0;
+				candidates([&](uint32_t other) {
+					count += compatible(specialization.images[resource], specialization.images[other]);
+				});
+				if (count > best_count) {
+					best       = resource;
+					best_count = count;
+				}
+			});
+			candidates([&](uint32_t resource) {
+				if (!compatible(specialization.images[resource], specialization.images[best])) {
+					snapshot.images[resource].dwords.fill(0u);
+				}
+			});
+		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
 		uint32_t resource_count = 0;
 		for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
@@ -1055,11 +1114,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
-		const auto& image_class = specialization.images[exemplar];
-		const auto is_2d = [](Decoder::ImageDimension dimension) {
-			return dimension == Decoder::ImageDimension::Dim2D ||
-			       dimension == Decoder::ImageDimension::Dim2DArray;
-		};
+		const auto image_class = specialization.images[exemplar];
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -1073,13 +1128,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			const bool same_coordinates = image.dimension == image_class.dimension &&
-			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
+			if (!compatible(image, image_class)) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
 				                program.info.images[root_index].first_use_pc));
@@ -1598,10 +1647,22 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			if (source->indirect_descriptor.has_value()) {
 				snapshot.buffers[i] = {.dword_count = 4u};
 				if (active.empty() || active[base.source]) {
+					const bool speculative = !source->indirect_descriptor->selector_value.IsEmpty();
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
 					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
-					        NormalizeIndirectStoreBuffer))
+					        [&](DescriptorValue& value) {
+						        // An enumerated key set can reach unused entries. One whose memory
+						        // is not mapped cannot be the destination the GPU writes.
+						        ShaderBufferResource descriptor;
+						        if (speculative && runtime.is_mapped != nullptr &&
+						            DecodeBufferDescriptor(value, descriptor) &&
+						            !runtime.is_mapped(descriptor.Base48(),
+						                               std::max<uint64_t>(descriptor.GetSize(), 1u))) {
+							        value.dwords.fill(0u);
+						        }
+						        return NormalizeIndirectStoreBuffer(value);
+					        }))
 						return false;
 				}
 			} else if (!evaluate(base.source, snapshot.buffers[i], base.written)) {
@@ -1658,12 +1719,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			// A table entry whose image is not mapped and aligned for its tiling cannot be the one
+			// the GPU samples.
+			const auto unmapped = [&](const DescriptorValue& value) {
+				return IsSpeculativeImageTable(source) && runtime.is_placeable_texture != nullptr &&
+				       !runtime.is_placeable_texture(std::span<const uint32_t, 8>(value.dwords));
+			};
 			if (!MaterializeIndirectDescriptor(
 			        program, indirect, i, 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, UINT32_MAX, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension) ||
+				            unmapped(value))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
