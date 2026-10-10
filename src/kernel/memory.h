@@ -117,6 +117,8 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Like ClampRangeSize, but returns 0 for a range that does not start in guest memory.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 // Whether guest memory in the range is mapped for GPU access; reads nothing.
