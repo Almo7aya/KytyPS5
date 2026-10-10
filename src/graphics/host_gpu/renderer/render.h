@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -152,7 +153,8 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -171,6 +173,7 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	[[nodiscard]] DrawRenderState& BeginDrawState();
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -217,6 +220,8 @@ private:
 	std::vector<uint64_t>                 m_address_bases;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// One draw's prepared state, reused: its shader input infos are kilobytes.
+	std::unique_ptr<DrawRenderState>      m_draw_state;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -448,6 +448,23 @@ struct DrawRenderState {
 	PipelineCache::GraphicsPrograms programs;
 };
 
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+RenderExecutor::~RenderExecutor() = default;
+
+DrawRenderState& RenderExecutor::BeginDrawState() {
+	if (m_draw_state == nullptr) {
+		m_draw_state = std::make_unique<DrawRenderState>();
+	}
+	// The shader input infos and programs are reset by the code that fills them; zeroing the
+	// whole state for every draw cost Uncharted about 2% of the command processor.
+	auto& state = *m_draw_state;
+	state.depth_info  = {};
+	std::ranges::fill(state.color_info, RenderColorInfo {});
+	state.color_count = 0;
+	state.ps_active   = true;
+	return state;
+}
+
 struct DrawCallInfo {
 	CommandBufferDebugOp debug_op       = CommandBufferDebugOp::DrawIndex;
 	uint32_t             index_count    = 0;
@@ -1268,7 +1285,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
-	DrawRenderState state {};
+	auto& state = BeginDrawState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
@@ -1348,7 +1365,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		ResetBindings();
 		return;
 	}
-	DrawRenderState state {};
+	auto& state = BeginDrawState();
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return;
