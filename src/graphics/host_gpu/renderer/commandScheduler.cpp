@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <optional>
 
@@ -175,6 +176,18 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 	BeginNext();
 }
 
+void CommandScheduler::FlushIfStale() {
+	// Commands are otherwise submitted at the end of a guest submission or by a CPU readback, which
+	// then waits for everything recorded so far. Uncharted records thousands of draws per
+	// submission, so the GPU idled while the CPU recorded and the CPU idled at every readback.
+	constexpr auto MaxRecordingTime = std::chrono::milliseconds(1);
+	if (!Active() || m_command.IsInvalid() ||
+	    std::chrono::steady_clock::now() - m_command_begin_time < MaxRecordingTime) {
+		return;
+	}
+	Flush();
+}
+
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
@@ -333,6 +346,7 @@ CommandBuffer& CommandScheduler::Current() {
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
 	m_command.m_buffer = m_command_pool.Commit();
+	m_command_begin_time = std::chrono::steady_clock::now();
 	m_command.Begin();
 	m_dynamic_state.Invalidate();
 	return m_command;

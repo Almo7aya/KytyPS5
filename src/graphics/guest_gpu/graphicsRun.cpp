@@ -671,9 +671,13 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
+	uint32_t packets = 0;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+		}
+		if ((++packets & 15u) == 0) {
+			GetScheduler().FlushIfStale();
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		EXIT_IF(cursor.offset_dw > cursor.commands.size());
