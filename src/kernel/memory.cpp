@@ -917,6 +917,10 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	}
 }
 
+bool IsGpuMemoryMapped(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
+}
+
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;

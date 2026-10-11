@@ -27,6 +27,14 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 
 bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	// As with ordinary reads, paths the GPU does not take are evaluated too, and a pointer there
+	// can be stale or garbage. Memory that is not mapped cannot be what the GPU reads: it reads
+	// as zero, and specialization does not depend on it.
+	if (capture.m_source.is_mapped != nullptr &&
+	    !capture.m_source.is_mapped(address, values.size_bytes())) {
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
 		return false;
 	}
@@ -38,6 +46,12 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
 	if (capture.m_source.read_memory != nullptr) {
 		if (!capture.m_source.read_memory(capture.m_source.userdata, address, values)) return false;
+	} else if (capture.m_source.is_mapped != nullptr &&
+	           !capture.m_source.is_mapped(address, values.size_bytes())) {
+		// Reads are evaluated on every path, including ones the GPU does not take with this data;
+		// a pointer there can be stale or garbage. No mapped memory reads as zero.
+		std::ranges::fill(values, 0u);
+		return true;
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
@@ -691,7 +705,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	} else {
 		if (vector) return false;
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		// As in SrtReadCapture::ReadOrdinary: a pointer on a path the GPU does not take can be
+		// garbage, and no mapped memory reads as zero.
+		if (m_runtime.is_mapped == nullptr || m_runtime.is_mapped(address, sizeof(word))) {
+			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		}
 	}
 	result = word;
 	return true;
