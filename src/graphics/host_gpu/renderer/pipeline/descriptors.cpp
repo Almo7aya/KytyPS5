@@ -1155,6 +1155,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				}
 			}
 		}
+		// Most draws read far from what they write: test the span of all reads first.
+		uint64_t first = UINT64_MAX;
+		uint64_t end   = 0;
+		for (const auto [address, size]: reads) {
+			first = std::min(first, address);
+			end   = std::max(end, address + size);
+		}
+		if (std::none_of(m_written_ranges.begin(), m_written_ranges.end(), [&](const auto& entry) {
+			    return ImageRangeOverlaps(first, end - first, entry.first.address,
+			                              entry.first.size);
+		    })) {
+			continue;
+		}
 		for (const auto [address, size]: reads) {
 			for (const auto& [written, image]: m_written_ranges) {
 				if (ImageRangeOverlaps(address, size, written.address, written.size)) {
