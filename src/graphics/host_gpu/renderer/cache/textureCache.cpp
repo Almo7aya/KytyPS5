@@ -42,8 +42,10 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
+		// The word is in guest memory layout, which a transformed host format does not share.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
+		       desc.info.GetColorTransform() == ColorTransform::None &&
 		       DecodePackedColorClear(format, metadata.clear_word, clear);
 	}
 	if (cmask) {

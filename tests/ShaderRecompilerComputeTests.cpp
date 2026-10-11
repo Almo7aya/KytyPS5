@@ -10531,7 +10531,7 @@ public:
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     struct PackedCase {
       vk::Format format;
-      uint32_t word;
+      uint64_t word;
       std::array<float, 4> channels;
     };
     const std::array packed_cases{
@@ -10549,16 +10549,30 @@ public:
         PackedCase{vk::Format::eR16G16Unorm, 0x0000ffffu, {1.0f, 0.0f}},
         PackedCase{vk::Format::eR16G16Unorm, 0x80000001u,
                    {1.0f / 65535.0f, 32768.0f / 65535.0f}},
+        // A captured wake map cleared to one through this 11_11_10 register word.
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x781e03c0u, {1.0f, 1.0f, 1.0f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x00000001u, {0x1p-20f}},
+        PackedCase{vk::Format::eB10G11R11UfloatPack32, 0x00400000u, {0.0f, 0.0f, 0x1p-19f}},
+        PackedCase{vk::Format::eR16G16B16A16Sfloat, 0x3c000000bc003c00ull,
+                   {1.0f, -1.0f, 0.0f, 1.0f}},
+        PackedCase{vk::Format::eR16G16B16A16Unorm, 0xffff00000000ffffull,
+                   {1.0f, 0.0f, 0.0f, 1.0f}},
+        PackedCase{vk::Format::eR32G32Sfloat, 0xbf8000003f800000ull, {1.0f, -1.0f}},
     };
     for (const auto &test : packed_cases) {
       vk::ClearColorValue clear{};
-      Require(name, "packed 16-bit clear",
+      Require(name, "packed register clear",
               DecodePackedColorClear(test.format, test.word, clear) &&
                   std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
                       std::bit_cast<std::array<uint32_t, 4>>(test.channels),
-              "16-bit clear lost channel order, sign, range or unused-channel zeros");
+              "register clear lost channel order, sign, range or unused-channel zeros");
     }
     vk::ClearColorValue clear{};
+    Require(name, "64-bit DWORD fill",
+            DecodeColorDwordFill(vk::Format::eR16G16B16A16Unorm, 0x0000ffffu, clear) &&
+                std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
+                    std::bit_cast<std::array<uint32_t, 4>>(std::array{1.0f, 0.0f, 1.0f, 0.0f}),
+            "a DWORD fill did not repeat across both halves of a 64-bit pixel");
     Require(name, "half NaN clear",
             DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
                 std::isnan(clear.float32[0]),
