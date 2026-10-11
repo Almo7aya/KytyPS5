@@ -31,10 +31,12 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -509,6 +511,92 @@ static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, boo
 	return false;
 }
 
+namespace {
+
+// The image a T# describes, before the texture cache resolves it.
+struct TextureDescription {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	bool                    shader_conversion = false;
+};
+
+// Building a texture's description recomputes its tiling layout for every bound texture of every
+// draw. It depends only on the T# and on how the shader uses the image, so remember recent ones,
+// with the image the texture cache last found for them.
+class TextureDescriptionCache {
+	struct Key {
+		std::array<uint32_t, 8> dwords {};
+		uint64_t                use    = 0;
+		uint32_t                format = 0;
+		uint32_t                count  = 0;
+
+		bool operator==(const Key&) const = default;
+	};
+
+public:
+	struct Slot {
+		bool               valid = false;
+		Key                key;
+		TextureDescription description;
+		// The texture cache's answer, while its lookup generation is unchanged: the image and the
+		// view it selected. Zero is no generation.
+		uint64_t lookup_generation  = 0;
+		bool     lookup_speculative = false;
+		ImageId  image;
+		uint32_t base_level = 0;
+		uint32_t base_layer = 0;
+	};
+
+	Slot* Find(const ShaderRecompiler::IR::ImageResource&   resource,
+	           const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto key  = MakeKey(resource, value);
+		auto&      slot = m_slots[Index(key)];
+		return slot.valid && slot.key == key ? &slot : nullptr;
+	}
+	Slot& Insert(const ShaderRecompiler::IR::ImageResource&   resource,
+	             const ShaderRecompiler::IR::DescriptorValue& value,
+	             TextureDescription                           description) {
+		const auto key  = MakeKey(resource, value);
+		auto&      slot = m_slots[Index(key)];
+		slot            = {true, key, std::move(description)};
+		return slot;
+	}
+
+private:
+	static Key MakeKey(const ShaderRecompiler::IR::ImageResource&   resource,
+	                   const ShaderRecompiler::IR::DescriptorValue& value) {
+		Key key;
+		key.dwords = value.dwords;
+		key.use    = static_cast<uint64_t>(resource.resource_class) |
+		             static_cast<uint64_t>(resource.numeric_class) << 8u |
+		             static_cast<uint64_t>(resource.dimension) << 16u |
+		             static_cast<uint64_t>(resource.mip_mode) << 24u |
+		             static_cast<uint64_t>(resource.mip_count & 0xffu) << 32u |
+		             uint64_t {resource.read} << 40u | uint64_t {resource.written} << 41u |
+		             uint64_t {resource.atomic} << 42u | uint64_t {resource.atomic64} << 43u |
+		             uint64_t {resource.depth_compare} << 44u | uint64_t {resource.cube} << 45u |
+		             uint64_t {resource.r128} << 46u | uint64_t {resource.mip_count > 0xffu} << 47u;
+		key.format = static_cast<uint32_t>(resource.conversion_format);
+		key.count  = value.dword_count;
+		return key;
+	}
+	static size_t Index(const Key& key) {
+		uint64_t hash = 0xcbf29ce484222325ull ^ key.use ^ (uint64_t {key.format} << 48u);
+		for (const auto dword: key.dwords) {
+			hash = (hash ^ dword) * 0x100000001b3ull;
+		}
+		return static_cast<size_t>(hash ^ (hash >> 29u)) & (SlotCount - 1u);
+	}
+	static constexpr size_t     SlotCount = 1024;
+	std::array<Slot, SlotCount> m_slots;
+};
+
+} // namespace
+
+static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                          const ShaderTextureResource&               descriptor);
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
@@ -528,6 +616,67 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		return {id, nullptr, std::move(desc)};
 	}
 
+	// Only the command processor resolves textures.
+	static thread_local auto descriptions = std::make_unique<TextureDescriptionCache>();
+	auto*                    slot         = descriptions->Find(resource, value);
+	if (slot == nullptr) {
+		slot = &descriptions->Insert(resource, value, DescribeTexture(resource, descriptor));
+	}
+	const auto& description       = slot->description;
+	auto        desc              = description.desc;
+	const auto  pixel_format      = description.pixel_format;
+	const auto  view_format       = description.view_format;
+	const bool  shader_conversion = description.shader_conversion;
+	const auto  null_binding      = [&] {
+		auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto null_id   = texture_cache.FindImage(null_desc);
+		return TextureBinding {null_id, nullptr, std::move(null_desc)};
+	};
+	ImageId id;
+	if (slot->lookup_generation == texture_cache.LookupGeneration() &&
+	    slot->lookup_speculative == resource.speculative) {
+		desc.view_info.base_level = slot->base_level;
+		desc.view_info.base_layer = slot->base_layer;
+		if (slot->image) {
+			id = texture_cache.ReuseImage(slot->image, desc, description.desc.view_info.base_layer);
+		}
+	} else {
+		id = resource.speculative ? texture_cache.FindSpeculativeImage(desc, shader_conversion)
+		                          : texture_cache.FindImage(desc, shader_conversion);
+		slot->lookup_generation  = texture_cache.LookupGeneration();
+		slot->lookup_speculative = resource.speculative;
+		slot->image              = id;
+		slot->base_level         = desc.view_info.base_level;
+		slot->base_layer         = desc.view_info.base_layer;
+	}
+	if (!id) {
+		return null_binding();
+	}
+	auto*      image               = &texture_cache.GetImage(id);
+	const bool stencil_association = static_cast<bool>(image->depth_id);
+	if (stencil_association) {
+		id    = image->depth_id;
+		image = &texture_cache.GetImage(id);
+	} else if (image->info.IsDepth()) {
+		if (storage) {
+			EXIT("depth target cannot be bound as a storage image\n");
+		}
+		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
+		                                 desc.info.data.size)) {
+			return null_binding();
+		}
+	} else if (storage) {
+		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+	} else {
+		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		                             descriptor.DstSelXYZW());
+	}
+	return {id, nullptr, std::move(desc)};
+}
+
+static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                          const ShaderTextureResource&               descriptor) {
+	const bool storage         = resource.written;
 	const auto address         = descriptor.Base40();
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
@@ -644,37 +793,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
-
-	const auto null_binding = [&] {
-		auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
-		const auto null_id   = texture_cache.FindImage(null_desc);
-		return TextureBinding {null_id, nullptr, std::move(null_desc)};
-	};
-	auto id = resource.speculative ? texture_cache.FindSpeculativeImage(desc, shader_conversion)
-	                               : texture_cache.FindImage(desc, shader_conversion);
-	if (!id) {
-		return null_binding();
-	}
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association) {
-		id    = image->depth_id;
-		image = &texture_cache.GetImage(id);
-	} else if (image->info.IsDepth()) {
-		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
-		}
-		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                                 desc.info.data.size)) {
-			return null_binding();
-		}
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
-	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
-	}
-	return {id, nullptr, std::move(desc)};
+	return {std::move(desc), pixel_format, view_format, shader_conversion};
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,

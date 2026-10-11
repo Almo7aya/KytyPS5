@@ -12,7 +12,9 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <array>
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +46,12 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Moves whenever a lookup could find a different image.
+	[[nodiscard]] uint64_t LookupGeneration() const noexcept { return m_structure_generation; }
+	// Repeats, in the same lookup generation, a lookup of an equal description that found `id`
+	// and left `desc` with its view.
+	[[nodiscard]] ImageId ReuseImage(ImageId id, const ImageDesc& desc,
+	                                 uint32_t metadata_base_layer);
 	// For a descriptor the GPU may never use: reuses an image with the same backing or inserts
 	// one into an empty region, and returns an invalid id rather than reshape cached images.
 	[[nodiscard]] ImageId       FindSpeculativeImage(ImageDesc& desc, bool exact_format = false);
@@ -159,6 +167,30 @@ private:
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
+	// The result of an image lookup, valid while the cache's images and their matching state are
+	// unchanged. A speculative overlap check sets view_mip to 1 when an image of another shape
+	// overlaps. Caller holds m_lock.
+	struct LookupMemo {
+		ImageInfo     info;
+		ImageViewInfo view;
+		uint64_t      generation = 0;
+		ImageId       result;
+		int32_t       view_mip     = -1;
+		int32_t       view_layer   = -1;
+		BindingType   type         = BindingType::Texture;
+		bool          exact_format = false;
+		bool          speculative  = false;
+	};
+	[[nodiscard]] LookupMemo& LookupSlot(const ImageDesc& desc, bool exact_format, bool speculative);
+	[[nodiscard]] bool        LookupMatches(const LookupMemo& memo, const ImageDesc& desc,
+	                                        bool exact_format, bool speculative) const;
+	void StoreLookup(LookupMemo& memo, const ImageDesc& desc, const ImageViewInfo& view,
+	                 bool exact_format, bool speculative, ImageId result, int32_t view_mip,
+	                 int32_t view_layer);
+	void ChangeStructure() { ++m_structure_generation; }
+	[[nodiscard]] ImageId FinishLookup(ImageId result, const ImageDesc& desc,
+	                                   uint32_t metadata_base_layer);
+
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
@@ -182,6 +214,10 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	// Moves whenever a lookup could find a different image: on registration and when a cached
+	// image's stencil, metadata or depth association changes.
+	uint64_t                                    m_structure_generation = 1;
+	std::unique_ptr<std::array<LookupMemo, 512>> m_lookup_memo;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
