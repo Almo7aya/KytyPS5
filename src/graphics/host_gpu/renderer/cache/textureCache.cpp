@@ -1304,12 +1304,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 			}
 		}
 	}
-	if (selected && ensure_valid) {
-		const auto owner = m_slot_images.try_get(selected);
-		if (owner != nullptr && owner->depth_id) {
-			selected = owner->depth_id;
-		}
-	}
+	// A stencil association is returned as itself: its range holds the stencil plane, not depth.
 	return selected;
 }
 
@@ -1656,6 +1651,36 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
+bool TextureCache::CanDownloadStencil(const Image& association) const {
+	const auto* depth = m_slot_images.try_get(association.depth_id);
+	// Mirrors RefreshImage: compressed or multisampled stencil planes are not uploaded either.
+	return depth != nullptr && depth->backing.image != nullptr && depth->info.HasStencil() &&
+	       depth->SafeToDownload() && !depth->info.metadata.stencil_compressed &&
+	       depth->info.samples == 1 && depth->backing.samples == 1 &&
+	       !association.IsBufferModified() && !association.IsCpuDirty() &&
+	       association.info.data.size != 0;
+}
+
+void TextureCache::DownloadStencil(Image& association, Buffer& destination,
+                                   uint64_t destination_offset) {
+	auto&       depth  = m_slot_images[association.depth_id];
+	const auto& info   = association.info;
+	const bool  tiled  = info.IsTiled();
+	auto        copies = info.BufferCopies(tiled ? 0 : destination_offset);
+	for (auto& copy: copies) {
+		copy.imageSubresource.baseArrayLayer += association.stencil_subresources.base_layer;
+	}
+	if (!tiled) {
+		depth.Download(copies, destination.Handle(), destination_offset, info.data.size);
+		return;
+	}
+	const auto linear_capacity = info.LinearSize();
+	auto       linear          = m_tiler.GetScratchBuffer(linear_capacity);
+	depth.Download(copies, linear.buffer, 0, linear.size);
+	m_tiler.Tile(linear.buffer, 0, linear_capacity, destination.Handle(), destination_offset,
+	             info.data.size, info);
+}
+
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                  uint64_t destination_size, uint32_t levels) {
 	if (!CanDownload(image)) {
@@ -1693,6 +1718,15 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
+	if (image.depth_id) {
+		// The depth image renders its stencil plane; this range is that plane's guest copy.
+		if (!m_texture_cache.CanDownloadStencil(image) ||
+		    !buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+			return false;
+		}
+		m_texture_cache.DownloadStencil(image, buffer, buffer.Offset(image.info.data.address));
+		return true;
+	}
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload()) {
 		return false;
