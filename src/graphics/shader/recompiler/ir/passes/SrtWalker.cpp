@@ -1359,16 +1359,9 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 	};
 	// Computes one node and seeds the walkers' memos with it, so a branch condition the walker
 	// evaluates, and the descriptor evaluation that follows, find it.
-	const auto evaluate = [&](size_t index) {
+	const auto compute = [&](size_t index) {
 		const auto& node = tape->nodes[index];
-		// A value the walkers already evaluated in this session is not read again.
-		if (node.inst != nullptr &&
-		    ((node.seed_ordinary && recall(m_context, node.index, values[index])) ||
-		     recall(node.clean ? m_clean_evaluator->m_context : m_context, node.index,
-		            values[index]))) {
-			return true;
-		}
-		uint64_t out = 0;
+		uint64_t    out  = 0;
 		switch (node.op) {
 			case SrtTape::Op::Const: out = node.immediate; break;
 			case SrtTape::Op::UserData:
@@ -1395,9 +1388,22 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 		}
 		return true;
 	};
+	const auto evaluate = [&](size_t index) {
+		const auto& node = tape->nodes[index];
+		// A value the walkers already evaluated in this session is not read again.
+		if (node.inst != nullptr &&
+		    ((node.seed_ordinary && recall(m_context, node.index, values[index])) ||
+		     recall(node.clean ? m_clean_evaluator->m_context : m_context, node.index,
+		            values[index]))) {
+			return true;
+		}
+		return compute(index);
+	};
 	if (tape->blocks.empty()) {
+		// The flat refresh opens the walkers' session and each node is listed once, so no value
+		// can be in their memos yet.
 		for (size_t index = 0; index < tape->nodes.size(); ++index) {
-			if (!evaluate(index)) return TapeResult::Failed;
+			if (!compute(index)) return TapeResult::Failed;
 		}
 		flat.resize(m_program.srt_reads.size());
 		for (const auto& [offset, node]: tape->slots) {
