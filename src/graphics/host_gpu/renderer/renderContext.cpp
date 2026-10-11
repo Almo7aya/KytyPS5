@@ -7,6 +7,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <atomic>
 
 namespace Libs::Graphics {
 
@@ -86,17 +87,45 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+// Generations are unique across contexts, so a thread's cached range never matches another one.
+static uint64_t NextMappingGeneration() {
+	static std::atomic<uint64_t> next {0};
+	return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		return false;
 	}
+	// Shader resource evaluation probes dozens of words of one mapping per draw, and the shared
+	// lock is contended by faulting guest threads. Remember the last mapping this thread found;
+	// every map and unmap moves the generation and invalidates it.
+	struct CachedRange {
+		const RenderContext* owner      = nullptr;
+		uint64_t             generation = 0;
+		uint64_t             begin      = 0;
+		uint64_t             end        = 0;
+	};
+	thread_local CachedRange cached;
+	if (cached.owner == this &&
+	    cached.generation == m_mapping_generation.load(std::memory_order_acquire) &&
+	    vaddr >= cached.begin && size <= cached.end - vaddr && vaddr < cached.end) {
+		return true;
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges.Contains(vaddr, size);
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	if (!m_mapped_ranges.FindContaining(vaddr, size, begin, end)) {
+		return false;
+	}
+	cached = {this, m_mapping_generation.load(std::memory_order_relaxed), begin, end};
+	return true;
 }
 
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapping_generation.store(NextMappingGeneration(), std::memory_order_release);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -120,6 +149,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapping_generation.store(NextMappingGeneration(), std::memory_order_release);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -150,9 +180,25 @@ void RenderContext::PrepareBda(std::span<const uint64_t> address_bases) {
 			}
 		});
 	}
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Every buffer must hold the guest's CPU writes before the shader reads memory directly. A
+	// sweep of every buffer before each DMA draw and dispatch would mostly find nothing to upload,
+	// so only the buffers in tracker regions with new CPU writes are visited. Regions are taken
+	// before uploading, and writes from then on queue their region again.
+	m_buffer_cache.TakeCpuModifiedRegions(m_bda_regions);
+	const auto generation = m_mapping_generation.load(std::memory_order_relaxed);
+	if (generation != m_bda_mapping_generation) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_mapping_generation = generation;
+	} else {
+		for (const auto region: m_bda_regions) {
+			m_mapped_ranges.ForEachInRange(
+			    region, TRACKER_REGION_SIZE, [this](uint64_t start, uint64_t end) {
+				    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			    });
+		}
+	}
 	m_fault_process_pending = true;
 }
 

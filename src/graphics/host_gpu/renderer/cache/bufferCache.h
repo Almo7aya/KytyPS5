@@ -81,6 +81,11 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// The tracker regions where SynchronizeBuffersInRange could find new CPU-modified data since
+	// the last call: pages became CPU-modified there, or a buffer was registered.
+	void TakeCpuModifiedRegions(std::vector<uint64_t>& regions) {
+		m_memory_tracker.TakeCpuModifiedRegions(regions);
+	}
 	void               RunGarbageCollector();
 
 private:
