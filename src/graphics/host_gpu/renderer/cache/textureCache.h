@@ -46,6 +46,12 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Moves whenever a lookup could find a different image.
+	[[nodiscard]] uint64_t LookupGeneration() const noexcept { return m_structure_generation; }
+	// Repeats, in the same lookup generation, a lookup of an equal description that found `id`
+	// and left `desc` with its view.
+	[[nodiscard]] ImageId ReuseImage(ImageId id, const ImageDesc& desc,
+	                                 uint32_t metadata_base_layer);
 	// For a descriptor the GPU may never use: reuses an image with the same backing or inserts
 	// one into an empty region, and returns an invalid id rather than reshape cached images.
 	[[nodiscard]] ImageId       FindSpeculativeImage(ImageDesc& desc, bool exact_format = false);

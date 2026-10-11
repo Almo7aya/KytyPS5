@@ -521,25 +521,9 @@ struct TextureDescription {
 
 // Building a texture's description recomputes its tiling layout for every bound texture of every
 // draw, a few percent of Uncharted's command processor. It depends only on the T# and on how the
-// shader uses the image, so remember recent ones.
+// shader uses the image, so remember recent ones, with the image the texture cache last found
+// for them.
 class TextureDescriptionCache {
-public:
-	const TextureDescription* Find(const ShaderRecompiler::IR::ImageResource&   resource,
-	                               const ShaderRecompiler::IR::DescriptorValue& value) {
-		const auto key  = MakeKey(resource, value);
-		auto&      slot = m_slots[Index(key)];
-		return slot.valid && slot.key == key ? &slot.description : nullptr;
-	}
-	const TextureDescription& Insert(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                 const ShaderRecompiler::IR::DescriptorValue& value,
-	                                 TextureDescription                           description) {
-		const auto key  = MakeKey(resource, value);
-		auto&      slot = m_slots[Index(key)];
-		slot            = {true, key, std::move(description)};
-		return slot.description;
-	}
-
-private:
 	struct Key {
 		std::array<uint32_t, 8> dwords {};
 		uint64_t                use    = 0;
@@ -548,11 +532,37 @@ private:
 
 		bool operator==(const Key&) const = default;
 	};
+
+public:
 	struct Slot {
 		bool               valid = false;
 		Key                key;
 		TextureDescription description;
+		// The texture cache's answer, while its lookup generation is unchanged: the image and the
+		// view it selected. Zero is no generation.
+		uint64_t lookup_generation  = 0;
+		bool     lookup_speculative = false;
+		ImageId  image;
+		uint32_t base_level = 0;
+		uint32_t base_layer = 0;
 	};
+
+	Slot* Find(const ShaderRecompiler::IR::ImageResource&   resource,
+	           const ShaderRecompiler::IR::DescriptorValue& value) {
+		const auto key  = MakeKey(resource, value);
+		auto&      slot = m_slots[Index(key)];
+		return slot.valid && slot.key == key ? &slot : nullptr;
+	}
+	Slot& Insert(const ShaderRecompiler::IR::ImageResource&   resource,
+	             const ShaderRecompiler::IR::DescriptorValue& value,
+	             TextureDescription                           description) {
+		const auto key  = MakeKey(resource, value);
+		auto&      slot = m_slots[Index(key)];
+		slot            = {true, key, std::move(description)};
+		return slot;
+	}
+
+private:
 	static Key MakeKey(const ShaderRecompiler::IR::ImageResource&   resource,
 	                   const ShaderRecompiler::IR::DescriptorValue& value) {
 		Key key;
@@ -607,22 +617,37 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	// Only the command processor resolves textures.
 	static thread_local auto descriptions = std::make_unique<TextureDescriptionCache>();
-	const auto*              cached       = descriptions->Find(resource, value);
-	const auto&              description =
-	    cached != nullptr
-	        ? *cached
-	        : descriptions->Insert(resource, value, DescribeTexture(resource, descriptor));
-	auto       desc              = description.desc;
-	const auto pixel_format      = description.pixel_format;
-	const auto view_format       = description.view_format;
-	const bool shader_conversion = description.shader_conversion;
-	const auto null_binding      = [&] {
+	auto*                    slot         = descriptions->Find(resource, value);
+	if (slot == nullptr) {
+		slot = &descriptions->Insert(resource, value, DescribeTexture(resource, descriptor));
+	}
+	const auto& description       = slot->description;
+	auto        desc              = description.desc;
+	const auto  pixel_format      = description.pixel_format;
+	const auto  view_format       = description.view_format;
+	const bool  shader_conversion = description.shader_conversion;
+	const auto  null_binding      = [&] {
 		auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
 		const auto null_id   = texture_cache.FindImage(null_desc);
 		return TextureBinding {null_id, nullptr, std::move(null_desc)};
 	};
-	auto id = resource.speculative ? texture_cache.FindSpeculativeImage(desc, shader_conversion)
-	                               : texture_cache.FindImage(desc, shader_conversion);
+	ImageId id;
+	if (slot->lookup_generation == texture_cache.LookupGeneration() &&
+	    slot->lookup_speculative == resource.speculative) {
+		desc.view_info.base_level = slot->base_level;
+		desc.view_info.base_layer = slot->base_layer;
+		if (slot->image) {
+			id = texture_cache.ReuseImage(slot->image, desc, description.desc.view_info.base_layer);
+		}
+	} else {
+		id = resource.speculative ? texture_cache.FindSpeculativeImage(desc, shader_conversion)
+		                          : texture_cache.FindImage(desc, shader_conversion);
+		slot->lookup_generation  = texture_cache.LookupGeneration();
+		slot->lookup_speculative = resource.speculative;
+		slot->image              = id;
+		slot->base_level         = desc.view_info.base_level;
+		slot->base_layer         = desc.view_info.base_layer;
+	}
 	if (!id) {
 		return null_binding();
 	}

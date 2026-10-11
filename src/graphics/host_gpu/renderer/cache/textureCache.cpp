@@ -1335,6 +1335,16 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	return FinishLookup(result, desc, metadata_base_layer);
 }
 
+ImageId TextureCache::ReuseImage(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer) {
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image   = m_slot_images[id];
+		image.tick_accessed_last = m_scheduler.CurrentTick();
+		TouchImage(image);
+	}
+	return FinishLookup(id, desc, metadata_base_layer);
+}
+
 ImageId TextureCache::FinishLookup(ImageId result, const ImageDesc& desc,
                                    uint32_t metadata_base_layer) {
 	MaterializeColorClear(result, desc, metadata_base_layer);
