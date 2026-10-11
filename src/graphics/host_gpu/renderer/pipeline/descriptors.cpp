@@ -1183,8 +1183,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		for (const auto [address, size]: reads) {
 			for (const auto& [written, image]: m_written_ranges) {
 				if (ImageRangeOverlaps(address, size, written.address, written.size)) {
-					EXIT(image ? "scalar resource reads overlap an image or attachment write\n"
-					           : "scalar resource reads overlap a shader buffer write\n");
+					EXIT("scalar resource reads overlap %s: shader 0x%016" PRIx64
+					     " read 0x%016" PRIx64 "+0x%" PRIx64 ", write 0x%016" PRIx64 "+0x%" PRIx64
+					     "\n",
+					     image ? "an image or attachment write" : "a shader buffer write",
+					     reader->runtime->program->shader_hash, address, size, written.address,
+					     written.size);
 				}
 			}
 		}
