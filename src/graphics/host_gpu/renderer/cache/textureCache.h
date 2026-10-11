@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <memory>
 #include <type_traits>
@@ -194,6 +195,23 @@ private:
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
+	// Registered images per MiB of guest memory, readable without m_lock: guest threads take a
+	// write fault on every buffer page they rewrite, and most of those pages hold no image.
+	class ImageRegionCounts {
+	public:
+		// Under m_lock, before the image's pages are watched or read.
+		void               Add(GuestRange range, int32_t delta);
+		[[nodiscard]] bool MayHoldImage(uint64_t address, uint64_t size) const;
+
+	private:
+		static constexpr uint64_t RegionBits = 20;
+		static constexpr uint64_t ChunkBits  = 12;
+		using Chunk                          = std::atomic<uint32_t>;
+		std::array<std::atomic<Chunk*>, (TRACKER_ADDRESS_SIZE >> (RegionBits + ChunkBits))>
+		                                      m_chunks {};
+		std::vector<std::unique_ptr<Chunk[]>> m_storage;
+	};
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;
@@ -203,6 +221,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	ImageRegionCounts                                             m_image_regions;
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;

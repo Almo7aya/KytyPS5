@@ -212,6 +212,38 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	return id;
 }
 
+void TextureCache::ImageRegionCounts::Add(GuestRange range, int32_t delta) {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << ChunkBits) - 1u;
+	for (auto region = range.address >> RegionBits; region <= (range.End() - 1u) >> RegionBits;
+	     region++) {
+		if ((region >> ChunkBits) >= m_chunks.size()) {
+			EXIT("TextureCache: image outside the tracked address space\n");
+		}
+		auto& slot  = m_chunks[region >> ChunkBits];
+		auto* chunk = slot.load(std::memory_order_relaxed);
+		if (chunk == nullptr) {
+			m_storage.push_back(std::make_unique<Chunk[]>(ChunkMask + 1u));
+			chunk = m_storage.back().get();
+			slot.store(chunk, std::memory_order_release);
+		}
+		chunk[region & ChunkMask].fetch_add(static_cast<uint32_t>(delta));
+	}
+}
+
+bool TextureCache::ImageRegionCounts::MayHoldImage(uint64_t address, uint64_t size) const {
+	constexpr uint64_t ChunkMask = (uint64_t {1} << ChunkBits) - 1u;
+	for (auto region = address >> RegionBits; region <= (address + size - 1u) >> RegionBits;
+	     region++) {
+		const auto* chunk = (region >> ChunkBits) < m_chunks.size()
+		                        ? m_chunks[region >> ChunkBits].load(std::memory_order_acquire)
+		                        : nullptr;
+		if (chunk != nullptr && chunk[region & ChunkMask].load() != 0u) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.registered || image.info.data.Empty()) {
@@ -224,6 +256,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
 		m_image_page_table[page].push_back(id);
 	});
+	m_image_regions.Add(image.info.data, 1);
 	ChangeStructure();
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -246,6 +279,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 	});
+	m_image_regions.Add(image.info.data, -1);
 	m_lru_cache.Free(image.lru_id);
 	const auto accounted = image.AccountedSize();
 	if (accounted > m_total_used_memory) {
@@ -1707,6 +1741,10 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
+	}
+	// Most CPU writes land in buffers far from any image; they need not wait for the lock.
+	if (!m_image_regions.MayHoldImage(address, size)) {
+		return;
 	}
 	std::scoped_lock lock {m_lock};
 	InvalidateCpuAliases(address, size);
