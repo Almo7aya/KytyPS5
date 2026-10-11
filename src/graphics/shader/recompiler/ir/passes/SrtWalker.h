@@ -81,12 +81,19 @@ private:
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	// The straight-line refresh of a plan without control flow; Unsupported leaves it to the walker.
+	enum class TapeResult { Done, Failed, Unsupported };
+	TapeResult RefreshFlatBufferTape(std::vector<uint32_t>& flat);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Every node of the plan's control-flow-free tape holds this session's value.
+	bool m_tape_complete = false;
+	// Some instruction was evaluated through the memo in this session.
+	bool m_memo_used = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
