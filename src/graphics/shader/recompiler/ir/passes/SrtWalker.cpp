@@ -985,21 +985,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	}
 	return false;
 }
-bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
-	if (source >= m_program.descriptor_sources.size()) {
-		return false;
-	}
-	const auto& descriptor = m_program.descriptor_sources[source];
-	result = {};
-	result.dword_count = descriptor.dword_count;
-	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
-		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
-			return false;
-		}
-	}
-	return true;
-}
-
 // The walker evaluates a plan's value graph recursively, memoizing every node, for every draw;
 // that cost Uncharted about a quarter of its command processor. Plans read scalar memory through
 // plain integer arithmetic, so the refresh is compiled once into nodes in the walker's own
@@ -1053,6 +1038,10 @@ struct SrtTape {
 	std::vector<Node>                          nodes;
 	std::vector<std::pair<uint32_t, uint32_t>> slots; // flat offset, node
 	std::vector<Block>                         blocks;
+	// For a tape without control flow: per descriptor source, the node computing each DWORD as
+	// the ordinary walker evaluates it, or NoNode.
+	static constexpr uint32_t                  NoNode = UINT32_MAX;
+	std::vector<std::array<uint32_t, 8>>       descriptors;
 	bool                                       has_clean = false;
 
 	// The nodes a node is computed from, in evaluation order.
@@ -1087,6 +1076,7 @@ public:
 				if (!Slot(read, node)) return nullptr;
 				m_tape.slots.emplace_back(read.flat_offset, node);
 			}
+			MapDescriptors();
 			return std::make_shared<const SrtTape>(std::move(m_tape));
 		}
 		m_tape.blocks.resize(m_program.control_flow.size());
@@ -1112,6 +1102,28 @@ public:
 
 private:
 	using Op = SrtTape::Op;
+
+	// The ordinary walker finds a value the tape computed in its memo: an ordinary node, or a clean
+	// read the tape also seeds into the ordinary memo.
+	void MapDescriptors() {
+		m_tape.descriptors.resize(m_program.descriptor_sources.size());
+		for (size_t source = 0; source < m_program.descriptor_sources.size(); ++source) {
+			const auto& descriptor = m_program.descriptor_sources[source];
+			auto&       nodes      = m_tape.descriptors[source];
+			nodes.fill(SrtTape::NoNode);
+			for (uint32_t index = 0; index < descriptor.dword_count && index < nodes.size();
+			     ++index) {
+				const auto* inst = descriptor.dwords[index].Resolve().TryInstruction();
+				if (inst == nullptr) continue;
+				if (const auto found = m_nodes.find({inst, false}); found != m_nodes.end()) {
+					nodes[index] = found->second;
+				} else if (const auto clean = m_nodes.find({inst, true});
+				           clean != m_nodes.end() && m_tape.nodes[clean->second].seed_ordinary) {
+					nodes[index] = clean->second;
+				}
+			}
+		}
+	}
 
 	bool Slot(const SrtRead& read, uint32_t& node) {
 		const auto* inst  = read.value.Resolve().TryInstruction();
@@ -1392,6 +1404,7 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 			flat[offset] = static_cast<uint32_t>(values[node]);
 		}
 		m_program.active_sources.clear();
+		m_tape_complete = true;
 		return TapeResult::Done;
 	}
 	// As the walker's control-flow refresh, with each block's reads taken from the tape.
@@ -1497,6 +1510,30 @@ static bool ComputeTapeNode(const SrtTape::Node& node, const std::vector<uint64_
 			}
 			out = word;
 			break;
+		}
+	}
+	return true;
+}
+
+bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	if (source >= m_program.descriptor_sources.size()) {
+		return false;
+	}
+	const auto& descriptor = m_program.descriptor_sources[source];
+	result                 = {};
+	result.dword_count     = descriptor.dword_count;
+	// Values this session's tape computed are read from it rather than found again in the memo.
+	const auto* tape = m_tape_complete ? m_program.srt_tape.get() : nullptr;
+	const auto* nodes =
+	    tape != nullptr && source < tape->descriptors.size() ? &tape->descriptors[source] : nullptr;
+	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+		if (nodes != nullptr && index < nodes->size() && (*nodes)[index] != SrtTape::NoNode) {
+			result.dwords[index] =
+			    static_cast<uint32_t>(m_program.srt_tape_values[(*nodes)[index]]);
+			continue;
+		}
+		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+			return false;
 		}
 	}
 	return true;

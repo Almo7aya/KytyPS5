@@ -85,6 +85,8 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Every node of the plan's control-flow-free tape holds this session's value.
+	bool m_tape_complete = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
