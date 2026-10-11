@@ -1954,7 +1954,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 	}
 	// The previous dispatch's layout, which speculative tables keep where they can.
-	const auto previous_images = std::exchange(specialization.images, {});
+	// Swapped with a retained scratch vector so neither layout is reallocated per dispatch.
+	static thread_local std::vector<ResourceSpecialization::Image> previous_images;
+	previous_images.swap(specialization.images);
+	specialization.images.clear();
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
