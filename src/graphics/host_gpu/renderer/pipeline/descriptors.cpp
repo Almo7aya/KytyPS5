@@ -791,7 +791,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			// A descriptor outside guest memory faults on the GPU if the shader uses it; it can also
+			// be stale or garbage on a path the shader does not take. Either way it binds nothing.
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+			if (size == 0) {
+				source = {};
+				continue;
+			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
 	}

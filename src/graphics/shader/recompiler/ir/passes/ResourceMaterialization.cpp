@@ -727,6 +727,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				descriptors[resource_index] = {.dword_count = dword_count};
 				return true;
 			}
+			// A V# read on a path the GPU does not take can be any data. One whose table is not
+			// mapped memory cannot be what the GPU uses: like a stale one, it provides no
+			// descriptor.
+			if (runtime.is_mapped != nullptr && !runtime.is_mapped(table_base, sizeof(uint32_t))) {
+				descriptors[resource_index] = {.dword_count = dword_count};
+				return true;
+			}
 			if (table_size > UINT32_MAX ||
 			    (indirect.table_record_bytes != 0u &&
 			     (table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
@@ -739,6 +746,13 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			// Descriptor bytes are refreshed together. The GPU selects the DWORD address;
 			// no material selector or unused table field is interpreted on the CPU.
+			// A table V# that is stale or not yet written can describe a size no descriptor heap
+			// has. Like an invalid one, it provides no descriptor.
+			constexpr uint64_t MaxTableBytes = 16u << 20u;
+			if (table_size > MaxTableBytes) {
+				descriptors[resource_index] = {.dword_count = dword_count};
+				return true;
+			}
 			keys.resize(table_size / 4u);
 			if (!ReadScalarTable(table_base, table_size, 0u, runtime, keys)) {
 				return SpecializationFail(fmt::format(

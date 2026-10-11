@@ -892,10 +892,13 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->ClampRangeSize(vaddr, size);
+}
 
-	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
@@ -915,6 +918,10 @@ void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 		     " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+}
+
+bool IsGpuMemoryMapped(uint64_t vaddr, uint64_t size) {
+	return g_gpu_resources != nullptr && g_gpu_resources->IsMapped(vaddr, size);
 }
 
 void InvalidateMemory(uint64_t vaddr, uint64_t size) {

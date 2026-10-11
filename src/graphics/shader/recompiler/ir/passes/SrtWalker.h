@@ -18,6 +18,8 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Whether guest memory is mapped, without reading it; null skips the check.
+	bool (*is_mapped)(uint64_t address, uint64_t size) = nullptr;
 };
 
 class SrtReadCapture {
