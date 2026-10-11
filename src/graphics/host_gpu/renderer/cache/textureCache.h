@@ -44,6 +44,9 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// For a descriptor the GPU may never use: reuses an image with the same backing or inserts
+	// one into an empty region, and returns an invalid id rather than reshape cached images.
+	[[nodiscard]] ImageId       FindSpeculativeImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
