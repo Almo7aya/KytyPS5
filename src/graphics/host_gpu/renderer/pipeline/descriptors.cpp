@@ -1114,6 +1114,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image_descriptor_count += count;
 			}
 		}
+		if (program.has_address_writes) {
+			m_context.GetBufferCache().NoteAddressWrites();
+		}
 		const auto shader_stage = NativeShaderStage(program.stage);
 		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
