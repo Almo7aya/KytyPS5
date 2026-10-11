@@ -378,7 +378,24 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// The view must match the image dimension the shader declares.
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	switch (resource.dimension) {
+		case Dimension::Dim1D:
+		case Dimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = resource.dimension == Dimension::Dim1D
+			                          ? vk::ImageViewType::e1D
+			                          : vk::ImageViewType::e1DArray;
+			break;
+		case Dimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case Dimension::Dim2DArray:
+		case Dimension::Dim2DMsaaArray: desc.view_info.type = vk::ImageViewType::e2DArray; break;
+		default: desc.view_info.type = vk::ImageViewType::e2D; break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
