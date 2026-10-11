@@ -286,6 +286,15 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       !descriptor.MsaaDepth();
 }
 
+// A 256-bit T# whose extension DWORDs are all zero describes what a 128-bit one does: one slice,
+// no metadata and no mips past its last level. The hardware accepts it (a zero PERF_MOD is
+// valid), and games bind storage images this way.
+static bool ShortFormTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                             const ShaderTextureResource&               descriptor) {
+	return resource.r128 || (descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
+	                         descriptor.fields[6] == 0 && descriptor.fields[7] == 0);
+}
+
 static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageResource& resource,
                                               const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
@@ -302,7 +311,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	                    descriptor.fields[3] == expected_field3;
-	if (resource.r128) {
+	if (ShortFormTexture(resource, descriptor)) {
 		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 	}
@@ -380,7 +389,24 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// The view must match the image dimension the shader declares.
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	switch (resource.dimension) {
+		case Dimension::Dim1D:
+		case Dimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = resource.dimension == Dimension::Dim1D
+			                          ? vk::ImageViewType::e1D
+			                          : vk::ImageViewType::e1DArray;
+			break;
+		case Dimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case Dimension::Dim2DArray:
+		case Dimension::Dim2DMsaaArray: desc.view_info.type = vk::ImageViewType::e2DArray; break;
+		default: desc.view_info.type = vk::ImageViewType::e2D; break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -398,13 +424,13 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
-	if (descriptor.MinLod() > descriptor.LastLevel() * 256u) {
-		EXIT("texture minimum LOD exceeds last mip level: min_lod=%u last_level=%u\n",
-		     descriptor.MinLod(), descriptor.LastLevel());
-	}
+	// The sampler never selects a level past the view's last one, so a larger MIN_LOD samples that
+	// level.
 	const auto base_lod = view.base_level * 256u;
-	if (descriptor.MinLod() > base_lod) {
-		view.min_lod = descriptor.MinLod() - base_lod;
+	const auto min_lod =
+	    std::min<uint32_t>(descriptor.MinLod(), base_lod + (view_levels - 1u) * 256u);
+	if (min_lod > base_lod) {
+		view.min_lod = min_lod - base_lod;
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
@@ -684,7 +710,8 @@ static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResou
 	const auto last_level      = descriptor.LastLevel();
 	const auto type            = TextureType(descriptor);
 	const bool multisampled    = IsMultisampledTexture(type);
-	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
+	const bool short_form      = ShortFormTexture(resource, descriptor);
+	const auto max_mip         = short_form ? last_level : descriptor.MaxMip();
 	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
