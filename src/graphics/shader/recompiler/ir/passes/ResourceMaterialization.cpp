@@ -1702,6 +1702,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	for (const auto& [low, high]: program.address_bases) {
+		if (ValidateRuntimeValue(program, low, RuntimeValueType::Integer) &&
+		    ValidateRuntimeValue(program, high, RuntimeValueType::Integer)) {
+			plan.address_bases.push_back({Clone(low), Clone(high)});
+		}
+	}
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value unknown;
@@ -1987,6 +1993,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	snapshot.address_bases.clear();
+	if (!program.address_bases.empty()) {
+		// Read with the plain runtime: these addresses only steer buffer residency and must not
+		// join the captured reads that decide specialization.
+		SrtWalker bases(program, runtime);
+		for (const auto& [low, high]: program.address_bases) {
+			uint32_t low_value  = 0;
+			uint32_t high_value = 0;
+			if (bases.Evaluate(low, low_value) && bases.Evaluate(high, high_value)) {
+				snapshot.address_bases.push_back(
+				    (uint64_t {high_value} << 32u | low_value) & 0xffffffffffffull);
+			}
+		}
+	}
 	return BuildResourceSpecialization(program, previous_images, snapshot, specialization);
 }
 

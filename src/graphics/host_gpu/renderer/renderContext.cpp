@@ -130,12 +130,26 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(std::span<const uint64_t> address_bases) {
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
+	// A DMA read of memory without a cached buffer returns zero; the fault only backs the page for
+	// later dispatches. A shader reading from a per-frame ring this way read zeros whenever the
+	// ring had moved onto new pages. Back a window at each known base.
+	constexpr uint64_t BaseWindow = 256ull << 10u;
+	for (const auto base: address_bases) {
+		if (base == 0) {
+			continue;
+		}
+		m_mapped_ranges.ForEachInRange(base, BaseWindow, [&](uint64_t start, uint64_t end) {
+			if (start == base) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			}
+		});
+	}
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});

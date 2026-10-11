@@ -345,6 +345,7 @@ public:
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma = false;
+		m_program.address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -2533,6 +2534,14 @@ private:
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
+			if (const auto* base = inst.Arg(0).Resolve().TryInstruction();
+			    base != nullptr && base->GetOpcode() == ValueOpcode::GetAddressResource &&
+			    base->NumArgs() == 2) {
+				const std::array<Value, 2> pair {base->Arg(0).Resolve(), base->Arg(1).Resolve()};
+				if (std::ranges::find(m_program.address_bases, pair) == m_program.address_bases.end()) {
+					m_program.address_bases.push_back(pair);
+				}
+			}
 			return;
 		}
 
