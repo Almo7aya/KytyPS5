@@ -991,7 +991,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				                          image->info.metadata.range}) {
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+						EXIT("scalar resource reads overlap an image or attachment write: shader "
+						     "0x%016" PRIx64 " read 0x%016" PRIx64 "+0x%" PRIx64
+						     ", write 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+						     reader->runtime->program->shader_hash, address, size,
+						     written.address, written.size);
 					}
 				}
 			}
@@ -1002,7 +1006,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					if (written.size != 0 && ImageRangeOverlaps(address, size,
 					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+						EXIT("scalar resource reads overlap a shader buffer write: shader "
+						     "0x%016" PRIx64 " read 0x%016" PRIx64 "+0x%" PRIx64
+						     ", write 0x%016" PRIx64 "+0x%" PRIx64 "\n",
+						     reader->runtime->program->shader_hash, address, size,
+						     written.address, written.size);
 					}
 				}
 			}
