@@ -458,7 +458,13 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	// The invariant value is a property of the plan, which does not change; resolving it walks the
+	// phi web and allocates on every evaluation.
+	auto [found, inserted] = m_program.invariant_phis.try_emplace(&inst);
+	if (inserted) {
+		found->second = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	}
+	const auto value = found->second;
 	return !value.IsEmpty() && EvaluateWide(value, result);
 }
 

@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -630,6 +631,8 @@ struct ResourcePlan {
 	mutable std::shared_ptr<const SrtTape>  srt_tape;
 	mutable bool                            srt_tape_built = false;
 	mutable std::vector<uint64_t>           srt_tape_values;
+	// ResolveInvariantPhi of each phi the walkers evaluated.
+	mutable std::unordered_map<const Inst*, Value> invariant_phis;
 };
 
 struct Program: ResourcePlan {
