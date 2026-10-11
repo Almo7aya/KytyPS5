@@ -1033,6 +1033,8 @@ struct SrtTape {
 		uint32_t    a = 0, b = 0, c = 0, d = 0, e = 0;
 		uint64_t    immediate = 0;
 		const Inst* inst      = nullptr;
+		// The instruction's slot in the walkers' memos, so evaluation does not touch the IR.
+		uint32_t index = UINT32_MAX;
 		// Also memoized by the ordinary walker, which delegates clean reads.
 		bool        seed_ordinary = false;
 	};
@@ -1189,7 +1191,9 @@ private:
 			if (!clean && mode) m_tape.nodes[result].seed_ordinary = true;
 			return true;
 		}
-		SrtTape::Node node {.clean = mode, .inst = inst};
+		SrtTape::Node node {.clean = mode,
+		                    .inst  = inst,
+		                    .index = inst->EvaluationIndex(m_program.evaluation_value_count)};
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::GetUserData: {
 				const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
@@ -1298,23 +1302,6 @@ private:
 
 } // namespace
 
-bool SrtWalker::Recall(const Inst& inst, uint64_t& value) const {
-	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
-	if (index >= m_context.values.size() || m_context.values[index].generation != m_context.generation) {
-		return false;
-	}
-	value = m_context.values[index].value;
-	return true;
-}
-
-void SrtWalker::Remember(const Inst& inst, uint64_t value) {
-	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
-	if (index >= m_context.values.size()) {
-		m_context.values.resize(m_program.evaluation_value_count);
-	}
-	m_context.values[index] = {value, m_context.generation};
-}
-
 static bool ComputeTapeNode(const SrtTape::Node& node, const std::vector<uint64_t>& values,
                             const SrtRuntime& runtime, uint64_t& out);
 
@@ -1333,14 +1320,34 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 	}
 	auto& values = m_program.srt_tape_values;
 	values.resize(tape->nodes.size());
+	// Every node's memo slot was assigned when the tape was compiled.
+	const auto memo_slots = m_program.evaluation_value_count;
+	if (m_context.values.size() < memo_slots) {
+		m_context.values.resize(memo_slots);
+	}
+	if (has_clean && m_clean_evaluator->m_context.values.size() < memo_slots) {
+		m_clean_evaluator->m_context.values.resize(memo_slots);
+	}
+	const auto recall = [](const ResourcePlan::EvaluationContext& context, uint32_t slot,
+	                       uint64_t& value) {
+		const auto& entry = context.values[slot];
+		if (entry.generation != context.generation) return false;
+		value = entry.value;
+		return true;
+	};
+	const auto remember = [](ResourcePlan::EvaluationContext& context, uint32_t slot,
+	                         uint64_t value) {
+		context.values[slot] = {value, context.generation};
+	};
 	// Computes one node and seeds the walkers' memos with it, so a branch condition the walker
 	// evaluates, and the descriptor evaluation that follows, find it.
 	const auto evaluate = [&](size_t index) {
 		const auto& node = tape->nodes[index];
 		// A value the walkers already evaluated in this session is not read again.
 		if (node.inst != nullptr &&
-		    ((node.seed_ordinary && Recall(*node.inst, values[index])) ||
-		     (node.clean ? m_clean_evaluator : this)->Recall(*node.inst, values[index]))) {
+		    ((node.seed_ordinary && recall(m_context, node.index, values[index])) ||
+		     recall(node.clean ? m_clean_evaluator->m_context : m_context, node.index,
+		            values[index]))) {
 			return true;
 		}
 		uint64_t out = 0;
@@ -1362,10 +1369,10 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 		values[index] = out;
 		if (node.inst != nullptr) {
 			if (node.clean) {
-				m_clean_evaluator->Remember(*node.inst, out);
-				if (node.seed_ordinary) Remember(*node.inst, out);
+				remember(m_clean_evaluator->m_context, node.index, out);
+				if (node.seed_ordinary) remember(m_context, node.index, out);
 			} else {
-				Remember(*node.inst, out);
+				remember(m_context, node.index, out);
 			}
 		}
 		return true;
