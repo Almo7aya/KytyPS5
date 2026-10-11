@@ -4012,8 +4012,10 @@ public:
     constexpr uint64_t unmap_offset = 0x4100;
     constexpr uint64_t partial_unmap_offset = 0x8100;
     constexpr uint64_t partial_unmap_survivor_offset = 0xc100;
-    constexpr uint64_t ring_fault_first_offset = 0x2100;
-    constexpr uint64_t ring_fault_second_offset = 0x2110;
+    // Readbacks publish the GPU-modified data in the 1 MiB window around the access, so the ring
+    // fault keeps a window of its own.
+    constexpr uint64_t ring_fault_first_offset = 0x402100;
+    constexpr uint64_t ring_fault_second_offset = 0x402110;
     constexpr uint32_t first_value = 0x10203040u;
     constexpr uint32_t second_value = 0x50607080u;
     constexpr uint32_t first_stale = 0x0badf00du;
@@ -4390,7 +4392,8 @@ public:
               "the earlier page did not publish its dirty ranges on its own read");
 
       constexpr uint64_t page_size = TRACKER_PAGE_SIZE;
-      constexpr uint64_t page_owner_offset = 0x240000;
+      // The owner straddles a 1 MiB readback window: the fault's window ends at the outside page.
+      constexpr uint64_t page_owner_offset = 0x300000 - TRACKER_PAGE_SIZE;
       constexpr uint64_t page_owner_size = 0xc0000;
       constexpr uint64_t page_fault_offset = page_owner_offset + 0x100;
       constexpr uint64_t page_inside_offset =
@@ -10223,6 +10226,9 @@ public:
                              .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
                              .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
         set_buffer(0, output, 16u * sizeof(u32));
+        // A recording older than a millisecond is submitted before the next dispatch; start a
+        // fresh one so only the dispatch's own argument handling could submit.
+        scheduler.Flush();
         const auto tick = scheduler.CurrentTick();
         if (test.transfer) {
           const std::array<u32, 3> packet{static_cast<u32>(args),
