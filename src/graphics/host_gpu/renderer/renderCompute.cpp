@@ -22,6 +22,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
+#include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 
@@ -111,7 +112,8 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	if (invocations != descriptor.NumRecords() || fill.count < invocations || size == 0 ||
+	    size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
@@ -122,6 +124,127 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
+	return true;
+}
+
+// A uniform fill of memory that holds no cached image is what a DMA fill does, so run it as one.
+// Games fast-clear CMASK with memset kernels every frame; executed on the GPU, every surface
+// bound afterwards drained the GPU to read its clear code back.
+static bool TryConsumeComputeBufferFill(RenderContext& context, const ShaderComputeInputInfo& input,
+                                        uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                        uint32_t mode) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
+		return false;
+	}
+	const uint64_t element = fill.words * sizeof(uint32_t);
+	const auto     descriptor =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	if (descriptor.Type() != 0u || descriptor.Stride() != element || descriptor.SwizzleEnabled() ||
+	    descriptor.AddTid() || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
+	    descriptor.Base48() == 0 || (descriptor.Base48() & 3u) != 0u) {
+		return false;
+	}
+	// Invocations index consecutive elements from zero.
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const auto elements =
+	    std::min({invocations, uint64_t {fill.count}, descriptor.GetSize() / element});
+	if (elements == 0) {
+		return true;
+	}
+	const GuestRange destination {descriptor.Base48(), elements * element};
+	if (!destination.Valid() || !context.IsMapped(destination.address, destination.size) ||
+	    !FillSourcesDisjoint(resources.buffers, destination, fill.resource) ||
+	    context.GetTextureCache().IsRegionRegistered(destination.address, destination.size)) {
+		return false;
+	}
+	context.GetBufferCache().FillBuffer(destination.address, destination.size, fill.value, false);
+	return true;
+}
+
+// A batched DWORD-copy kernel applies small CPU-staged updates: for up to eight segments, a table
+// holds the source V#s at +0x000, the destination V#s at +0x080, the DWORD counts at +0x100 and
+// the segment count at +0x120, and lane `gid` copies element `gid` of every segment longer than
+// it. Its results are read on the CPU, and each read of a GPU-written destination drains the GPU.
+// As a DMA copy, the destinations stay CPU-visible.
+static bool TryConsumeComputeSegmentCopy(RenderContext& context, const ShaderComputeInputInfo& input,
+                                         uint32_t group_x, uint32_t group_y, uint32_t group_z,
+                                         uint32_t mode) {
+	constexpr uint64_t SegmentCopyKernel = 0xb3ade16b0485b3bdull;
+	constexpr uint32_t MaxSegments       = 8;
+	const auto&        resources         = *input.stage.resources;
+	if (input.stage.program->shader_hash != SegmentCopyKernel || resources.user_data.size() < 2 ||
+	    input.dispatch_thread_dimensions || mode != 0x41u || input.threads_num[1] != 1 ||
+	    input.threads_num[2] != 1 || group_y != 1 || group_z != 1) {
+		return false;
+	}
+	auto&          cache = context.GetBufferCache();
+	const uint64_t table =
+	    (uint64_t {resources.user_data[1]} << 32u | resources.user_data[0]) & 0xffffffffffffull;
+	std::array<uint32_t, 0x124 / sizeof(uint32_t)> words {};
+	if (table == 0 || (table & 3u) != 0 || !context.IsMapped(table, sizeof(words)) ||
+	    cache.IsRegionGpuModified(table, sizeof(words)) ||
+	    !Libs::LibKernel::Memory::TryReadBacking(table, words.data(), sizeof(words))) {
+		return false;
+	}
+	const auto segments = words[0x120 / 4];
+	const auto lanes    = uint64_t {group_x} * input.threads_num[0];
+	if (segments == 0 || segments > MaxSegments) {
+		return false;
+	}
+	struct Copy {
+		uint64_t source, destination, bytes;
+	};
+	std::array<Copy, MaxSegments> copies {};
+	const auto decode = [&](uint32_t first, uint64_t count, uint64_t& base) {
+		ShaderRecompiler::IR::DescriptorValue value {.dword_count = 4};
+		std::copy_n(words.begin() + first, 4, value.dwords.begin());
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+		base                  = descriptor.Base48();
+		return descriptor.Type() == 0u && descriptor.Stride() == 4u && !descriptor.SwizzleEnabled() &&
+		       !descriptor.AddTid() && descriptor.Format() != Prospero::BufferFormat::kInvalid &&
+		       base != 0 && (base & 3u) == 0 && count <= descriptor.NumRecords();
+	};
+	for (uint32_t i = 0; i < segments; ++i) {
+		auto&      copy  = copies[i];
+		const auto count = std::min<uint64_t>(words[0x100 / 4 + i], lanes);
+		if (!decode(i * 4, count, copy.source) || !decode(0x80 / 4 + i * 4, count, copy.destination)) {
+			return false;
+		}
+		copy.bytes = count * sizeof(uint32_t);
+	}
+	// Lanes run the segments concurrently: every write must miss every read and the table.
+	const auto overlaps = [](uint64_t a, uint64_t a_size, uint64_t b, uint64_t b_size) {
+		return a_size != 0 && b_size != 0 && a < b + b_size && b < a + a_size;
+	};
+	for (uint32_t i = 0; i < segments; ++i) {
+		const auto& write = copies[i];
+		if (write.bytes == 0) continue;
+		if (!context.IsMapped(write.destination, write.bytes) ||
+		    !context.IsMapped(write.source, write.bytes) ||
+		    overlaps(write.destination, write.bytes, table, sizeof(words))) {
+			return false;
+		}
+		for (uint32_t j = 0; j < segments; ++j) {
+			if (overlaps(write.destination, write.bytes, copies[j].source, copies[j].bytes) ||
+			    (j != i && overlaps(write.destination, write.bytes, copies[j].destination, copies[j].bytes))) {
+				return false;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < segments; ++i) {
+		if (copies[i].bytes != 0) {
+			cache.CopyBuffer(copies[i].destination, copies[i].source, copies[i].bytes, false, false);
+		}
+	}
 	return true;
 }
 
@@ -306,9 +429,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	// Reads only its own validated table, never the specialized snapshot.
+	if (TryConsumeComputeSegmentCopy(m_context, input_info, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode)) {
+		ResetBindings();
+		return;
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
+	                                 thread_group_z, mode) ||
+	     TryConsumeComputeBufferFill(m_context, input_info, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode))) {
 		ResetBindings();
 		return;
