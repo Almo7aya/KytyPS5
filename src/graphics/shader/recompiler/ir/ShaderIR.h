@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -576,6 +577,8 @@ struct UniformFillPlan {
 	Value                count; // Empty unless the store is guarded by index < count.
 };
 
+struct SrtTape; // A plan's flat SRT refresh compiled for straight-line evaluation (SrtWalker.cpp).
+
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
@@ -624,6 +627,12 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	// Built on the first refresh; null when the plan needs the walker.
+	mutable std::shared_ptr<const SrtTape>  srt_tape;
+	mutable bool                            srt_tape_built = false;
+	mutable std::vector<uint64_t>           srt_tape_values;
+	// ResolveInvariantPhi of each phi the walkers evaluated.
+	mutable std::unordered_map<const Inst*, Value> invariant_phis;
 };
 
 struct Program: ResourcePlan {
