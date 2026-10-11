@@ -310,8 +310,13 @@ void TestInvariantIndirectImageMaterialization() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // A null root, then the two candidates in a run padded to four slots.
+  const auto null_image = [](const DescriptorValue &image) {
+    return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+  };
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u && memory.watched_reads == 1u &&
+            snapshot.images.size() == 5u && null_image(snapshot.images[3]) &&
+            null_image(snapshot.images[4]) && memory.watched_reads == 1u &&
             memory.watched_dwords == 36u && memory.reads == 1u,
         "image table was not read once independently of its GPU selector chain");
   const auto root = specialization.images[0];
@@ -333,15 +338,38 @@ void TestInvariantIndirectImageMaterialization() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images[2].dwords[0] == descriptor[0] + 7u,
         "changed table descriptor was not refreshed");
+  // A read-only table that selects fewer descriptors, or none, keeps its layout: the compiled
+  // shader must not follow the table's contents.
+  const auto stable_specialization = specialization;
+  std::fill_n(memory.words.begin() + (0x1000u + 112u) / 4u, 8u, 0u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization,
+        "a table with fewer candidates changed shader specialization");
+  std::fill_n(memory.words.begin() + (0x1000u + 16u) / 4u, 8u, 0u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization &&
+            std::ranges::all_of(snapshot.images, [](const DescriptorValue &image) {
+              return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+            }),
+        "a table that selects nothing changed shader specialization or kept a descriptor");
+  put(16u, 0u);
+  put(112u, 7u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization == stable_specialization &&
+            snapshot.images[2].dwords[0] == descriptor[0] + 7u,
+        "a refilled table changed shader specialization");
   // Scalar reads align each DWORD and return zero beyond the V# byte size.
   data[5] = 0u;
   data[6] = 19u;
   std::fill(memory.words.begin() + 0x1000u / 4u, memory.words.end(), 0u);
   put(0u, 0u);
   memory.fail_address = 0x2010u;
+  // A bounded table is laid out stably: it keeps the previous dispatch's capacity, padded with
+  // null entries.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            memory.watched_dwords == 4u && snapshot.images.size() == 2u &&
-            snapshot.images[1].dwords == descriptor,
+            memory.watched_dwords == 4u && snapshot.images.size() >= 2u &&
+            snapshot.images[1].dwords == descriptor &&
+            std::all_of(snapshot.images.begin() + 2, snapshot.images.end(), null_image),
         "partial descriptor prefix did not zero its out-of-bounds DWORDs");
   memory.fail_address = 0x2008u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -349,10 +377,9 @@ void TestInvariantIndirectImageMaterialization() {
   memory.fail_address = UINT64_MAX;
   for (uint32_t size : {0u, 3u, 4u}) {
     data[6] = size;
+    // Every slot, including the padding a stable layout keeps, is null.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1u &&
-              specialization.images[0].indirect_root == ImageResource::NoIndirectImage &&
-              std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
+              std::ranges::all_of(snapshot.images, null_image),
           "empty image table did not specialize as a safe null image");
   }
   // The GPU computes these offsets; host materialization must not enumerate the key.
@@ -407,8 +434,13 @@ void TestBoundedImageViewEligibility() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // The stable layout pads the three compatible views to four slots; the padding is null.
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
+            snapshot.images.size() >= 4u && memory.reads == 1u &&
+            std::all_of(snapshot.images.begin() + 4, snapshot.images.end(),
+                        [](const DescriptorValue &image) {
+                          return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+                        }),
         "unrelated cube/3D heap entries prevented a typed 2D table view");
   const auto mapping = specialization.images[0].indirect_mapping_offset;
   Check(snapshot.flattened_srt[mapping] == 53u &&
@@ -742,6 +774,30 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+
+  // A key the GPU computes over-approximates the table's candidates; an entry of another
+  // dimension than the sample's is never the one the GPU samples.
+  const auto enumerated = make_plan(Guard::Zero, false);
+  LinearTestMemory mixed;
+  mixed.words[0] = 0x1800u;
+  fill_table(mixed, table);
+  const auto cube_word = (table - mixed.base) / 4u + 3u * 8u;
+  mixed.words[cube_word + 3u] = (mixed.words[cube_word + 3u] & 0x0fffffffu) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+  std::array<uint32_t, 2> pointer{0x1000u, 0u};
+  SrtRuntime mixed_runtime{.user_data = pointer, .read_memory = ReadLinearTestMemory,
+                           .userdata = &mixed, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot mixed_snapshot;
+  ResourceSpecialization mixed_specialization;
+  const auto identity = [](uint32_t value) {
+    return [value](const DescriptorValue &image) { return image.dwords[0] == value; };
+  };
+  Check(MaterializeResources(enumerated, mixed_runtime, mixed_snapshot, mixed_specialization) &&
+            std::ranges::none_of(mixed_snapshot.images, identity(0x103u)) &&
+            std::ranges::any_of(mixed_snapshot.images, identity(0x104u)) &&
+            std::ranges::none_of(mixed_specialization.images,
+                                 [](const auto &image) { return image.cube; }),
+        "a GPU-keyed 2D image table kept a cube-map candidate");
 }
 
 void TestBoundedComputeImageLoop() {

@@ -155,6 +155,9 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// A candidate of a descriptor table the host reads speculatively: the GPU may never select
+	// it, so binding it must not fail or reshape cached images.
+	bool                          speculative                = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;

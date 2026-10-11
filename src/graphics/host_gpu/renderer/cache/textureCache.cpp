@@ -1158,6 +1158,24 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+ImageId TextureCache::FindSpeculativeImage(ImageDesc& desc, bool exact_format) {
+	if (!desc.info.data.Empty()) {
+		std::scoped_lock lock {m_lock};
+		bool overlapped = false;
+		for (const auto id: FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+			if (SameBacking(m_slot_images[id].info, desc.info, exact_format)) {
+				overlapped = false;
+				break;
+			}
+			overlapped = true;
+		}
+		if (overlapped) {
+			return {};
+		}
+	}
+	return FindImage(desc, exact_format);
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {

@@ -40427,7 +40427,13 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() >= count + 1u &&
+                // A bounded table's stable layout pads its candidates with null entries.
+                std::all_of(snapshot.images.begin() + count + 1u, snapshot.images.end(),
+                            [](const DescriptorValue &image) {
+                              return std::ranges::all_of(image.dwords,
+                                                         [](u32 word) { return word == 0u; });
+                            }),
             "GPU-selected material descriptors did not expand beyond native root capacity");
     const auto offset = specialization.images[0].indirect_mapping_offset;
     const auto ordinal = [&](u32 byte_offset) {
