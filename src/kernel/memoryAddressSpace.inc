@@ -944,16 +944,37 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 		return ProtectMappedUnlocked(vaddr, size, mode);
 	}
 
+	// A page watch only changes read and write access. Guest code in a watched page (the GPU
+	// can watch any guest memory, including the pages a module's code shares) stays executable.
 	bool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
 		}
 
 		std::lock_guard lock(m_mutex);
-		return ProtectMappedUnlocked(vaddr, size, mode);
+		const auto      end     = vaddr + size;
+		auto            current = vaddr;
+		auto            it      = m_executable.upper_bound(vaddr);
+		if (it != m_executable.begin() && std::prev(it)->second > vaddr) {
+			--it;
+		}
+		for (; it != m_executable.end() && it->first < end; ++it) {
+			const auto code_begin = std::max(current, it->first);
+			const auto code_end   = std::min(end, it->second);
+			if (current < code_begin &&
+			    !ProtectMappedUnlocked(current, code_begin - current, mode)) {
+				return false;
+			}
+			if (!ProtectMappedUnlocked(code_begin, code_end - code_begin, WithExecute(mode))) {
+				return false;
+			}
+			current = code_end;
+		}
+		return current == end || ProtectMappedUnlocked(current, end - current, mode);
 	}
 
 	bool MapBacking(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
@@ -978,6 +999,7 @@ public:
 			if (!replacing) {
 				EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			}
+			SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 			return true;
 		}
 		if (!replacing) {
@@ -999,6 +1021,7 @@ public:
 			return false;
 		}
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Backing));
+		SetExecutableUnlocked(vaddr, size, false);
 		AddFreeUnlocked(vaddr, size);
 		return true;
 	}
@@ -1070,10 +1093,12 @@ public:
 			return false;
 		}
 		EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+		SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 		return true;
 #else
 		if (VirtualMemory::Protect(vaddr, size, host_mode)) {
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Private));
+			SetExecutableUnlocked(vaddr, size, VirtualMemory::IsExecute(mode));
 			return true;
 		}
 		AddFreeUnlocked(vaddr, size);
@@ -1111,6 +1136,7 @@ public:
 		}
 #endif
 		EXIT_IF(!RemoveMappedUnlocked(vaddr, size, MappingType::Private));
+		SetExecutableUnlocked(vaddr, size, false);
 		AddFreeUnlocked(vaddr, size);
 		return true;
 	}
@@ -1188,6 +1214,43 @@ private:
 			}
 		}
 		return true;
+	}
+
+	static VirtualMemory::Mode WithExecute(VirtualMemory::Mode mode) {
+		switch (mode) {
+			case VirtualMemory::Mode::Read: return VirtualMemory::Mode::ExecuteRead;
+			case VirtualMemory::Mode::Write:
+			case VirtualMemory::Mode::ReadWrite: return VirtualMemory::Mode::ExecuteReadWrite;
+			// Executing a page that must not be read faults like a read and resolves the watch.
+			default: return mode;
+		}
+	}
+
+	void SetExecutableUnlocked(uint64_t vaddr, uint64_t size, bool executable) {
+		const auto end = vaddr + size;
+		auto       it  = m_executable.lower_bound(vaddr);
+		if (it != m_executable.begin()) {
+			auto previous = std::prev(it);
+			if (previous->second > vaddr) {
+				const auto previous_end = previous->second;
+				previous->second        = vaddr;
+				if (previous_end > end) {
+					m_executable.emplace(end, previous_end);
+				}
+			}
+		}
+		while (it != m_executable.end() && it->first < end) {
+			if (it->second > end) {
+				const auto tail_end = it->second;
+				m_executable.erase(it);
+				m_executable.emplace(end, tail_end);
+				break;
+			}
+			it = m_executable.erase(it);
+		}
+		if (executable) {
+			m_executable.emplace(vaddr, end);
+		}
 	}
 
 	bool ConsumeUnlocked(uint64_t vaddr, uint64_t size) {
@@ -1552,6 +1615,8 @@ private:
 	std::shared_mutex                          m_mutex;
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Begin -> end of the ranges the guest mapped or protected executable.
+	std::map<uint64_t, uint64_t>               m_executable;
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	std::mutex                                 m_replacement_mutex;
 	std::condition_variable                    m_replacement_done;

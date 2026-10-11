@@ -294,8 +294,10 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+// Watched code stays executable, but executing a page with no access faults like reading it.
 bool PageManager::IsWatched(uint64_t vaddr, PageFaultAccess access) const noexcept {
-	if (access != PageFaultAccess::Read && access != PageFaultAccess::Write) {
+	if (access != PageFaultAccess::Read && access != PageFaultAccess::Write &&
+	    access != PageFaultAccess::Execute) {
 		return false;
 	}
 	auto* region = m_impl->FindRegion(vaddr);

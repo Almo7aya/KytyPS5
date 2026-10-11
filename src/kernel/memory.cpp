@@ -3699,6 +3699,13 @@ bool TestWindowsBackingViewModes() {
 	}
 	return VirtualFree(placeholder, 0, MEM_RELEASE) != 0 && valid;
 }
+
+uint32_t TestWindowsHostProtection(uint64_t vaddr) {
+	MEMORY_BASIC_INFORMATION info {};
+	return VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) != 0
+	           ? static_cast<uint32_t>(info.Protect)
+	           : 0u;
+}
 #endif
 
 bool TestGuestFreeRangeBounds() {
