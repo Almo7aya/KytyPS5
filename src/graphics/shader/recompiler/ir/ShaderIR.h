@@ -607,6 +607,9 @@ struct ResourcePlan {
 	std::vector<SrtRead>                srt_reads;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
+	// Low/high dwords of DMA (device address) bases the host can evaluate. A DMA read of memory
+	// without a cached buffer returns zero, so the renderer backs these bases before dispatch.
+	std::vector<std::array<Value, 2>>   address_bases;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;

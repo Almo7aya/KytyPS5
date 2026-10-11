@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <span>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -55,7 +56,8 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
-	void               PrepareBda();
+	// Backs the shader's evaluated DMA bases with cached buffers, then synchronizes them.
+	void               PrepareBda(std::span<const uint64_t> address_bases);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

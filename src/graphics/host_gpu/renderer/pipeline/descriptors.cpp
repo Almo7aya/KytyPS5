@@ -904,11 +904,14 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
 	FindBuffers(stages);
+	m_address_bases.clear();
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->program->info.uses_dma;
+		const auto& bases = stage->runtime->resources->address_bases;
+		m_address_bases.insert(m_address_bases.end(), bases.begin(), bases.end());
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(m_address_bases);
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);
