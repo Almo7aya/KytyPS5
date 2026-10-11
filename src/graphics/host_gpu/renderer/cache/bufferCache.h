@@ -93,6 +93,9 @@ public:
 	// A draw or dispatch that writes guest memory through shader addresses. Those writes have no
 	// tracked range, so a readback waits for the last of them.
 	void NoteAddressWrites() noexcept { m_address_write_tick = CurrentTick(); }
+	// Records that the command buffer recording now writes these bytes of guest memory. A
+	// readback on the readback queue waits for the last such command buffer.
+	void NoteWrite(uint64_t vaddr, uint64_t size);
 	// Readbacks published later from GPU completion (asynchronous downloads) must not be
 	// overtaken by a newer synchronous one; these bracket each.
 	void BeginAsyncPublish() noexcept { m_async_publishes.fetch_add(1); }
@@ -143,8 +146,6 @@ private:
 	                                           uint64_t                        total_size);
 	// The tick of the command buffer recording now.
 	[[nodiscard]] uint64_t CurrentTick() const noexcept;
-	// Records that the command buffer recording now writes these bytes of guest memory.
-	void NoteWrite(uint64_t vaddr, uint64_t size);
 	// The tick of the last recorded write to the MiB holding `vaddr`; zero if none was.
 	[[nodiscard]] uint64_t LastWriteTick(uint64_t vaddr) const;
 
