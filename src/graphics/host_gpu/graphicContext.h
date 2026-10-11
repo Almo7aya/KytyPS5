@@ -18,6 +18,8 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+enum class GpuCheckpoint : uint32_t { Dispatch, DispatchIndirect, Draw };
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -28,6 +30,7 @@ struct GraphicContext {
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               device_fault_enabled                  = false;
+	bool                               checkpoints_enabled                   = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -96,8 +99,14 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
-	// After VK_ERROR_DEVICE_LOST: prints the device fault description and faulting addresses.
+	// After VK_ERROR_DEVICE_LOST: prints the device fault description and faulting addresses,
+	// and with checkpoints the last commands the GPU reached.
 	void               ReportDeviceFault() const;
+	// With KYTY_GPU_CHECKPOINTS set, marks a command so a lost device can name it. An indirect
+	// command also passes its argument buffer, which is copied so the report can show it.
+	void SetCheckpoint(vk::CommandBuffer command, GpuCheckpoint kind, uint64_t shader_hash,
+	                   vk::Buffer args = {}, vk::DeviceSize args_offset = 0,
+	                   uint64_t args_addr = 0) const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

@@ -1171,6 +1171,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	m_context.GetGraphics().SetCheckpoint(vk_buffer, GpuCheckpoint::Draw,
+	                                      state.ps_active
+	                                          ? state.ps_input_info.stage.program->shader_hash
+	                                          : state.vertex_info[0].stage.program->shader_hash);
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {

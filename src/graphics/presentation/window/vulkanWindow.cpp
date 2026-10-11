@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -1013,6 +1014,15 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// A marker per draw and dispatch names the command a lost device stopped in; it costs a
+		// driver call per command, so it is opt-in.
+		if (std::getenv("KYTY_GPU_CHECKPOINTS") != nullptr &&
+		    HasExtension(available_extensions,
+		                 VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.checkpoints_enabled = true;
+			Log::WriteToConsoleAndLog("Vulkan: GPU checkpoints enabled.\n");
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
