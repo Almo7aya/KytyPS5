@@ -105,10 +105,19 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	// Reads on paths the GPU does not take can follow garbage pointers; memory that is not
+	// mapped cannot be what the GPU reads, and reads as zero.
+	if (!Libs::LibKernel::Memory::IsGpuMemoryMapped(address, values.size_bytes())) {
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+	return Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(),
+	                                                     values.size_bytes());
 }
 
 // A texture the texture cache can place: its view lies within its physical mips, and its image

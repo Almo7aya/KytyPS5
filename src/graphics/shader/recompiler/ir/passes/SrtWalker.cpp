@@ -25,6 +25,14 @@ SrtRuntime SrtReadCapture::ObservedRuntime() {
 
 bool SrtReadCapture::ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<SrtReadCapture*>(userdata);
+	// As with ordinary reads, paths the GPU does not take are evaluated too, and a pointer there
+	// can be stale or garbage. Memory that is not mapped cannot be what the GPU reads: it reads
+	// as zero, and specialization does not depend on it.
+	if (capture.m_source.is_mapped != nullptr &&
+	    !capture.m_source.is_mapped(address, values.size_bytes())) {
+		std::ranges::fill(values, 0u);
+		return true;
+	}
 	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
 		return false;
 	}
