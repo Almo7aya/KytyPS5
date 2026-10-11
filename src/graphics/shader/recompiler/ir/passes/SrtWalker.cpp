@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -994,11 +995,12 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 // The walker evaluates a plan's value graph recursively, memoizing every node, for every draw;
-// that cost Uncharted about a quarter of its command processor. Most plans have no control flow
-// and read scalar memory through plain integer arithmetic. For those, the refresh is compiled
-// once into nodes in the walker's own depth-first evaluation order, so they read memory in the
-// same order and through the same readers, then evaluated without recursion or memo lookups.
-// The results seed the walkers' memos for the descriptor evaluation that follows.
+// that cost Uncharted about a quarter of its command processor. Plans read scalar memory through
+// plain integer arithmetic, so the refresh is compiled once into nodes in the walker's own
+// depth-first evaluation order; they read memory in the same order and through the same readers,
+// and are evaluated without recursion. A plan with control flow keeps the walker's block order
+// and lets the walker evaluate its branch conditions. The results seed the walkers' memos for
+// those conditions and for the descriptor evaluation that follows.
 struct SrtTape {
 	enum class Op : uint8_t {
 		Const,
@@ -1034,9 +1036,32 @@ struct SrtTape {
 		// Also memoized by the ordinary walker, which delegates clean reads.
 		bool        seed_ordinary = false;
 	};
+	// A plan with control flow is refreshed block by block in the walker's order. Each block
+	// lists the nodes its reads need, in evaluation order, including nodes shared with others.
+	struct Block {
+		std::vector<uint32_t>                      nodes;
+		std::vector<std::pair<uint32_t, uint32_t>> slots;
+	};
 	std::vector<Node>                          nodes;
 	std::vector<std::pair<uint32_t, uint32_t>> slots; // flat offset, node
+	std::vector<Block>                         blocks;
 	bool                                       has_clean = false;
+
+	// The nodes a node is computed from, in evaluation order.
+	static size_t Operands(const Node& node, std::array<uint32_t, 5>& operands) {
+		operands = {node.a, node.b, node.c, node.d, node.e};
+		switch (node.op) {
+			case Op::Const:
+			case Op::UserData:
+			case Op::ShaderBase: return 0;
+			case Op::Copy:
+			case Op::Extract64: return 1;
+			case Op::BitFieldUExtract:
+			case Op::ScalarRead: return 3;
+			case Op::ConstBufferRead: return 5;
+			default: return 2;
+		}
+	}
 };
 
 namespace {
@@ -1048,23 +1073,60 @@ public:
 	}
 
 	std::shared_ptr<const SrtTape> Compile() {
-		if (!m_program.control_flow.empty()) return nullptr;
-		for (const auto& read: m_program.srt_reads) {
-			const auto* inst = read.value.Resolve().TryInstruction();
-			const bool  clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
-			// The walker fails a clean slot it has no clean reader for; leave that to it.
-			if ((clean && !m_tape.has_clean) || read.flat_offset >= m_program.srt_reads.size()) {
-				return nullptr;
+		if (m_program.control_flow.empty()) {
+			for (const auto& read: m_program.srt_reads) {
+				uint32_t node = 0;
+				if (!Slot(read, node)) return nullptr;
+				m_tape.slots.emplace_back(read.flat_offset, node);
 			}
-			uint32_t node = 0;
-			if (!Node(read.value, clean, node)) return nullptr;
-			m_tape.slots.emplace_back(read.flat_offset, node);
+			return std::make_shared<const SrtTape>(std::move(m_tape));
+		}
+		m_tape.blocks.resize(m_program.control_flow.size());
+		for (size_t index = 0; index < m_program.control_flow.size(); ++index) {
+			for (const auto slot: m_program.control_flow[index].srt_reads) {
+				uint32_t node = 0;
+				if (slot >= m_program.srt_reads.size() || !Slot(m_program.srt_reads[slot], node)) {
+					return nullptr;
+				}
+				m_tape.blocks[index].slots.emplace_back(m_program.srt_reads[slot].flat_offset,
+				                                        node);
+			}
+		}
+		std::vector<uint8_t> listed;
+		for (auto& block: m_tape.blocks) {
+			listed.assign(m_tape.nodes.size(), 0u);
+			for (const auto& [offset, node]: block.slots) {
+				ListEvaluationOrder(node, listed, block.nodes);
+			}
 		}
 		return std::make_shared<const SrtTape>(std::move(m_tape));
 	}
 
 private:
 	using Op = SrtTape::Op;
+
+	bool Slot(const SrtRead& read, uint32_t& node) {
+		const auto* inst  = read.value.Resolve().TryInstruction();
+		const bool  clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
+		// The walker fails a clean slot it has no clean reader for; leave that to it.
+		if ((clean && !m_tape.has_clean) || read.flat_offset >= m_program.srt_reads.size()) {
+			return false;
+		}
+		return Node(read.value, clean, node);
+	}
+
+	// Appends a node after the nodes it is computed from, as the walker evaluates them.
+	void ListEvaluationOrder(uint32_t node, std::vector<uint8_t>& listed,
+	                         std::vector<uint32_t>& order) const {
+		if (listed[node] != 0u) return;
+		listed[node] = 1u;
+		std::array<uint32_t, 5> operands {};
+		const auto              count = SrtTape::Operands(m_tape.nodes[node], operands);
+		for (size_t index = 0; index < count; ++index) {
+			ListEvaluationOrder(operands[index], listed, order);
+		}
+		order.push_back(node);
+	}
 
 	static Op BinaryOp(ValueOpcode opcode) {
 		switch (opcode) {
@@ -1253,6 +1315,9 @@ void SrtWalker::Remember(const Inst& inst, uint64_t value) {
 	m_context.values[index] = {value, m_context.generation};
 }
 
+static bool ComputeTapeNode(const SrtTape::Node& node, const std::vector<uint64_t>& values,
+                            const SrtRuntime& runtime, uint64_t& out);
+
 SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& flat) {
 	const bool has_clean = m_clean_evaluator != nullptr;
 	if (!m_program.srt_tape_built) {
@@ -1268,90 +1333,160 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 	}
 	auto& values = m_program.srt_tape_values;
 	values.resize(tape->nodes.size());
-	for (size_t index = 0; index < tape->nodes.size(); ++index) {
+	// Computes one node and seeds the walkers' memos with it, so a branch condition the walker
+	// evaluates, and the descriptor evaluation that follows, find it.
+	const auto evaluate = [&](size_t index) {
 		const auto& node = tape->nodes[index];
 		// A value the walkers already evaluated in this session is not read again.
 		if (node.inst != nullptr &&
 		    ((node.seed_ordinary && Recall(*node.inst, values[index])) ||
 		     (node.clean ? m_clean_evaluator : this)->Recall(*node.inst, values[index]))) {
-			continue;
+			return true;
 		}
-		const auto  a = values[node.a];
-		const auto  b = values[node.b];
-		uint64_t    out = 0;
+		uint64_t out = 0;
 		switch (node.op) {
 			case SrtTape::Op::Const: out = node.immediate; break;
 			case SrtTape::Op::UserData:
-				if (node.a >= m_runtime.user_data.size()) return TapeResult::Failed;
+				// The operand is a register, not a node.
+				if (node.a >= m_runtime.user_data.size()) return false;
 				out = m_runtime.user_data[node.a];
 				break;
 			case SrtTape::Op::ShaderBase: out = m_runtime.shader_base; break;
-			case SrtTape::Op::Copy: out = a; break;
-			case SrtTape::Op::Add32: out = static_cast<uint32_t>(a + b); break;
-			case SrtTape::Op::Add64: out = a + b; break;
-			case SrtTape::Op::Sub32: out = static_cast<uint32_t>(a - b); break;
-			case SrtTape::Op::Sub64: out = a - b; break;
-			case SrtTape::Op::Mul32: out = static_cast<uint32_t>(a * b); break;
-			case SrtTape::Op::Shl32: out = static_cast<uint32_t>(a) << (b & 31u); break;
-			case SrtTape::Op::Shl64: out = a << (b & 63u); break;
-			case SrtTape::Op::Shr32: out = static_cast<uint32_t>(a) >> (b & 31u); break;
-			case SrtTape::Op::Shr64: out = a >> (b & 63u); break;
-			case SrtTape::Op::And32: out = static_cast<uint32_t>(a & b); break;
-			case SrtTape::Op::And64: out = a & b; break;
-			case SrtTape::Op::Or32: out = static_cast<uint32_t>(a | b); break;
-			case SrtTape::Op::Xor32: out = static_cast<uint32_t>(a ^ b); break;
-			case SrtTape::Op::BitFieldUExtract: {
-				const auto offset = static_cast<uint32_t>(b);
-				const auto width  = static_cast<uint32_t>(values[node.c]);
-				if (offset > 32u || width > 32u - offset) return TapeResult::Failed;
-				const auto mask = width == 32u  ? UINT32_MAX
-				                  : width == 0u ? 0u
-				                                : (uint32_t {1} << width) - 1u;
-				out = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
-				break;
-			}
-			case SrtTape::Op::Pack64:
-				out = static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
-				break;
-			case SrtTape::Op::Extract64: out = static_cast<uint32_t>(a >> (node.immediate * 32u)); break;
-			case SrtTape::Op::AddCarry: {
-				const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
-				out = node.immediate == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
-				break;
-			}
-			case SrtTape::Op::ScalarRead:
-			case SrtTape::Op::ConstBufferRead: {
-				const bool const_buffer = node.op == SrtTape::Op::ConstBufferRead;
-				uint64_t   address      = 0;
-				uint32_t   word         = 0;
-				const auto& runtime = node.clean ? m_clean_evaluator->m_runtime : m_runtime;
-				if (!ScalarReadAddress(const_buffer, static_cast<uint32_t>(node.immediate), a, b,
-				                       const_buffer ? values[node.d] : 0u, values[node.c], address) ||
-				    !ReadScalarWord(runtime, address, word)) {
-					return TapeResult::Failed;
+			default:
+				if (!ComputeTapeNode(node, values,
+				                     node.clean ? m_clean_evaluator->m_runtime : m_runtime, out)) {
+					return false;
 				}
-				out = word;
 				break;
-			}
 		}
 		values[index] = out;
+		if (node.inst != nullptr) {
+			if (node.clean) {
+				m_clean_evaluator->Remember(*node.inst, out);
+				if (node.seed_ordinary) Remember(*node.inst, out);
+			} else {
+				Remember(*node.inst, out);
+			}
+		}
+		return true;
+	};
+	if (tape->blocks.empty()) {
+		for (size_t index = 0; index < tape->nodes.size(); ++index) {
+			if (!evaluate(index)) return TapeResult::Failed;
+		}
+		flat.resize(m_program.srt_reads.size());
+		for (const auto& [offset, node]: tape->slots) {
+			flat[offset] = static_cast<uint32_t>(values[node]);
+		}
+		m_program.active_sources.clear();
+		return TapeResult::Done;
 	}
-	flat.resize(m_program.srt_reads.size());
-	for (const auto& [offset, node]: tape->slots) {
-		flat[offset] = static_cast<uint32_t>(values[node]);
+	// As the walker's control-flow refresh, with each block's reads taken from the tape.
+	flat.assign(m_program.srt_reads.size(), 0u);
+	auto& active = m_program.active_sources;
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto source: block.sources) {
+			active.at(source) = 0u;
+		}
 	}
-	m_program.active_sources.clear();
-	for (size_t index = 0; index < tape->nodes.size(); ++index) {
-		const auto& node = tape->nodes[index];
-		if (node.inst == nullptr) continue;
-		if (node.clean) {
-			m_clean_evaluator->Remember(*node.inst, values[index]);
-			if (node.seed_ordinary) Remember(*node.inst, values[index]);
+	auto& visited = m_program.visited_blocks;
+	auto& pending = m_program.pending_blocks;
+	visited.assign(m_program.control_flow.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited.at(index)) continue;
+		visited[index]    = 1u;
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) {
+			active[source] = 1u;
+		}
+		const auto& compiled = tape->blocks[index];
+		for (const auto node: compiled.nodes) {
+			if (!evaluate(node)) return TapeResult::Failed;
+		}
+		for (const auto& [offset, node]: compiled.slots) {
+			flat[offset] = static_cast<uint32_t>(values[node]);
+		}
+		uint32_t condition = 0;
+		auto&    predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+		if (!block.condition.IsEmpty() &&
+		    (m_runtime.read_specialization_memory != nullptr ||
+		     !m_program.capture_specialization_reads) &&
+		    predicate.Evaluate(block.condition, condition)) {
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
-			Remember(*node.inst, values[index]);
+			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
 	return TapeResult::Done;
+}
+
+// A node computed from other nodes; reads go through the runtime of the node's walker.
+static bool ComputeTapeNode(const SrtTape::Node& node, const std::vector<uint64_t>& values,
+                            const SrtRuntime& runtime, uint64_t& out) {
+	const auto a = values[node.a];
+	const auto b = values[node.b];
+	switch (node.op) {
+		case SrtTape::Op::Const:
+		case SrtTape::Op::UserData:
+		case SrtTape::Op::ShaderBase: return false;
+		case SrtTape::Op::Copy: out = a; break;
+		case SrtTape::Op::Add32: out = static_cast<uint32_t>(a + b); break;
+		case SrtTape::Op::Add64: out = a + b; break;
+		case SrtTape::Op::Sub32: out = static_cast<uint32_t>(a - b); break;
+		case SrtTape::Op::Sub64: out = a - b; break;
+		case SrtTape::Op::Mul32: out = static_cast<uint32_t>(a * b); break;
+		case SrtTape::Op::Shl32: out = static_cast<uint32_t>(a) << (b & 31u); break;
+		case SrtTape::Op::Shl64: out = a << (b & 63u); break;
+		case SrtTape::Op::Shr32: out = static_cast<uint32_t>(a) >> (b & 31u); break;
+		case SrtTape::Op::Shr64: out = a >> (b & 63u); break;
+		case SrtTape::Op::And32: out = static_cast<uint32_t>(a & b); break;
+		case SrtTape::Op::And64: out = a & b; break;
+		case SrtTape::Op::Or32: out = static_cast<uint32_t>(a | b); break;
+		case SrtTape::Op::Xor32: out = static_cast<uint32_t>(a ^ b); break;
+		case SrtTape::Op::BitFieldUExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(values[node.c]);
+			if (offset > 32u || width > 32u - offset) return false;
+			const auto mask = width == 32u  ? UINT32_MAX
+			                  : width == 0u ? 0u
+			                                : (uint32_t {1} << width) - 1u;
+			out             = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+			break;
+		}
+		case SrtTape::Op::Pack64:
+			out =
+			    static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			break;
+		case SrtTape::Op::Extract64:
+			out = static_cast<uint32_t>(a >> (node.immediate * 32u));
+			break;
+		case SrtTape::Op::AddCarry: {
+			const auto sum =
+			    static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
+			out = node.immediate == 0u ? static_cast<uint32_t>(sum)
+			                           : static_cast<uint32_t>(sum >> 32u);
+			break;
+		}
+		case SrtTape::Op::ScalarRead:
+		case SrtTape::Op::ConstBufferRead: {
+			const bool const_buffer = node.op == SrtTape::Op::ConstBufferRead;
+			uint64_t   address      = 0;
+			uint32_t   word         = 0;
+			if (!ScalarReadAddress(const_buffer, static_cast<uint32_t>(node.immediate), a, b,
+			                       const_buffer ? values[node.d] : 0u, values[node.c], address) ||
+			    !ReadScalarWord(runtime, address, word)) {
+				return false;
+			}
+			out = word;
+			break;
+		}
+	}
+	return true;
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
