@@ -560,7 +560,7 @@ void TestWaterfallImageTable() {
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero };
-  const auto make_plan = [](Guard guard) {
+  const auto make_plan = [](Guard guard, bool guarded = true) {
     Fixture fixture(ShaderType::Pixel);
     fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
@@ -646,6 +646,13 @@ void TestGuardedDirectImageTable() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (!guarded) {
+      // Without a dominating nonzero guard the selector range is not proven, so the key can only
+      // be one the GPU computes, enumerated at dispatch.
+      Check(indirect && !indirect->selector_value.IsEmpty(),
+            "direct table accepted a selector without a dominating nonzero guard");
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && !indirect->selector.has_value() &&
               indirect->table_offset == 344u &&
               indirect->key_count.Resolve().IsImmediate() &&
@@ -660,8 +667,7 @@ void TestGuardedDirectImageTable() {
   make_plan(Guard::Plain);
   for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
                            Guard::ExecZero, Guard::VccZero}) {
-    CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
-               "direct table accepted a selector without a dominating nonzero guard");
+    make_plan(guard, false);
   }
   LinearTestMemory memory;
   constexpr uint64_t table = 0x1800u + 344u;
@@ -747,7 +753,7 @@ void TestBoundedComputeImageLoop() {
     Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
     GuardedDiamond, GuardedDiamondBypass
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, bool *enumerated = nullptr) {
     const bool diamond = variant >= Variant::GuardedDiamond;
     Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
     fixture.program.wave_size = 64u;
@@ -994,6 +1000,10 @@ void TestBoundedComputeImageLoop() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (enumerated != nullptr) {
+      *enumerated = indirect && !indirect->selector_value.IsEmpty();
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && !indirect->selector.has_value() &&
               indirect->table_offset == 0x6b0u &&
               indirect->key_count.Resolve() == count.Resolve(),
@@ -1001,6 +1011,20 @@ void TestBoundedComputeImageLoop() {
     return ExtractResourcePlan(fixture.program);
   };
 
+  // Without a proven bound the loop's count is not accepted: the key is rejected, or planned as
+  // one the GPU computes and enumerated at dispatch.
+  const auto check_unbounded = [&](Variant variant, const char *message) {
+    bool enumerated = false;
+    try {
+      make_plan(variant, &enumerated);
+    } catch (const std::runtime_error &error) {
+      Check(std::string_view(error.what()).find("not a valid runtime value") !=
+                std::string_view::npos,
+            message);
+      return;
+    }
+    Check(enumerated, message);
+  };
   auto plan = make_plan(Variant::Bounded);
   make_plan(Variant::Plain);
   make_plan(Variant::Nonzero);
@@ -1015,28 +1039,16 @@ void TestBoundedComputeImageLoop() {
                              Variant::MaskedWrongGuard,
                              Variant::MaskResurrection, Variant::StatusOverwrite,
                              Variant::GuardedDiamondBypass}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop allowed an unbounded induction or mask resurrection");
+    check_unbounded(variant, "compute image loop allowed an unbounded induction or mask resurrection");
   }
-  CheckFatal([&] { make_plan(Variant::WrongGuard); },
-             "not a valid runtime value",
-             "compute image loop accepted an unrelated guard");
-  CheckFatal([&] { make_plan(Variant::EntryBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an entry bypass");
-  CheckFatal([&] { make_plan(Variant::ExitBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an exit bypass");
-  CheckFatal([&] { make_plan(Variant::GuardBlock); },
-             "not a valid runtime value",
-             "compute image loop accepted a descriptor read before the guard");
-  CheckFatal([&] { make_plan(Variant::WrongStep); },
-             "not a valid runtime value",
-             "compute image loop accepted a two-step induction");
+  check_unbounded(Variant::WrongGuard, "compute image loop accepted an unrelated guard");
+  check_unbounded(Variant::EntryBypass, "compute image loop accepted an entry bypass");
+  check_unbounded(Variant::ExitBypass, "compute image loop accepted an exit bypass");
+  check_unbounded(Variant::GuardBlock, "compute image loop accepted a descriptor read before the guard");
+  check_unbounded(Variant::WrongStep, "compute image loop accepted a two-step induction");
   for (const auto variant : {Variant::DivergentBound, Variant::DivergentKey,
                              Variant::Disjunction, Variant::WrongPolarity}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop accepted a guard without a uniform bound");
+    check_unbounded(variant, "compute image loop accepted a guard without a uniform bound");
   }
 
   LinearTestMemory memory;
@@ -1090,7 +1102,7 @@ void TestUniformizedMaterialImageKeys() {
     AndNot, Subset, FirstLane, FirstLaneDirect, FirstLaneAndNot, EmptyFirstEntry, WrongFirstBackedge,
     WideningFirstEntry, WideningFirstBackedge, WrongFirstLoadMask
   };
-  const auto make_plan = [](Variant variant) {
+  const auto make_plan = [](Variant variant, bool *enumerated = nullptr) {
     Fixture fixture;
     fixture.program.wave_size = 64u;
     const bool first_lane = variant >= Variant::FirstLane;
@@ -1368,6 +1380,10 @@ void TestUniformizedMaterialImageKeys() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
+    if (enumerated != nullptr) {
+      *enumerated = indirect && !indirect->selector_value.IsEmpty();
+      return ExtractResourcePlan(fixture.program);
+    }
     Check(indirect && indirect->selector->stride == 0x90u &&
               indirect->selector->offset == 0xc00u &&
               indirect->table_offset == 0x20e0u &&
@@ -1376,6 +1392,20 @@ void TestUniformizedMaterialImageKeys() {
               indirect->key_count.Resolve().U32() == 32u,
           "uniformized image key lost its finite material range");
     return ExtractResourcePlan(fixture.program);
+  };
+  // An unproven material key is rejected, or planned as one the GPU computes and enumerated at
+  // dispatch; it never keeps the finite material range.
+  const auto check_unproven = [&](Variant variant, const char *message) {
+    bool enumerated = false;
+    try {
+      make_plan(variant, &enumerated);
+    } catch (const std::runtime_error &error) {
+      Check(std::string_view(error.what()).find("not a valid runtime value") !=
+                std::string_view::npos,
+            message);
+      return;
+    }
+    Check(enumerated, message);
   };
   auto plan = make_plan(Variant::Valid);
   make_plan(Variant::Plain);
@@ -1443,21 +1473,16 @@ void TestUniformizedMaterialImageKeys() {
                 std::pair<uint64_t, uint64_t>{first_table, 32}) !=
                 snapshot.specialization_reads.end(),
         "image descriptor read was omitted from the renderer write-overlap check");
-  CheckFatal([&] { make_plan(Variant::WrongUpdate); }, "not a valid runtime value",
-             "non-clearing material mask was accepted");
-  CheckFatal([&] { make_plan(Variant::WrongEquality); }, "not a valid runtime value",
-             "unrelated ReadLane key was accepted");
-  CheckFatal([&] { make_plan(Variant::WrongExit); }, "not a valid runtime value",
-             "one inactive lane bypassed material index initialization for active lanes");
+  check_unproven(Variant::WrongUpdate, "non-clearing material mask was accepted");
+  check_unproven(Variant::WrongEquality, "unrelated ReadLane key was accepted");
+  check_unproven(Variant::WrongExit, "one inactive lane bypassed material index initialization for active lanes");
   for (const auto variant : {Variant::WrongCarry, Variant::WrongBackedge}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "inactive material lane did not preserve its selected index across iterations");
+    check_unproven(variant, "inactive material lane did not preserve its selected index across iterations");
   }
   for (const auto variant : {Variant::EmptyFirstEntry, Variant::WrongFirstBackedge,
                             Variant::WideningFirstEntry, Variant::WideningFirstBackedge,
                             Variant::WrongFirstLoadMask}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "first-lane material key escaped its active load mask");
+    check_unproven(variant, "first-lane material key escaped its active load mask");
   }
 }
 

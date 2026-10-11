@@ -12,7 +12,10 @@
 #include <cstdio>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <numeric>
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -201,17 +204,459 @@ bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
 	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
 	    descriptor.Base48() == 0u || descriptor.GetSize() == 0u) {
 		value.dwords.fill(0u);
-	} else if (descriptor.Stride() != 1u || descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	           descriptor.OutOfBounds() != 3u) {
-		return SpecializationFail("indirect buffer stores require linear byte bounds");
+	} else if (descriptor.SwizzleEnabled() || descriptor.AddTid()) {
+		// Each candidate is bound as its own buffer with its own stride and bounds; only the
+		// lane-dependent address modes are shared across the selection switch.
+		return SpecializationFail("indirect buffer stores require unswizzled addressing");
 	}
 	return true;
 }
 
+// Enumerates every value a GPU-computed key can take. Host-evaluable operands are evaluated
+// exactly. A GPU-only operand (shared memory, a lane value) is unknown: masks bound it, and a
+// scalar buffer read at an affine offset of it enumerates that buffer's in-bounds entries.
+// Offsets are assumed not to wrap; an index that large addresses no guest table.
+class KeySetEvaluator {
+public:
+	KeySetEvaluator(const ResourcePlan& program, const SrtRuntime& runtime, SrtWalker& clean)
+	    : m_program(program), m_runtime(runtime), m_clean(clean) {}
+
+	bool Run(Value value, std::span<const DescriptorSource::IndirectDescriptor::InductionRange> ranges,
+	         std::vector<uint32_t>& keys) {
+		for (const auto& range: ranges) {
+			uint32_t begin = 0, end = 0;
+			const auto* counter = range.counter.Resolve().TryInstruction();
+			if (counter == nullptr || !m_clean.Evaluate(range.begin, begin) ||
+			    !m_clean.Evaluate(range.end, end)) {
+				return false;
+			}
+			std::vector<uint32_t> values;
+			if (begin < end) {
+				if (end - begin > MaxValues) return false;
+				values.resize(end - begin);
+				std::iota(values.begin(), values.end(), begin);
+			}
+			m_counters[counter] = {.values = std::move(values)};
+		}
+		auto result = Evaluate(value, 0);
+		if (!result.values) return false;
+		keys = std::move(*result.values);
+		return true;
+	}
+
+private:
+	struct Abstract {
+		// Sorted, unique values when they are known.
+		std::optional<std::vector<uint32_t>> values;
+		// Otherwise scale * unknown + bias, while the value is affine in a single unknown.
+		const Inst* unknown = nullptr;
+		uint32_t    scale   = 0;
+		uint32_t    bias    = 0;
+
+		[[nodiscard]] bool Known() const { return values.has_value(); }
+		[[nodiscard]] bool Affine() const { return !values && unknown != nullptr; }
+		[[nodiscard]] std::optional<uint32_t> Single() const {
+			return values && values->size() == 1u ? std::optional((*values)[0]) : std::nullopt;
+		}
+	};
+
+	static constexpr size_t   MaxValues     = 4096;
+	static constexpr size_t   MaxProducts   = size_t {1} << 16u;
+	static constexpr uint32_t MaxSubsetBits = 12;
+	static constexpr uint32_t MaxDepth      = 64;
+	static constexpr uint64_t MaxTableBytes = 1024 * 1024;
+
+	static Abstract Known(std::vector<uint32_t> values) {
+		std::ranges::sort(values);
+		values.erase(std::unique(values.begin(), values.end()), values.end());
+		if (values.size() > MaxValues) return {};
+		return {.values = std::move(values)};
+	}
+
+	static Abstract Affine(const Inst* unknown, uint32_t scale, uint32_t bias) {
+		return {.unknown = unknown, .scale = scale, .bias = bias};
+	}
+
+	// Every value whose set bits are a subset of mask.
+	static Abstract Subsets(uint32_t mask) {
+		if (static_cast<uint32_t>(std::popcount(mask)) > MaxSubsetBits) return {};
+		std::vector<uint32_t> values;
+		for (uint32_t subset = mask;; subset = (subset - 1u) & mask) {
+			values.push_back(subset);
+			if (subset == 0u) break;
+		}
+		return Known(std::move(values));
+	}
+
+	template <typename Op>
+	static Abstract Combine(const Abstract& a, const Abstract& b, Op&& op) {
+		if (!a.Known() || !b.Known() || a.values->size() * b.values->size() > MaxProducts) return {};
+		std::vector<uint32_t> values;
+		values.reserve(a.values->size() * b.values->size());
+		for (const auto x: *a.values) {
+			for (const auto y: *b.values) values.push_back(op(x, y));
+		}
+		return Known(std::move(values));
+	}
+
+	static Abstract Union(const Abstract& a, const Abstract& b) {
+		if (a.Affine() && b.Affine() && a.unknown == b.unknown && a.scale == b.scale &&
+		    a.bias == b.bias) {
+			return a;
+		}
+		if (!a.Known() || !b.Known()) return {};
+		auto values = *a.values;
+		values.insert(values.end(), b.values->begin(), b.values->end());
+		return Known(std::move(values));
+	}
+
+	static uint32_t BitsOf(const std::vector<uint32_t>& values) {
+		uint32_t bits = 0;
+		for (const auto value: values) bits |= value;
+		return bits;
+	}
+
+	// Reads one DWORD per address with a single guest copy of the spanned table.
+	bool ReadWords(std::span<const uint64_t> addresses, std::vector<uint32_t>& values) const {
+		if (addresses.empty()) return true;
+		const auto [first, last] = std::ranges::minmax(addresses);
+		if (last - first >= MaxTableBytes || m_runtime.read_specialization_memory == nullptr) {
+			return false;
+		}
+		std::vector<uint32_t> table((last - first) / 4u + 1u);
+		if (!m_runtime.read_specialization_memory(m_runtime.userdata, first, table)) return false;
+		for (const auto address: addresses) values.push_back(table[(address - first) / 4u]);
+		return true;
+	}
+
+	Abstract ReadAddress(const Inst& inst, const MemoryInfo& memory, uint32_t depth) {
+		const auto* handle = inst.Arg(0).ResolveInstruction();
+		uint32_t    low = 0, high = 0;
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+		    handle->NumArgs() != 2u || !m_clean.Evaluate(handle->Arg(0), low) ||
+		    !m_clean.Evaluate(handle->Arg(1), high)) {
+			return {};
+		}
+		const auto offsets = Evaluate(inst.Arg(1), depth + 1u);
+		if (!offsets.Known()) return {};
+		// SMEM aligns the base and both offsets to DWORDs independently.
+		const auto base = ((uint64_t {high} << 32u) | low) & AddressMask & ~uint64_t {3};
+		const auto immediate =
+		    static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3};
+		std::vector<uint64_t> addresses;
+		for (const auto offset: *offsets.values) {
+			const auto relative = immediate + static_cast<int64_t>(offset & ~3u);
+			if (relative < 0 && static_cast<uint64_t>(-relative) > base) return {};
+			const auto address = base + static_cast<uint64_t>(relative);
+			if (address > AddressMask - 3u) return {};
+			addresses.push_back(address);
+		}
+		std::vector<uint32_t> values;
+		if (!ReadWords(addresses, values)) return {};
+		return Known(std::move(values));
+	}
+
+	Abstract ReadBuffer(const Inst& inst, const MemoryInfo& memory, uint32_t depth) {
+		const auto*     handle = inst.Arg(0).ResolveInstruction();
+		DescriptorValue value {.dword_count = 4u};
+		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+		    handle->NumArgs() != 4u || static_cast<int32_t>(memory.offset) < 0) {
+			return {};
+		}
+		for (uint32_t word = 0; word < 4u; ++word) {
+			if (!m_clean.Evaluate(handle->Arg(word), value.dwords[word])) return {};
+		}
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(value, descriptor)) return {};
+		const auto stride = descriptor.Stride();
+		const auto size   = stride == 0u ? uint64_t {descriptor.NumRecords()}
+		                                 : uint64_t {stride} * descriptor.NumRecords();
+		const auto base   = descriptor.Base48() & ~uint64_t {3};
+		const auto immediate = uint64_t {memory.offset} & ~uint64_t {3};
+		const auto offsets   = Evaluate(inst.Arg(1), depth + 1u);
+		std::vector<uint64_t> addresses;
+		// Scalar buffer reads outside NUM_RECORDS return zero.
+		bool out_of_bounds = false;
+		const auto add = [&](uint64_t byte_offset) {
+			if (byte_offset + 4u > size) {
+				out_of_bounds = true;
+			} else {
+				addresses.push_back(base + byte_offset);
+			}
+		};
+		if (offsets.Known()) {
+			for (const auto offset: *offsets.values) add(immediate + (offset & ~3u));
+		} else if (offsets.Affine() && offsets.scale != 0u && offsets.scale <= INT32_MAX) {
+			// Every in-bounds entry the unknown index can select, plus the zero of an OOB read.
+			out_of_bounds    = true;
+			const auto bias  = int64_t {static_cast<int32_t>(offsets.bias)};
+			const auto scale = int64_t {offsets.scale};
+			for (auto index = bias < 0 ? (scale - 1 - bias) / scale : int64_t {0};; ++index) {
+				const auto offset = static_cast<uint64_t>(bias + index * scale);
+				if (offset > UINT32_MAX || immediate + (offset & ~uint64_t {3}) + 4u > size) break;
+				if (addresses.size() >= MaxProducts) return {};
+				add(immediate + (offset & ~uint64_t {3}));
+			}
+		} else {
+			return {};
+		}
+		std::vector<uint32_t> values;
+		if (out_of_bounds) values.push_back(0u);
+		if (!ReadWords(addresses, values)) return {};
+		return Known(std::move(values));
+	}
+
+	// Whether EXEC at the observing ReadFirstLane implies this condition: it is a conjunct.
+	bool ImpliedByActive(Value condition) const {
+		condition = condition.Resolve();
+		std::vector<Value> pending {m_active};
+		for (uint32_t visited = 0; !pending.empty() && visited < 64u; ++visited) {
+			const auto value = pending.back().Resolve();
+			pending.pop_back();
+			if (value.IsEmpty()) continue;
+			if (value == condition) return true;
+			const auto* inst = value.TryInstruction();
+			if (inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				pending.push_back(inst->Arg(0));
+				pending.push_back(inst->Arg(1));
+			}
+		}
+		return false;
+	}
+
+	// Booleans are the value sets {0}, {1} or {0, 1}.
+	static Abstract Boolean(const Abstract& value) {
+		return value.Known() ? value : Abstract {.values = std::vector<uint32_t> {0u, 1u}};
+	}
+
+	Abstract Evaluate(Value value, uint32_t depth) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::U32) return {.values = std::vector<uint32_t> {value.U32()}};
+			if (value.GetType() == Type::U1) {
+				return {.values = std::vector<uint32_t> {value.U1() ? 1u : 0u}};
+			}
+			return {};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > MaxDepth ||
+		    (value.GetType() != Type::U32 && value.GetType() != Type::U1)) {
+			return {};
+		}
+		if (const auto counter = m_counters.find(inst); counter != m_counters.end()) {
+			return counter->second;
+		}
+		if (!m_active.IsEmpty() && IsSelect(*inst) && inst->Arg(0).Resolve() == m_active) {
+			// ReadFirstLane observes a lane where its EXEC mask holds.
+			return Evaluate(inst->Arg(1), depth + 1u);
+		}
+		const auto key = std::pair(inst, m_active.TryInstruction());
+		if (const auto found = m_memo.find(key); found != m_memo.end()) return found->second;
+		// A cycle through a loop-carried value is unbounded.
+		m_memo.emplace(key, Abstract {});
+		auto result = EvaluateInst(*inst, depth);
+		m_memo[key] = result;
+		return result;
+	}
+
+	static bool IsSelect(const Inst& inst) {
+		return inst.GetOpcode() == ValueOpcode::SelectU32 && inst.NumArgs() == 3u;
+	}
+
+	Abstract EvaluateInst(const Inst& inst, uint32_t depth) {
+		if (uint32_t exact = 0; m_clean.Evaluate(Value(const_cast<Inst*>(&inst)), exact)) {
+			return {.values = std::vector<uint32_t> {exact}};
+		}
+		const auto arg = [&](uint32_t index) { return Evaluate(inst.Arg(index), depth + 1u); };
+		const auto memory_index = inst.Flags<SrtReadFlags>().index;
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::ReadFirstLane: {
+				const auto previous = m_active;
+				m_active            = inst.Arg(1).Resolve();
+				auto result         = arg(0);
+				m_active            = previous;
+				return result;
+			}
+			case ValueOpcode::Phi: {
+				Abstract result {.values = std::vector<uint32_t> {}};
+				for (uint32_t index = 0; index < inst.NumArgs(); ++index) {
+					result = index == 0u ? arg(index) : Union(result, arg(index));
+				}
+				return result;
+			}
+			case ValueOpcode::SelectU32: {
+				if (ImpliedByActive(inst.Arg(0))) return arg(1);
+				if (const auto condition = arg(0).Single()) return arg(*condition != 0u ? 1u : 2u);
+				return Union(arg(1), arg(2));
+			}
+			case ValueOpcode::ConditionRef: return Boolean(arg(0));
+			case ValueOpcode::LogicalNot:
+				return Boolean(Combine(Boolean(arg(0)), {.values = std::vector<uint32_t> {1u}},
+				                       [](uint32_t x, uint32_t y) { return x ^ y; }));
+			case ValueOpcode::LogicalAnd:
+			case ValueOpcode::LogicalOr:
+			case ValueOpcode::LogicalXor: {
+				const auto op = inst.GetOpcode();
+				const auto a = Boolean(arg(0)), b = Boolean(arg(1));
+				// One decided operand can decide the result without the other.
+				const auto absorbing = op == ValueOpcode::LogicalAnd ? 0u : 1u;
+				if (op != ValueOpcode::LogicalXor &&
+				    (a.Single() == absorbing || b.Single() == absorbing)) {
+					return {.values = std::vector<uint32_t> {absorbing}};
+				}
+				return Combine(a, b, [op](uint32_t x, uint32_t y) {
+					return op == ValueOpcode::LogicalAnd ? x & y
+					       : op == ValueOpcode::LogicalOr ? x | y
+					                                      : x ^ y;
+				});
+			}
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+			case ValueOpcode::ULessThan32:
+			case ValueOpcode::ULessThanEqual32:
+			case ValueOpcode::UGreaterThan32:
+			case ValueOpcode::UGreaterThanEqual32:
+			case ValueOpcode::SLessThan32:
+			case ValueOpcode::SLessThanEqual32:
+			case ValueOpcode::SGreaterThan32:
+			case ValueOpcode::SGreaterThanEqual32: {
+				const auto op = inst.GetOpcode();
+				return Boolean(Combine(arg(0), arg(1), [op](uint32_t x, uint32_t y) -> uint32_t {
+					const auto sx = std::bit_cast<int32_t>(x), sy = std::bit_cast<int32_t>(y);
+					switch (op) {
+						case ValueOpcode::IEqual32: return x == y;
+						case ValueOpcode::INotEqual32: return x != y;
+						case ValueOpcode::ULessThan32: return x < y;
+						case ValueOpcode::ULessThanEqual32: return x <= y;
+						case ValueOpcode::UGreaterThan32: return x > y;
+						case ValueOpcode::UGreaterThanEqual32: return x >= y;
+						case ValueOpcode::SLessThan32: return sx < sy;
+						case ValueOpcode::SLessThanEqual32: return sx <= sy;
+						case ValueOpcode::SGreaterThan32: return sx > sy;
+						default: return sx >= sy;
+					}
+				}));
+			}
+			case ValueOpcode::LoadAddressU32:
+			case ValueOpcode::ReadConstBuffer: {
+				if (memory_index >= m_program.memory_info.size()) return {};
+				const auto& memory = m_program.memory_info[memory_index];
+				auto result = inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				                      memory.kind == ResourceKind::ScalarAddress
+				                  ? ReadAddress(inst, memory, depth)
+				              : inst.GetOpcode() == ValueOpcode::ReadConstBuffer &&
+				                      memory.kind == ResourceKind::ScalarBuffer
+				                  ? ReadBuffer(inst, memory, depth)
+				                  : Abstract {};
+				return result.Known() ? result : Affine(&inst, 1u, 0u);
+			}
+			case ValueOpcode::BitwiseAnd32: {
+				const auto a = arg(0), b = arg(1);
+				// Unknown bits can only survive where the other operand may be set.
+				if (a.Known() && !b.Known()) return Subsets(BitsOf(*a.values));
+				if (b.Known() && !a.Known()) return Subsets(BitsOf(*b.values));
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x & y; });
+			}
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto a = arg(0), b = arg(1);
+				if (!a.Known() && b.Known()) {
+					uint32_t shift = 31;
+					for (const auto value: *b.values) shift = std::min(shift, value & 31u);
+					return Subsets(UINT32_MAX >> shift);
+				}
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x >> (y & 31u); });
+			}
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = arg(1);
+				const auto width  = arg(2).Single();
+				if (!offset.Known() || !width || *width > 32u) return {};
+				const auto mask   = *width == 32u ? UINT32_MAX : (uint32_t {1} << *width) - 1u;
+				const auto source = arg(0);
+				if (!source.Known()) return Subsets(mask);
+				return Combine(source, offset, [mask](uint32_t x, uint32_t y) {
+					return y >= 32u ? 0u : (x >> y) & mask;
+				});
+			}
+			case ValueOpcode::UMin32: {
+				const auto a = arg(0), b = arg(1);
+				if (a.Known() != b.Known()) {
+					const auto& bound = *(a.Known() ? a : b).values;
+					if (bound.empty() || bound.back() >= MaxValues) return {};
+					std::vector<uint32_t> values(bound.back() + 1u);
+					std::iota(values.begin(), values.end(), 0u);
+					return {.values = std::move(values)};
+				}
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return std::min(x, y); });
+			}
+			case ValueOpcode::IAdd32: {
+				const auto a = arg(0), b = arg(1);
+				const auto ca = a.Single(), cb = b.Single();
+				if (a.Affine() && cb) return Affine(a.unknown, a.scale, a.bias + *cb);
+				if (b.Affine() && ca) return Affine(b.unknown, b.scale, b.bias + *ca);
+				if (a.Affine() && b.Affine() && a.unknown == b.unknown) {
+					return Affine(a.unknown, a.scale + b.scale, a.bias + b.bias);
+				}
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x + y; });
+			}
+			case ValueOpcode::ISub32: {
+				const auto a = arg(0), b = arg(1);
+				if (const auto cb = b.Single(); a.Affine() && cb) {
+					return Affine(a.unknown, a.scale, a.bias - *cb);
+				}
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x - y; });
+			}
+			case ValueOpcode::IMul32: {
+				const auto a = arg(0), b = arg(1);
+				const auto ca = a.Single(), cb = b.Single();
+				if (a.Affine() && cb) return Affine(a.unknown, a.scale * *cb, a.bias * *cb);
+				if (b.Affine() && ca) return Affine(b.unknown, b.scale * *ca, b.bias * *ca);
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x * y; });
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto a = arg(0), b = arg(1);
+				if (const auto cb = b.Single(); a.Affine() && cb) {
+					const auto shift = *cb & 31u;
+					return Affine(a.unknown, a.scale << shift, a.bias << shift);
+				}
+				return Combine(a, b, [](uint32_t x, uint32_t y) { return x << (y & 31u); });
+			}
+			case ValueOpcode::FindUMsb32:
+			case ValueOpcode::FindUMsb64:
+			case ValueOpcode::FindILsb32:
+			case ValueOpcode::BitCount32:
+			case ValueOpcode::BitCount64: {
+				// A bit position, or the all-ones result of a scan that finds no bit.
+				const auto op   = inst.GetOpcode();
+				const auto bits = op == ValueOpcode::FindUMsb64 || op == ValueOpcode::BitCount64 ? 64u : 32u;
+				const bool count = op == ValueOpcode::BitCount32 || op == ValueOpcode::BitCount64;
+				std::vector<uint32_t> values(count ? bits + 1u : bits);
+				std::iota(values.begin(), values.end(), 0u);
+				if (!count) values.push_back(UINT32_MAX);
+				return {.values = std::move(values)};
+			}
+			case ValueOpcode::BitwiseOr32:
+				return Combine(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x | y; });
+			case ValueOpcode::BitwiseXor32:
+				return Combine(arg(0), arg(1), [](uint32_t x, uint32_t y) { return x ^ y; });
+			default:
+				// A GPU-only value: the unknown that affine offsets are expressed in.
+				if (inst.GetType() != Type::U32) return {};
+				return Affine(&inst, 1u, 0u);
+		}
+	}
+
+	const ResourcePlan& m_program;
+	const SrtRuntime&   m_runtime;
+	SrtWalker&          m_clean;
+	Value               m_active;
+	std::unordered_map<const Inst*, Abstract>               m_counters;
+	std::map<std::pair<const Inst*, const Inst*>, Abstract> m_memo;
+};
+
 bool IsBoundedDescriptorTable(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& indirect) {
 	const auto* table = Source(program, indirect.table_source);
-	return indirect.sources.empty() && !indirect.selector &&
+	return indirect.sources.empty() && !indirect.selector && indirect.selector_value.IsEmpty() &&
 	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
 }
 
@@ -286,12 +731,20 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    (indirect.table_record_bytes != 0u &&
 			     (table.Type() != 0u || table.SwizzleEnabled() || table.AddTid() ||
 			      table.OutOfBounds() != 0u || (table_base & 3u) != 0u ||
-			      (table.Stride() & 3u) != 0u || table.Stride() < indirect.table_record_bytes)))
-				return false;
+			      (table.Stride() & 3u) != 0u || table.Stride() < indirect.table_record_bytes))) {
+				return SpecializationFail(fmt::format(
+				    "shader 0x{:016x}: unsupported descriptor table V# {:08x},{:08x},{:08x},{:08x}",
+				    program.shader_hash, table_value.dwords[0], table_value.dwords[1],
+				    table_value.dwords[2], table_value.dwords[3]));
+			}
 			// Descriptor bytes are refreshed together. The GPU selects the DWORD address;
 			// no material selector or unused table field is interpreted on the CPU.
 			keys.resize(table_size / 4u);
-			if (!ReadScalarTable(table_base, table_size, 0u, runtime, keys)) return false;
+			if (!ReadScalarTable(table_base, table_size, 0u, runtime, keys)) {
+				return SpecializationFail(fmt::format(
+				    "shader 0x{:016x}: cannot read descriptor table at 0x{:x}, size 0x{:x}",
+				    program.shader_hash, table_base, table_size));
+			}
 			const auto mapping_offset = snapshot.flattened_srt.size();
 			descriptors[resource_index] = {.dword_count = dword_count};
 			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
@@ -318,7 +771,17 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			}
 			return true;
 		}
-		if (selector == nullptr) {
+		if (!indirect.selector_value.IsEmpty()) {
+			// The GPU computes the key; its value set is enumerated from the guest memory it reads.
+			if (indirect.table_stride == 0u) return false;
+			if (!KeySetEvaluator(program, runtime, clean)
+			         .Run(indirect.selector_value, indirect.selector_ranges, keys)) {
+				return SpecializationFail(fmt::format(
+				    "shader 0x{:016x} resource {}: GPU-selected descriptor key has no bounded "
+				    "value set",
+				    program.shader_hash, resource_index));
+			}
+		} else if (selector == nullptr) {
 			uint32_t key_count = 0;
 			if (indirect.workgroup_axis != UINT32_MAX) {
 				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
@@ -400,7 +863,10 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			    (indirect.table_immediate & ~3u);
 			if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
 			                     std::span(candidate.dwords).first(dword_count))) {
-				return false;
+				// An enumerated key set is a superset; a key that addresses no guest memory
+				// cannot be the one the GPU selects with a valid table.
+				if (indirect.selector_value.IsEmpty()) return false;
+				candidate.dwords.fill(0u);
 			}
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return false;
@@ -976,6 +1442,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			    Clone(target.indirect_descriptor->selector_first);
 			target.indirect_descriptor->selector_mask =
 			    Clone(target.indirect_descriptor->selector_mask);
+			target.indirect_descriptor->selector_value =
+			    Clone(target.indirect_descriptor->selector_value);
+			for (auto& range: target.indirect_descriptor->selector_ranges) {
+				range = {Clone(range.counter), Clone(range.begin), Clone(range.end)};
+			}
 		}
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
@@ -1046,6 +1517,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			MarkCleanReads(planned_reads, nullptr, indirect.selector_mask);
 			MarkCleanReads(planned_reads, nullptr, indirect.selector_first);
 			MarkCleanReads(planned_reads, nullptr, indirect.key_count);
+			MarkCleanReads(planned_reads, nullptr, indirect.selector_value);
+			for (const auto& range: indirect.selector_ranges) {
+				MarkCleanReads(planned_reads, nullptr, range.begin);
+				MarkCleanReads(planned_reads, nullptr, range.end);
+			}
 			if (indirect.sources.empty()) {
 				MarkCleanReads(planned_reads, Source(plan, indirect.table_source));
 			} else {

@@ -514,6 +514,18 @@ struct DescriptorSource {
 		Value    key_count;
 		Value                 selector_first;
 		Value    selector_mask;
+		// A bounded key computed on the GPU. The host enumerates its possible values from the
+		// guest memory it reads; table entries at those keys are the candidates.
+		Value    selector_value;
+		// Loop counters selector_value depends on, with the half-open range their guards prove.
+		struct InductionRange {
+			Value counter;
+			Value begin;
+			Value end;
+
+			bool operator==(const InductionRange& other) const = default;
+		};
+		std::vector<InductionRange> selector_ranges;
 		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
