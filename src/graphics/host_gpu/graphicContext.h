@@ -27,6 +27,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               device_fault_enabled                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
@@ -95,6 +96,8 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateAllocator();
 	void               DestroyAllocator();
 	void               LogMemoryBudget() const;
+	// After VK_ERROR_DEVICE_LOST: prints the device fault description and faulting addresses.
+	void               ReportDeviceFault() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;

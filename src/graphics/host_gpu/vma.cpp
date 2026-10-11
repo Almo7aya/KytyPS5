@@ -21,6 +21,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
+#include <fmt/format.h>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -50,6 +54,49 @@ bool GraphicContext::CreateAllocator() {
 		return false;
 	}
 	return true;
+}
+
+// A lost device says little by itself; VK_EXT_device_fault reports the addresses the GPU faulted
+// on, which identify the buffer or image it was accessing.
+void GraphicContext::ReportDeviceFault() const {
+	const auto get_fault_info = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+	if (!device_fault_enabled || get_fault_info == nullptr || device == nullptr) {
+		return;
+	}
+	VkDeviceFaultCountsEXT counts {};
+	counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
+	if (get_fault_info(device, &counts, nullptr) != VK_SUCCESS) {
+		return;
+	}
+	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	counts.vendorBinarySize = 0;
+	VkDeviceFaultInfoEXT info {};
+	info.sType         = VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT;
+	info.pAddressInfos = addresses.data();
+	info.pVendorInfos  = vendors.data();
+	const auto result  = get_fault_info(device, &counts, &info);
+	if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+		return;
+	}
+	const auto report = [](const std::string& line) {
+		LOGF("%s", line.c_str());
+		std::printf("%s", line.c_str());
+	};
+	report(fmt::format("Device fault: {}\n", info.description));
+	for (uint32_t i = 0; i < counts.addressInfoCount; ++i) {
+		const auto& address = addresses[i];
+		report(fmt::format(
+		    "  address 0x{:016x} precision 0x{:x}: {}\n", address.reportedAddress,
+		    address.addressPrecision,
+		    vk::to_string(static_cast<vk::DeviceFaultAddressTypeEXT>(address.addressType))));
+	}
+	for (uint32_t i = 0; i < counts.vendorInfoCount; ++i) {
+		const auto& vendor = vendors[i];
+		report(fmt::format("  vendor: {} code=0x{:x} data=0x{:x}\n", vendor.description,
+		                   vendor.vendorFaultCode, vendor.vendorFaultData));
+	}
+	std::fflush(stdout);
 }
 
 void GraphicContext::DestroyAllocator() {

@@ -51,6 +51,9 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			m_graphics.ReportDeviceFault();
+		}
 		EXIT("MasterSemaphore: waiting for tick %" PRIu64 " failed: %s\n", tick,
 		     vk::to_string(result).c_str());
 	}
