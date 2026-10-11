@@ -38,6 +38,8 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               depth_color_copy_enabled               = false;
+	// VK_KHR_maintenance8: sampling instructions take a non-constant Offset image operand.
+	bool                               sample_offsets_enabled                 = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};

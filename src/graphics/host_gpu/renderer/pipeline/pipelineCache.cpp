@@ -192,8 +192,8 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	file.Write(code.data(), code.size_bytes());
 }
 
-bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv) {
+bool ValidateShaderSpirv(const char* label, uint64_t shader_hash, const std::vector<uint32_t>& spirv,
+                         bool sample_offsets) {
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
@@ -205,7 +205,10 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        static_cast<int>(position.column), static_cast<int>(position.index),
 		                        message);
 	});
-	if (tools.Validate(spirv)) {
+	// VK_KHR_maintenance8 allows a non-constant Offset on sampling instructions.
+	spvtools::ValidatorOptions validator;
+	validator.SetAllowOffsetTextureOperand(sample_offsets);
+	if (tools.Validate(spirv.data(), spirv.size(), validator)) {
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -344,7 +347,8 @@ struct PipelineCache::ProgramCache {
 	                               std::span<const uint32_t> function_code) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
-		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
+		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
+		                         options.sample_offsets)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -441,6 +445,7 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.sample_offsets = sample_offsets;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -509,7 +514,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool sample_offsets)
+	    : device(device), sample_offsets(sample_offsets) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -524,11 +530,14 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        sample_offsets = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(
+          std::make_unique<ProgramCache>(graphics.device, graphics.sample_offsets_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

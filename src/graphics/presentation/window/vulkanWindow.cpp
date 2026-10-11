@@ -578,6 +578,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.depth_color_copy_enabled = maintenance8_extension && maintenance8.maintenance8;
+	graphics.sample_offsets_enabled   = graphics.depth_color_copy_enabled;
 	LOGF("Vulkan depth/color copy support: %s\n",
 	     graphics.depth_color_copy_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",

@@ -1355,6 +1355,8 @@ struct TestCase {
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
+  // Compile for a host that takes non-constant sample offsets (VK_KHR_maintenance8).
+  bool sample_offsets = false;
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
@@ -1421,8 +1423,11 @@ bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
   return true;
 }
 
-void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
+void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv,
+                   bool sample_offsets = false) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  spvtools::ValidatorOptions options;
+  options.SetAllowOffsetTextureOperand(sample_offsets);
   std::string messages;
   tools.SetMessageConsumer([&messages](spv_message_level_t, const char *,
                                        const spv_position_t &position,
@@ -1433,7 +1438,7 @@ void ValidateSpirv(const char *shader_name, const std::vector<u32> &spirv) {
     messages += buffer;
   });
 
-  if (!tools.Validate(spirv)) {
+  if (!tools.Validate(spirv.data(), spirv.size(), options)) {
     Fail(shader_name, "SPIR-V validation", messages);
   }
 }
@@ -1657,6 +1662,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
+  options.sample_offsets = test.sample_offsets;
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -1732,7 +1738,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   }
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
-  ValidateSpirv(test.name, result.spirv);
+  ValidateSpirv(test.name, result.spirv, test.sample_offsets);
   CheckSpirvText(test, result.spirv);
   if (test.expected_buffer_resources) {
     std::vector<u32> resources;
@@ -35063,6 +35069,58 @@ template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
   return test;
 }
 
+// IMAGE_SAMPLE_LZ_O takes its texel offset from a VGPR, here loaded at runtime. A host with
+// VK_KHR_maintenance8 takes it as a non-constant Offset; otherwise the level-zero coordinates
+// move by offset / size, which addresses the same texel.
+template <u32 wave_size, bool native> TestCase ImageSampleRuntimeOffsetsReadFourNeighbors() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = native ? (wave_size == 32 ? "ImageSampleNativeRuntimeOffsets32"
+                                        : "ImageSampleNativeRuntimeOffsets64")
+                     : (wave_size == 32 ? "ImageSampleRuntimeOffsetsReadFourNeighbors32"
+                                        : "ImageSampleRuntimeOffsetsReadFourNeighbors64");
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  constexpr std::array offsets{0x01u, 0x3fu, 0x3f00u, 0x0100u};
+  test.initial.assign(8, 0u);
+  std::ranges::copy(offsets, test.initial.begin() + 4);
+  for (u32 sample = 0; sample < offsets.size(); ++sample) {
+    AppendVMovU32(&test.code, 30, (4u + sample) * 4u);
+    test.code.push_back(EncodeMubuf0(0x0cu)); // BUFFER_LOAD_DWORD v20, v30, s[48:51]
+    test.code.push_back(EncodeMubuf1(20, 12, 30));
+    // Each sample addresses the center of texel (2, 1) before applying the offset.
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(0.375f));
+    test.code.push_back(EncodeMimg0(0x37u, 0x1));
+    test.code.push_back(EncodeMimg1(sample, 20));
+    AppendStoreVgpr(&test.code, sample, sample);
+  }
+  AppendEnd(&test.code);
+  test.sampled_image_rgba = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&test.sampled_image_rgba, 4, 2, 1, std::bit_cast<u32>(16.f), 0, 0, 0);
+  constexpr std::array<std::array<u32, 2>, 4> neighbors{{{3, 1}, {1, 1}, {2, 0}, {2, 2}}};
+  for (u32 sample = 0; sample < neighbors.size(); ++sample) {
+    const auto value = std::bit_cast<u32>(float(sample + 1));
+    SetRgbaPixel(&test.sampled_image_rgba, 4, neighbors[sample][0], neighbors[sample][1],
+                 value, 0, 0, 0);
+    test.expected.push_back(value);
+  }
+  test.expected.insert(test.expected.end(), offsets.begin(), offsets.end());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  if (native) {
+    // The harness device does not enable VK_KHR_maintenance8, so this case only compiles.
+    test.sample_offsets = true;
+    test.compile_only = true;
+    test.required_spirv = {"Lod|Offset", "ImageGatherExtended"};
+    test.forbidden_spirv = {"OpImageQuerySizeLod", "OpFDiv"};
+  } else {
+    test.required_spirv = {"OpImageQuerySizeLod", "OpFDiv"};
+    test.forbidden_spirv = {"Lod|Offset", "Lod|ConstOffset"};
+  }
+  return test;
+}
+
 TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   using O = ShaderOpcode;
 
@@ -37849,6 +37907,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
   AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<32, false>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<64, false>);
+  AddCase(ImageSampleRuntimeOffsetsReadFourNeighbors<64, true>);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
@@ -40650,6 +40711,27 @@ void CheckShaderRecompilerFatalContracts() {
 
   ExpectFatal("WritableFlatStoreRejection", [] {
     const auto test = FlatStoreVariants();
+    (void)CompileCase(test);
+  });
+
+  ExpectFatal("RuntimeLodSampleOffsetRejection", [] {
+    // Without VK_KHR_maintenance8 only a level-zero sample takes a runtime texel offset.
+    using O = ShaderOpcode;
+    TestCase test;
+    test.name = "RuntimeLodSampleOffsetRejection";
+    test.initial = {0u, 0x01u};
+    AppendVMovU32(&test.code, 30, 4u);
+    test.code.push_back(EncodeMubuf0(0x0cu));
+    test.code.push_back(EncodeMubuf1(20, 12, 30));
+    AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.625f));
+    AppendVMovLiteral(&test.code, 22, std::bit_cast<u32>(0.375f));
+    AppendVMovU32(&test.code, 23, 0);
+    test.code.push_back(EncodeMimg0(0x34u, 0x1)); // IMAGE_SAMPLE_L_O
+    test.code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&test.code, 0, 0);
+    AppendEnd(&test.code);
+    test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                    O::S_ENDPGM};
     (void)CompileCase(test);
   });
 
