@@ -284,6 +284,15 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	       !descriptor.MsaaDepth();
 }
 
+// A 256-bit T# whose extension DWORDs are all zero describes what a 128-bit one does: one slice,
+// no metadata and no mips past its last level. The hardware accepts it (a zero PERF_MOD is
+// valid), and Uncharted binds storage images this way.
+static bool ShortFormTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                             const ShaderTextureResource&               descriptor) {
+	return resource.r128 || (descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
+	                         descriptor.fields[6] == 0 && descriptor.fields[7] == 0);
+}
+
 static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageResource& resource,
                                               const ShaderTextureResource& descriptor) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
@@ -300,7 +309,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 	const bool common = (descriptor.fields[1] & field1_reserved_mask) == 0 &&
 	                    (descriptor.fields[2] & field2_reserved_mask) == 0 &&
 	                    descriptor.fields[3] == expected_field3;
-	if (resource.r128) {
+	if (ShortFormTexture(resource, descriptor)) {
 		return common && descriptor.fields[4] == 0 && descriptor.fields[5] == 0 &&
 		       descriptor.fields[6] == 0 && descriptor.fields[7] == 0;
 	}
@@ -700,7 +709,8 @@ static TextureDescription DescribeTexture(const ShaderRecompiler::IR::ImageResou
 	const auto last_level      = descriptor.LastLevel();
 	const auto type            = TextureType(descriptor);
 	const bool multisampled    = IsMultisampledTexture(type);
-	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
+	const bool short_form      = ShortFormTexture(resource, descriptor);
+	const auto max_mip         = short_form ? last_level : descriptor.MaxMip();
 	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
