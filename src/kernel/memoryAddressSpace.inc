@@ -955,8 +955,10 @@ public:
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
+		// Watches only read the mappings. The page manager serializes the watches of each page,
+		// so faulting guest threads no longer queue behind the GPU thread's protection changes.
+		std::shared_lock lock(m_mutex);
+		const auto       end     = vaddr + size;
 		auto            current = vaddr;
 		auto            it      = m_executable.upper_bound(vaddr);
 		if (it != m_executable.begin() && std::prev(it)->second > vaddr) {
