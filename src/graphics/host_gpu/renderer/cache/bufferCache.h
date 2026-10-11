@@ -81,6 +81,11 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Changes whenever SynchronizeBuffersInRange could find new CPU-modified data: after pages
+	// become CPU-modified and after a buffer is registered.
+	[[nodiscard]] uint64_t UploadEpoch() const noexcept {
+		return m_memory_tracker.CpuModifiedEpoch() + m_registered_buffers;
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -138,6 +143,7 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
+	uint64_t                                          m_registered_buffers = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

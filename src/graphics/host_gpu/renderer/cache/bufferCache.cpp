@@ -97,6 +97,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 		const auto [it, inserted] = m_buffers.emplace(buffer.CpuAddress(), id);
 		(void)it;
 		EXIT_IF(!inserted);
+		m_registered_buffers++;
 		m_total_used_memory += buffer.Size();
 		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
 		std::vector<vk::DeviceAddress> addresses;

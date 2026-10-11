@@ -29,6 +29,11 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Advances after pages become CPU-modified. A caller that reads it before uploading every
+	// CPU-modified page of some ranges needs no further upload there while it is unchanged.
+	[[nodiscard]] uint64_t CpuModifiedEpoch() const noexcept {
+		return m_cpu_modified_epoch.load(std::memory_order_acquire);
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -45,6 +50,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+				AdvanceCpuModifiedEpoch();
 				return false;
 			}();
 			if (should_flush) {
@@ -112,6 +118,9 @@ private:
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
+	void AdvanceCpuModifiedEpoch() noexcept {
+		m_cpu_modified_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
 
 	template <bool create, typename Func>
 	bool Iterate(uint64_t vaddr, uint64_t size, Func&& func) {
@@ -150,6 +159,7 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
+	std::atomic<uint64_t>                          m_cpu_modified_epoch {0};
 };
 
 } // namespace Libs::Graphics

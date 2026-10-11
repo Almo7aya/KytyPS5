@@ -90,6 +90,9 @@ private:
 	bool                      m_fault_process_pending = false;
 	int                       m_gc_frame              = -1;
 	bool                      m_bda_logged = false;
+	// The buffer upload epoch and mapping generation of the last DMA buffer sweep.
+	uint64_t m_bda_upload_epoch       = UINT64_MAX;
+	uint64_t m_bda_mapping_generation = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

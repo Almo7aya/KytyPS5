@@ -180,9 +180,17 @@ void RenderContext::PrepareBda(std::span<const uint64_t> address_bases) {
 			}
 		});
 	}
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// The sweep visits every buffer, about 1200 in Uncharted, which prepares about 100 DMA draws and
+	// dispatches a frame; most of them follow another sweep with no CPU write in between.
+	const auto epoch      = m_buffer_cache.UploadEpoch();
+	const auto generation = m_mapping_generation.load(std::memory_order_relaxed);
+	if (epoch != m_bda_upload_epoch || generation != m_bda_mapping_generation) {
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_upload_epoch       = epoch;
+		m_bda_mapping_generation = generation;
+	}
 	m_fault_process_pending = true;
 }
 
