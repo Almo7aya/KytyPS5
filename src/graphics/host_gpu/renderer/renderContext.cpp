@@ -180,16 +180,24 @@ void RenderContext::PrepareBda(std::span<const uint64_t> address_bases) {
 			}
 		});
 	}
-	// The sweep visits every buffer, about 1200 in Uncharted, which prepares about 100 DMA draws and
-	// dispatches a frame; most of them follow another sweep with no CPU write in between.
-	const auto epoch      = m_buffer_cache.UploadEpoch();
+	// Every buffer must hold the guest's CPU writes before the shader reads memory directly. A
+	// sweep of all buffers visits about 1200 in Uncharted, which prepares about 100 DMA draws and
+	// dispatches a frame, so only the buffers in tracker regions with new CPU writes are visited.
+	// Regions are taken before uploading, and writes from then on queue their region again.
+	m_buffer_cache.TakeCpuModifiedRegions(m_bda_regions);
 	const auto generation = m_mapping_generation.load(std::memory_order_relaxed);
-	if (epoch != m_bda_upload_epoch || generation != m_bda_mapping_generation) {
+	if (generation != m_bda_mapping_generation) {
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 		});
-		m_bda_upload_epoch       = epoch;
 		m_bda_mapping_generation = generation;
+	} else {
+		for (const auto region: m_bda_regions) {
+			m_mapped_ranges.ForEachInRange(
+			    region, TRACKER_REGION_SIZE, [this](uint64_t start, uint64_t end) {
+				    m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			    });
+		}
 	}
 	m_fault_process_pending = true;
 }

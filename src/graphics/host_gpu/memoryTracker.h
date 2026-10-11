@@ -29,11 +29,12 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
-	// Advances after pages become CPU-modified. A caller that reads it before uploading every
-	// CPU-modified page of some ranges needs no further upload there while it is unchanged.
-	[[nodiscard]] uint64_t CpuModifiedEpoch() const noexcept {
-		return m_cpu_modified_epoch.load(std::memory_order_acquire);
-	}
+	// Moves the regions where pages became CPU-modified since the last call, as region base
+	// addresses, into `regions`. A region is queued after its pages change, so a caller that
+	// uploads every CPU-modified page of the regions it takes misses nothing.
+	void TakeCpuModifiedRegions(std::vector<uint64_t>& regions);
+	// Queues the regions of a range as if their pages had become CPU-modified.
+	void QueueRegions(uint64_t vaddr, uint64_t size);
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
@@ -50,7 +51,7 @@ public:
 					return true;
 				}
 				manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
-				AdvanceCpuModifiedEpoch();
+				QueueRegion(manager);
 				return false;
 			}();
 			if (should_flush) {
@@ -118,8 +119,11 @@ private:
 			EXIT("memory tracker re-entered from upload callback\n");
 		}
 	}
-	void AdvanceCpuModifiedEpoch() noexcept {
-		m_cpu_modified_epoch.fetch_add(1, std::memory_order_acq_rel);
+	void QueueRegion(RegionManager* manager) {
+		if (!manager->queued.exchange(true, std::memory_order_acq_rel)) {
+			std::scoped_lock lock(m_queued_mutex);
+			m_queued_regions.push_back(manager->GetCpuAddr());
+		}
 	}
 
 	template <bool create, typename Func>
@@ -159,7 +163,8 @@ private:
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;
 	PageManager&                                   m_page_manager;
-	std::atomic<uint64_t>                          m_cpu_modified_epoch {0};
+	std::mutex                                     m_queued_mutex;
+	std::vector<uint64_t>                          m_queued_regions;
 };
 
 } // namespace Libs::Graphics

@@ -64,8 +64,27 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
 	m_regions[index].store(ptr, std::memory_order_release);
-	AdvanceCpuModifiedEpoch();
+	QueueRegion(ptr);
 	return ptr;
+}
+
+void MemoryTracker::TakeCpuModifiedRegions(std::vector<uint64_t>& regions) {
+	regions.clear();
+	{
+		std::scoped_lock lock(m_queued_mutex);
+		regions.swap(m_queued_regions);
+	}
+	// Pages that change from here on queue their region again.
+	for (const auto base: regions) {
+		if (auto* manager = m_regions[base / TRACKER_REGION_SIZE].load(std::memory_order_acquire)) {
+			manager->queued.store(false, std::memory_order_release);
+		}
+	}
+}
+
+void MemoryTracker::QueueRegions(uint64_t vaddr, uint64_t size) {
+	Iterate<true>(vaddr, size,
+	              [this](RegionManager* manager, uint64_t, uint64_t) { QueueRegion(manager); });
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
@@ -86,11 +105,11 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
-	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueRegion(manager);
 	});
-	AdvanceCpuModifiedEpoch();
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
@@ -128,10 +147,10 @@ void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	    })) {
 		EXIT("cannot untrack GPU-dirty memory\n");
 	}
-	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+	Iterate<false>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
+		QueueRegion(manager);
 	});
-	AdvanceCpuModifiedEpoch();
 }
 
 } // namespace Libs::Graphics
