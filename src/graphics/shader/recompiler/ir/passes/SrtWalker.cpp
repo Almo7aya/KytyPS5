@@ -194,8 +194,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
-	    : m_program(program), m_type(type) {}
+	RuntimeValidator(const ResourcePlan& program, RuntimeValueType type, Value counter = {})
+	    : m_program(program), m_type(type), m_counter(counter.Resolve()) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -214,6 +214,7 @@ private:
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
 			return false;
 		}
+		if (!m_counter.IsEmpty() && value == m_counter) return true;
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
 			if (!require_uniform) return true;
@@ -373,6 +374,7 @@ private:
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
+	Value                           m_counter;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -534,6 +536,16 @@ ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& p
 
 float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
+}
+
+void SrtWalker::Bind(Value value, uint64_t result) {
+	auto* inst = value.Resolve().TryInstruction();
+	EXIT_IF(inst == nullptr);
+	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	m_context.values[index] = {result, m_context.generation};
 }
 
 bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
@@ -1166,8 +1178,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	return true;
 }
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          Value counter) {
+	return RuntimeValidator(program, type, counter).Run(value);
 }
 
 

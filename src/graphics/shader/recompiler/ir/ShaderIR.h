@@ -577,6 +577,33 @@ struct CompiledShaderInfo {
 struct UniformFillPlan {
 	UniformFill          fill;
 	std::array<Value, 4> values;
+	Value                count; // Empty unless the store is guarded by index < count.
+};
+
+// A compute shader whose only effect is copying buffer elements: each store writes, at the global
+// invocation index, the element a load of the same form read from another buffer at that index,
+// for lanes below a uniform count. The copies may sit in one uniform counted loop.
+struct UniformCopyPlan {
+	// A buffer descriptor: four DWORD values, or a tracked descriptor source. An enumerated table
+	// source is read at `key`.
+	struct Descriptor {
+		std::array<Value, 4> dwords {};
+		uint32_t             source = UINT32_MAX;
+		Value                key;
+	};
+	struct Copy {
+		Descriptor source;
+		Descriptor destination;
+		Value      count;
+		uint32_t   words     = 1;
+		bool       formatted = false;
+	};
+	std::vector<Copy> copies;
+	// The loop counter, bound to each value in [begin, end); empty without a loop.
+	Value    counter;
+	uint32_t begin        = 0;
+	Value    end;
+	uint32_t group_stride = 0;
 };
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
@@ -619,6 +646,7 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
+	UniformCopyPlan                     uniform_copy;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;

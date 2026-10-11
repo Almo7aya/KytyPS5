@@ -38110,6 +38110,44 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
           !ResolveComputeBufferFill(compute, 2, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "excess invocation coverage was accepted as a fill");
+  // A DMA fill writes exactly what the BUFFER_STORE_FORMAT_* stores would: through a format that
+  // converts nothing, an identity DST_SEL, and only in range.
+  GuestRange dma{};
+  Require("Ps5GameExampleImageClear", "DMA fill",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.address == 0x200000u &&
+              dma.size == 256u,
+          "a proven 32-bit fill did not resolve to its destination range");
+  Require("Ps5GameExampleImageClear", "DMA fill dropped stores",
+          ResolveComputeDmaFill(compute, 2, 1, 1, 0x41u, dma) && dma.size == 256u,
+          "stores past NumRecords were written by the DMA fill");
+  const auto dma_word3 = [&](u32 word3) {
+    runtime_resources = scalar;
+    runtime_resources.buffers[0].dwords[3] = word3;
+    return ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma);
+  };
+  const auto format = [](Prospero::BufferFormat value) { return static_cast<u32>(value) << 12u; };
+  Require("Ps5GameExampleImageClear", "converting DMA fill format",
+          !dma_word3(format(Prospero::BufferFormat::k16_16UInt) | 0x204u),
+          "a 16_16 format, which converts the stored DWORD, was filled with raw DWORDs");
+  Require("Ps5GameExampleImageClear", "float DMA fill format",
+          dma_word3(format(Prospero::BufferFormat::k32Float) | 0x204u) && dma.size == 256u,
+          "a 32-bit float format, which converts nothing, was not filled");
+  Require("Ps5GameExampleImageClear", "DMA fill DST_SEL",
+          !dma_word3(format(Prospero::BufferFormat::k32UInt) | 0x205u),
+          "a DST_SEL that moves the stored component was filled with raw DWORDs");
+  Require("Ps5GameExampleImageClear", "DMA fill OOB_SELECT 3",
+          !dma_word3(format(Prospero::BufferFormat::k32UInt) | 0x204u | (3u << 28u)),
+          "OOB_SELECT 3, which this fill cannot model exactly, was accepted");
+  runtime_resources = scalar;
+  runtime_resources.buffers[0].dwords[2] = 16u;
+  Require("Ps5GameExampleImageClear", "partial DMA fill",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.size == 64u,
+          "stores past NumRecords were written by the DMA fill");
+  runtime_resources.buffers[0].dwords[3] |= 2u << 28u;
+  Require("Ps5GameExampleImageClear", "DMA fill OOB_SELECT 2",
+          ResolveComputeDmaFill(compute, 1, 1, 1, 0x41u, dma) && dma.size == 256u,
+          "OOB_SELECT 2, which only checks for an empty buffer, was bounded by NumRecords");
+  runtime_resources = scalar;
   auto alias = scalar.buffers.front();
   runtime_resources.buffers.push_back(alias);
   Require("Ps5GameExampleImageClear", "aliased scalar input",

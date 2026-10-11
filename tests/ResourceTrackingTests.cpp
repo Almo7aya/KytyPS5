@@ -1812,6 +1812,94 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+// A captured CMASK fast clear: a 64-bit memset bounded by a user-data element count, with the
+// store inside the compiler's EXEC skip.
+void TestCountedComputeBufferFill() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Accepted, InvertedSkip, ScalarBranch, UnboundIndex };
+  const auto Run = [](Variant variant) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(body);
+    entry->AddBranch(exit);
+    body->AddBranch(exit);
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto low = fixture.UserData(4);
+    const auto high = fixture.UserData(5);
+    const auto count = fixture.UserData(6);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    const auto index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(6u)}),
+         local});
+    const auto guard = fixture.Emit(
+        ValueOpcode::UGreaterThan32,
+        {count, variant == Variant::UnboundIndex ? local : index});
+    Value condition;
+    if (variant == Variant::ScalarBranch) {
+      condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(7), Value(0u)})},
+          CFG::BranchCondition::ScalarInstruction);
+    } else {
+      // !(all lanes fail the guard): the true edge enters the store.
+      condition = fixture.Emit(
+          ValueOpcode::ConditionRef,
+          {fixture.Emit(ValueOpcode::LogicalNot, {guard})},
+          CFG::BranchCondition::ExecZero);
+      if (variant != Variant::InvertedSkip)
+        condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
+    }
+    entry->condition = condition;
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body,
+                         .false_block = exit};
+    body->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    store.data_dwords = 2;
+    fixture.Emit(ValueOpcode::StoreBufferU32x2,
+                 {buffer, index, Value(0u), Value(0u),
+                  fixture.Emit(ValueOpcode::CompositeConstructU32x2, {low, high},
+                               0, body),
+                  guard},
+                 fixture.AddMemory(store, 16), body);
+    fixture.PlanAndTrack();
+    const auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 7> userdata{0x200000u, 8u << 16, 0x4000u, 0x14204u, 0u, 0u, 8192u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {.user_data = userdata}, snapshot, specialization),
+          "counted fill fixture did not materialize");
+    const auto &fill = snapshot.uniform_fill;
+    if (variant != Variant::Accepted) {
+      Check(fill.kind == UniformFillKind::None,
+            "a fill whose store a branch or bound can skip was accepted");
+      return;
+    }
+    Check(fill.kind == UniformFillKind::Buffer && fill.words == 2 &&
+              fill.group_stride[0] == 64 && fill.value == 0u && fill.count == 8192u,
+          "counted memset lost its value, element count or address coverage");
+  };
+  Run(Variant::Accepted);
+  Run(Variant::InvertedSkip);
+  Run(Variant::ScalarBranch);
+  Run(Variant::UnboundIndex);
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -3795,6 +3883,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("counted compute buffer fill", TestCountedComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

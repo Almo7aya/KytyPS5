@@ -229,6 +229,24 @@ private:
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
 
+// The guest memory a dispatch of a proven fill kernel writes, when a DMA fill of its value writes
+// exactly that; empty when every store is out of range or no lane stores.
+[[nodiscard]] bool ResolveComputeDmaFill(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                         uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                         GuestRange& destination);
+
+struct ComputeCopy {
+	uint64_t source      = 0;
+	uint64_t destination = 0;
+	uint64_t bytes       = 0;
+};
+
+// The byte copies a dispatch of a proven copy kernel performs, when they are exactly what the
+// kernel does: in range, unconverted and independent of each other.
+[[nodiscard]] bool ResolveComputeCopies(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                        uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                        std::vector<ComputeCopy>& copies);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_ */

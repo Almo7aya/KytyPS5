@@ -48,8 +48,9 @@ struct SrtReadFlags {
 
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
+// `counter` is a loop counter the caller binds (SrtWalker::Bind) before evaluating the value.
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
+                          RuntimeValueType type = RuntimeValueType::Any, Value counter = {});
 void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
@@ -65,6 +66,9 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// Fixes an instruction's value for this session, such as a loop counter for one iteration;
+	// everything evaluated afterwards that depends on it uses this value.
+	void Bind(Value value, uint64_t result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 

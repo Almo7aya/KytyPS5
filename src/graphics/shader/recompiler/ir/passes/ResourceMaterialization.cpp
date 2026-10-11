@@ -1527,30 +1527,90 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	return left;
 }
 
+// Whether a conditional branch only skips the store's block when no lane would store: the EXEC test
+// a compiler places around a predicated region, "some lane passes the store guard".
+static bool IsStoreGuardSkip(const Block& block, const Block* store_block, Value guard) {
+	auto        value = block.condition.Resolve();
+	bool        outer = false;
+	const Inst* test  = nullptr;
+	while (test == nullptr) {
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
+			test = inst;
+		} else if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+			outer = !outer;
+			value = inst->Arg(0).Resolve();
+		} else {
+			return false;
+		}
+	}
+	bool inner = false;
+	value = test->Arg(0).Resolve();
+	for (guard = guard.Resolve(); value != guard;) {
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LogicalNot) return false;
+		inner = !inner;
+		value = inst->Arg(0).Resolve();
+	}
+	// ExecNonZero tests whether any lane holds its operand; ExecZero whether all lanes do.
+	bool any = false;
+	const auto kind = test->Flags<CFG::BranchCondition>();
+	if (kind == CFG::BranchCondition::ExecNonZero && !inner) {
+		any = true; // any(guard)
+	} else if (kind != CFG::BranchCondition::ExecZero || !inner) {
+		return false; // all(!guard) is !any(guard); other forms are not a skip.
+	}
+	if (outer) any = !any;
+	return (any ? block.terminator.true_block : block.terminator.false_block) == store_block;
+}
+
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty()) {
 		return {};
 	}
-	std::unordered_set<const Block*> visited;
-	const auto*                      block = program.blocks.front();
-	const Inst*                      store = nullptr;
-	for (;;) {
-		if (block == nullptr || !visited.insert(block).second) return {};
+	// One store and no other effect in acyclic control flow; branches are checked below.
+	std::unordered_map<const Block*, size_t> order;
+	for (size_t index = 0; index < program.blocks.size(); ++index) {
+		order.emplace(program.blocks[index], index);
+	}
+	const auto forward = [&](const Block* from, const Block* to) {
+		const auto found = order.find(to);
+		return to != nullptr && found != order.end() && found->second > order.at(from);
+	};
+	const Inst*  store       = nullptr;
+	const Block* store_block = nullptr;
+	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
-			if (!inst.MayHaveSideEffects()) continue;
+			// References only keep a branch condition alive.
+			if (!inst.MayHaveSideEffects() || inst.GetOpcode() == ValueOpcode::Reference ||
+			    inst.GetOpcode() == ValueOpcode::ReferenceU32)
+				continue;
 			if (store != nullptr || (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write &&
 			                         inst.GetOpcode() != ValueOpcode::ImageWrite))
 				return {};
-			store = &inst;
+			store       = &inst;
+			store_block = block;
 		}
 		const auto& term = block->terminator;
-		if (term.kind == CFG::TerminatorKind::Return) break;
-		if (term.kind != CFG::TerminatorKind::Branch) return {};
-		block = term.true_block;
+		if (term.loop_header) return {};
+		if (term.kind == CFG::TerminatorKind::Return) continue;
+		if ((term.kind != CFG::TerminatorKind::Branch &&
+		     term.kind != CFG::TerminatorKind::ConditionalBranch) ||
+		    !forward(block, term.true_block) ||
+		    (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+		     !forward(block, term.false_block)))
+			return {};
 	}
-	if (store == nullptr || visited.size() != program.blocks.size()) return {};
+	if (store == nullptr) return {};
+	for (const auto* block: program.blocks) {
+		if (block->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+		    (store->GetOpcode() == ValueOpcode::ImageWrite ||
+		     !IsStoreGuardSkip(*block, store_block, store->Arg(5))))
+			return {};
+	}
 	for (const auto& buffer: program.info.buffers) {
 		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
 	}
@@ -1594,7 +1654,21 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		    store->Arg(3).Resolve() != Value(0u))
 			return {};
 		guard = store->Arg(5).Resolve();
-		if (!IsFullDispatchPredicate(guard)) return {};
+		if (!IsFullDispatchPredicate(guard)) {
+			// A memset kernel bounds its index by a host-provided element count.
+			const auto* bound = guard.TryInstruction();
+			const auto  index = store->Arg(1).Resolve();
+			if (bound != nullptr && bound->GetOpcode() == ValueOpcode::UGreaterThan32 &&
+			    bound->Arg(1).Resolve() == index) {
+				result.count = bound->Arg(0).Resolve();
+			} else if (bound != nullptr && bound->GetOpcode() == ValueOpcode::ULessThan32 &&
+			           bound->Arg(0).Resolve() == index) {
+				result.count = bound->Arg(1).Resolve();
+			}
+			if (result.count.IsEmpty() || result.count.GetType() != Type::U32 ||
+			    !ValidateRuntimeValue(program, result.count, RuntimeValueType::Integer))
+				return {};
+		}
 		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
@@ -1620,6 +1694,359 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
 			return {};
 		result.values[i] = word;
+	}
+	return result;
+}
+
+// Whether every lane the dispatch launches holds `value`: EXEC at entry, EXEC restored to all ones
+// (after an S_MOV of -1, each lane tests its bit of 0xffffffff), dispatch-extent predicates (the renderer
+// bounds the lanes it copies by the dispatch), and masks merging only these. A mask a loop carries
+// holds on every iteration when it holds on entry and its back edge keeps it.
+static bool IsAllLanes(Value value, std::vector<const Inst*>& carried, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value == Value(true) || IsFullDispatchPredicate(value)) return true;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 32) return false;
+	const auto immediate = [](Value operand, uint32_t expected) {
+		operand = operand.Resolve();
+		return operand.IsImmediate() && operand.GetType() == Type::U32 && operand.U32() == expected;
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalAnd:
+			return IsAllLanes(inst->Arg(0), carried, depth + 1) &&
+			       IsAllLanes(inst->Arg(1), carried, depth + 1);
+		case ValueOpcode::Phi:
+			if (std::ranges::find(carried, inst) != carried.end()) return true;
+			carried.push_back(inst);
+			for (size_t i = 0; i < inst->NumArgs(); ++i) {
+				if (!IsAllLanes(inst->Arg(i), carried, depth + 1)) return false;
+			}
+			return true;
+		case ValueOpcode::INotEqual32: {
+			const auto* bit   = inst->Arg(0).ResolveInstruction();
+			const auto* shift = bit != nullptr && bit->GetOpcode() == ValueOpcode::BitwiseAnd32
+			                        ? bit->Arg(0).ResolveInstruction()
+			                        : nullptr;
+			const auto* lane  = shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftRightLogical32
+			                        ? shift->Arg(1).ResolveInstruction()
+			                        : nullptr;
+			if (lane == nullptr || !immediate(inst->Arg(1), 0u) || !immediate(bit->Arg(1), 1u) ||
+			    !immediate(shift->Arg(0), UINT32_MAX) || lane->GetOpcode() != ValueOpcode::BitwiseAnd32)
+				return false;
+			const auto mask = lane->Arg(1).Resolve();
+			return mask.IsImmediate() && mask.GetType() == Type::U32 && mask.U32() < 32u;
+		}
+		default: return false;
+	}
+}
+
+// Splits a store guard into all-lanes terms and at most one bound, index < count.
+static bool SplitCopyGuard(Value guard, Value index, Value& count, uint32_t depth = 0) {
+	guard = guard.Resolve();
+	std::vector<const Inst*> carried;
+	if (IsAllLanes(guard, carried)) return true;
+	const auto* inst = guard.TryInstruction();
+	if (inst == nullptr || depth > 32) return false;
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return SplitCopyGuard(inst->Arg(0), index, count, depth + 1) &&
+		       SplitCopyGuard(inst->Arg(1), index, count, depth + 1);
+	}
+	if (!count.IsEmpty()) return false;
+	if (inst->GetOpcode() == ValueOpcode::UGreaterThan32 && inst->Arg(1).Resolve() == index) {
+		count = inst->Arg(0).Resolve();
+	} else if (inst->GetOpcode() == ValueOpcode::ULessThan32 && inst->Arg(0).Resolve() == index) {
+		count = inst->Arg(1).Resolve();
+	}
+	return !count.IsEmpty();
+}
+
+// A kernel whose only effect is copying buffer elements (see UniformCopyPlan). Each store writes,
+// at the invocation's global index, what a load of the same width, form and guard read at that
+// index. Branches are uniform except EXEC tests that skip a store block no lane would store in.
+// One counted loop may surround the copies; descriptors, counts and the trip count are evaluated
+// per iteration from memory, so they must not depend on anything the loop computes but the counter.
+static UniformCopyPlan AnalyzeUniformCopy(const Program& program) {
+	const auto& info = program.info;
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.has_address_writes ||
+	    program.dispatcher_fallback || !info.images.empty() || !info.samplers.empty() ||
+	    info.uses_lds || info.uses_gds || info.function_lds || info.function_scratch) {
+		return {};
+	}
+	std::unordered_map<const Block*, size_t> order;
+	for (size_t index = 0; index < program.blocks.size(); ++index) {
+		order.emplace(program.blocks[index], index);
+	}
+	std::vector<const Inst*> stores;
+	const Block*             header = nullptr;
+	const Block*             latch  = nullptr;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			// Scalar reads of guest memory feed counts and descriptors; nothing else addresses it.
+			if (AddressOpcodeInfoOf(op).access != AddressAccess::None &&
+			    (op != ValueOpcode::LoadAddressU32 ||
+			     program.memory_info.at(inst.Flags<MemoryFlags>().index).kind !=
+			         ResourceKind::ScalarAddress))
+				return {};
+			if (!inst.MayHaveSideEffects() || op == ValueOpcode::Reference ||
+			    op == ValueOpcode::ReferenceU32)
+				continue;
+			if (BufferAccessOf(op) != BufferAccess::Write) return {};
+			stores.push_back(&inst);
+		}
+		const auto& term = block->terminator;
+		if (term.kind == CFG::TerminatorKind::Return) continue;
+		if (term.kind != CFG::TerminatorKind::Branch &&
+		    term.kind != CFG::TerminatorKind::ConditionalBranch)
+			return {};
+		const std::array targets {term.true_block, term.false_block};
+		const auto       count = term.kind == CFG::TerminatorKind::ConditionalBranch ? 2u : 1u;
+		for (uint32_t i = 0; i < count; ++i) {
+			const auto found = order.find(targets[i]);
+			if (found == order.end()) return {};
+			if (found->second > order.at(block)) continue;
+			// An unconditional back edge closes the only loop.
+			if (latch != nullptr || term.kind != CFG::TerminatorKind::Branch) return {};
+			header = targets[i];
+			latch  = block;
+		}
+	}
+	if (stores.empty()) return {};
+	UniformCopyPlan result;
+	std::unordered_set<const Block*> body;
+	const Inst*  counter = nullptr;
+	const Block* test    = nullptr;
+	if (latch != nullptr) {
+		body.insert(header);
+		for (std::vector<const Block*> pending {latch}; !pending.empty();) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (!body.insert(block).second) continue;
+			for (const auto* predecessor: block->ImmPredecessors()) pending.push_back(predecessor);
+		}
+		// The loop tests its counter at the top, in a straight run of blocks without stores, and
+		// leaves only there; code outside it is straight-line and stores nothing.
+		test = header;
+		for (uint32_t steps = 0; test->terminator.kind == CFG::TerminatorKind::Branch; ++steps) {
+			test = test->terminator.true_block;
+			if (steps > 8 || !body.contains(test) || test == header) return {};
+		}
+		if (test->terminator.kind != CFG::TerminatorKind::ConditionalBranch) return {};
+		for (const auto* block: program.blocks) {
+			const auto& term = block->terminator;
+			const bool inside = body.contains(block);
+			if (term.kind == CFG::TerminatorKind::ConditionalBranch && block != test &&
+			    (!inside || body.contains(term.true_block) != body.contains(term.false_block)))
+				return {};
+			if (!inside || block == header) continue;
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == ValueOpcode::Phi && inst.HasUses()) return {};
+			}
+		}
+		for (const auto* store: stores) {
+			if (!body.contains(store->Parent())) return {};
+		}
+		for (const Block* block = program.blocks[0]; block != header; block = block->terminator.true_block) {
+			if (block->terminator.kind != CFG::TerminatorKind::Branch || body.contains(block)) return {};
+		}
+		for (const Block* block = header;; block = block->terminator.true_block) {
+			for (const auto* store: stores) {
+				if (store->Parent() == block) return {};
+			}
+			if (block == test) break;
+		}
+		// The exit test, through scalar branch conditions only: counter < end stays in the loop.
+		auto condition = test->condition.Resolve();
+		bool negated   = false;
+		for (uint32_t depth = 0;; ++depth) {
+			const auto* inst = condition.TryInstruction();
+			if (inst == nullptr || depth > 8) return {};
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+				negated = !negated;
+			} else if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
+				const auto kind = inst->Flags<CFG::BranchCondition>();
+				if (kind != CFG::BranchCondition::SccZero && kind != CFG::BranchCondition::SccNonZero &&
+				    kind != CFG::BranchCondition::ScalarInstruction)
+					return {};
+			} else {
+				break;
+			}
+			condition = inst->Arg(0).Resolve();
+		}
+		const auto* compare = condition.TryInstruction();
+		if (compare == nullptr) return {};
+		Value      count_value;
+		Value      end;
+		bool       stays_if_true = true;
+		switch (compare->GetOpcode()) {
+			case ValueOpcode::ULessThan32: count_value = compare->Arg(0); end = compare->Arg(1); break;
+			case ValueOpcode::UGreaterThan32: count_value = compare->Arg(1); end = compare->Arg(0); break;
+			case ValueOpcode::UGreaterThanEqual32:
+				count_value = compare->Arg(0), end = compare->Arg(1), stays_if_true = false;
+				break;
+			case ValueOpcode::ULessThanEqual32:
+				count_value = compare->Arg(1), end = compare->Arg(0), stays_if_true = false;
+				break;
+			default: return {};
+		}
+		const auto& term = test->terminator;
+		const auto* stay = stays_if_true != negated ? term.true_block : term.false_block;
+		const auto* exit = stay == term.true_block ? term.false_block : term.true_block;
+		counter = count_value.Resolve().TryInstruction();
+		if (!body.contains(stay) || body.contains(exit) || counter == nullptr ||
+		    counter->GetOpcode() != ValueOpcode::Phi || counter->Parent() != header ||
+		    counter->GetType() != Type::U32 || counter->NumArgs() != 2u ||
+		    !ValidateRuntimeValue(program, end, RuntimeValueType::Integer))
+			return {};
+		const Value self(const_cast<Inst*>(counter));
+		bool        entered = false;
+		bool        stepped = false;
+		for (size_t i = 0; i < 2u; ++i) {
+			const auto operand = counter->Arg(i).Resolve();
+			if (!body.contains(counter->PhiBlock(i))) {
+				entered = operand.IsImmediate() && operand.GetType() == Type::U32;
+				if (entered) result.begin = operand.U32();
+				continue;
+			}
+			const auto* step = operand.TryInstruction();
+			stepped = step != nullptr && step->GetOpcode() == ValueOpcode::IAdd32 &&
+			          ((step->Arg(0).Resolve() == self && step->Arg(1).Resolve() == Value(1u)) ||
+			           (step->Arg(1).Resolve() == self && step->Arg(0).Resolve() == Value(1u)));
+		}
+		if (!entered || !stepped) return {};
+		// Every other value the loop carries is an all-lanes EXEC mask.
+		for (const auto& inst: *header) {
+			std::vector<const Inst*> carried;
+			if (inst.GetOpcode() == ValueOpcode::Phi && &inst != counter && inst.HasUses() &&
+			    (inst.GetType() != Type::U1 || !IsAllLanes(Value(const_cast<Inst*>(&inst)), carried)))
+				return {};
+		}
+		result.counter = self;
+		result.end     = end.Resolve();
+	} else {
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == ValueOpcode::Phi && inst.HasUses()) return {};
+			}
+		}
+	}
+	const Value counter_value = counter != nullptr ? Value(const_cast<Inst*>(counter)) : Value {};
+	const auto  runtime_value = [&](Value value) {
+		return value.GetType() == Type::U32 &&
+		       ValidateRuntimeValue(program, value, RuntimeValueType::Integer, counter_value);
+	};
+	// A V# the copy reads or writes: its four DWORDs, or a tracked source (one table entry when the
+	// key is computed on the GPU).
+	const auto descriptor = [&](const Inst& access, UniformCopyPlan::Descriptor& out) {
+		const auto& memory = program.memory_info.at(access.Flags<MemoryFlags>().index);
+		if (memory.kind == ResourceKind::IndirectBuffer) {
+			const auto* handle = access.Arg(0).ResolveInstruction();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    handle->NumArgs() != 4u)
+				return false;
+			for (uint32_t i = 0; i < 4u; ++i) {
+				out.dwords[i] = handle->Arg(i).Resolve();
+				if (!runtime_value(out.dwords[i])) return false;
+			}
+			return true;
+		}
+		if (memory.kind != ResourceKind::Buffer || memory.resource >= info.buffers.size()) return false;
+		const auto& buffer = info.buffers[memory.resource];
+		const auto* source = Source(program, buffer.source);
+		if (source == nullptr || buffer.indirect_root != UINT32_MAX || (buffer.read && buffer.written) ||
+		    source->dword_count != 4u)
+			return false;
+		out.source = buffer.source;
+		if (!source->indirect_descriptor) return true;
+		const auto& indirect = *source->indirect_descriptor;
+		const auto* table    = Source(program, indirect.table_source);
+		if (!indirect.sources.empty() || indirect.selector || !indirect.selector_first.IsEmpty() ||
+		    !indirect.selector_mask.IsEmpty() || indirect.workgroup_axis != UINT32_MAX ||
+		    indirect.table_stride == 0u || indirect.selector_value.IsEmpty() || table == nullptr ||
+		    table->indirect_descriptor || (table->dword_count != 2u && table->dword_count != 4u) ||
+		    !runtime_value(indirect.selector_value))
+			return false;
+		out.key = indirect.selector_value.Resolve();
+		return true;
+	};
+	constexpr std::array store_ops {ValueOpcode::StoreBufferU32, ValueOpcode::StoreBufferU32x2,
+	                                ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
+	constexpr std::array load_ops {ValueOpcode::LoadBufferU32, ValueOpcode::LoadBufferU32x2,
+	                               ValueOpcode::LoadBufferU32x3, ValueOpcode::LoadBufferU32x4};
+	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
+	                                 ValueOpcode::CompositeConstructU32x3,
+	                                 ValueOpcode::CompositeConstructU32x4};
+	constexpr std::array extracts {ValueOpcode::CompositeExtractU32x2,
+	                               ValueOpcode::CompositeExtractU32x3,
+	                               ValueOpcode::CompositeExtractU32x4};
+	// Linear element addressing at the global index: idxen, no offsets, unswizzled DWORD data.
+	const auto element_access = [&](const Inst& access, uint32_t words) {
+		const auto& memory = program.memory_info.at(access.Flags<MemoryFlags>().index);
+		return !memory.typed && memory.idxen && !memory.offen && memory.offset == 0u &&
+		       memory.data_bits == 32u && memory.data_dwords == words &&
+		       access.Arg(2).Resolve() == Value(0u) && access.Arg(3).Resolve() == Value(0u);
+	};
+	for (const auto* store: stores) {
+		const auto words_found = std::ranges::find(store_ops, store->GetOpcode());
+		if (words_found == store_ops.end()) return {};
+		const auto  words     = static_cast<uint32_t>(words_found - store_ops.begin() + 1);
+		const auto& memory    = program.memory_info.at(store->Flags<MemoryFlags>().index);
+		const auto  guard     = store->Arg(5).Resolve();
+		const auto  index     = store->Arg(1).Resolve();
+		if (!element_access(*store, words)) return {};
+		UniformCopyPlan::Copy copy {.words = words, .formatted = memory.formatted};
+		if (!SplitCopyGuard(guard, index, copy.count) ||
+		    (!copy.count.IsEmpty() && !runtime_value(copy.count)))
+			return {};
+		const auto address = FillIndex(index, 0, guard);
+		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0 ||
+		    (result.group_stride != 0 && result.group_stride != (*address)[2]))
+			return {};
+		result.group_stride = static_cast<uint32_t>((*address)[2]);
+		// The stored data is the loaded element, whole and in order.
+		auto        data = words == 1u ? ResolveActiveU32(store->Arg(4), guard) : store->Arg(4).Resolve();
+		const auto* load = data.TryInstruction();
+		if (load != nullptr && words > 1u && load->GetOpcode() == composites[words - 2]) {
+			const Inst* parts = nullptr;
+			for (uint32_t i = 0; i < words; ++i) {
+				const auto* part = load->Arg(i).ResolveInstruction();
+				if (part == nullptr || part->GetOpcode() != extracts[words - 2] ||
+				    part->Arg(1).Resolve() != Value(i) ||
+				    (parts != nullptr && part->Arg(0).ResolveInstruction() != parts))
+					return {};
+				parts = part->Arg(0).ResolveInstruction();
+			}
+			load = parts;
+		}
+		std::vector<const Inst*> carried;
+		if (load == nullptr || load->GetOpcode() != load_ops[words - 1] || !element_access(*load, words) ||
+		    program.memory_info.at(load->Flags<MemoryFlags>().index).formatted != memory.formatted ||
+		    load->Arg(1).Resolve() != index ||
+		    (load->Arg(4).Resolve() != guard && !IsAllLanes(load->Arg(4), carried)) ||
+		    !descriptor(*load, copy.source) || !descriptor(*store, copy.destination))
+			return {};
+		result.copies.push_back(std::move(copy));
+	}
+	// Every other conditional branch only skips a block whose stores no lane performs, and rejoins
+	// where that block continues.
+	for (const auto* block: program.blocks) {
+		const auto& term = block->terminator;
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch || block == test) continue;
+		bool skip = false;
+		for (const auto* stored: {term.true_block, term.false_block}) {
+			const auto* rejoin = stored == term.true_block ? term.false_block : term.true_block;
+			const Inst* first  = nullptr;
+			bool        same   = true;
+			for (const auto* store: stores) {
+				if (store->Parent() != stored) continue;
+				same &= first == nullptr || store->Arg(5).Resolve() == first->Arg(5).Resolve();
+				if (first == nullptr) first = store;
+			}
+			skip |= first != nullptr && same && stored->terminator.kind == CFG::TerminatorKind::Branch &&
+			        stored->terminator.true_block == rejoin &&
+			        IsStoreGuardSkip(*block, stored, first->Arg(5));
+		}
+		if (!skip) return {};
 	}
 	return result;
 }
@@ -1768,6 +2195,26 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	}
+	if (!plan.uniform_fill.count.IsEmpty()) {
+		plan.uniform_fill.count = Clone(plan.uniform_fill.count);
+	}
+	plan.uniform_copy = AnalyzeUniformCopy(program);
+	const auto clone_descriptor = [&](UniformCopyPlan::Descriptor& descriptor) {
+		if (descriptor.source == UINT32_MAX) {
+			for (auto& dword: descriptor.dwords) dword = Clone(dword);
+		} else if (!descriptor.key.IsEmpty()) {
+			descriptor.key = Clone(descriptor.key);
+		}
+	};
+	for (auto& copy: plan.uniform_copy.copies) {
+		clone_descriptor(copy.source);
+		clone_descriptor(copy.destination);
+		if (!copy.count.IsEmpty()) copy.count = Clone(copy.count);
+	}
+	if (!plan.uniform_copy.counter.IsEmpty()) {
+		plan.uniform_copy.counter = Clone(plan.uniform_copy.counter);
+		plan.uniform_copy.end     = Clone(plan.uniform_copy.end);
+	}
 	plan.capture_specialization_reads |=
 	    capture_indirect_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
@@ -1815,6 +2262,73 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+// Every copy a proven copy kernel performs in this dispatch. Each loop iteration binds the counter
+// and reads the descriptors and counts from the memory the kernel reads them from.
+static bool EvaluateUniformCopies(const ResourcePlan& program, const SrtRuntime& runtime,
+                                  ResourceSnapshot& snapshot) {
+	constexpr uint32_t MaxIterations = 64;
+	const auto&        plan          = program.uniform_copy;
+	SrtReadCapture     capture {runtime, snapshot.uniform_copy_reads};
+	const auto         clean = CleanRuntime(capture.ObservedRuntime());
+	uint32_t           end   = plan.begin + 1u;
+	if (!plan.counter.IsEmpty()) {
+		SrtWalker walker(program, clean);
+		if (!walker.Evaluate(plan.end, end)) return false;
+	}
+	if (end > plan.begin && end - plan.begin > MaxIterations) return false;
+	const auto read = [&](SrtWalker& walker, const UniformCopyPlan::Descriptor& recipe,
+	                      std::array<uint32_t, 4>& words) {
+		if (recipe.source == UINT32_MAX) {
+			for (uint32_t i = 0; i < 4u; ++i) {
+				if (!walker.Evaluate(recipe.dwords[i], words[i])) return false;
+			}
+			return true;
+		}
+		const auto&     source = program.descriptor_sources[recipe.source];
+		DescriptorValue value;
+		if (!source.indirect_descriptor) {
+			if (!walker.EvaluateDescriptor(recipe.source, value) || value.dword_count != 4u) return false;
+			std::copy_n(value.dwords.begin(), 4, words.begin());
+			return true;
+		}
+		// The table entry at the key, read as MaterializeIndirectDescriptor reads candidates.
+		const auto& indirect = *source.indirect_descriptor;
+		uint32_t    key      = 0;
+		if (!walker.Evaluate(recipe.key, key) ||
+		    !walker.EvaluateDescriptor(indirect.table_source, value))
+			return false;
+		uint64_t             base = 0;
+		uint64_t             size = UINT64_MAX;
+		ShaderBufferResource table;
+		if (value.dword_count == 2u) {
+			base = (static_cast<uint64_t>(value.dwords[1]) << 32u) | value.dwords[0];
+		} else if (DecodeBufferDescriptor(value, table)) {
+			base = table.Base48();
+			size = table.GetSize();
+		} else {
+			return false;
+		}
+		const uint64_t offset =
+		    uint64_t {(key * indirect.table_stride + indirect.table_offset) & ~3u} +
+		    (indirect.table_immediate & ~3u);
+		return ReadScalarTable(base, size, offset, clean, words);
+	};
+	for (uint32_t iteration = plan.begin; iteration < end; ++iteration) {
+		SrtWalker walker(program, clean);
+		if (!plan.counter.IsEmpty()) walker.Bind(plan.counter, iteration);
+		for (const auto& recipe: plan.copies) {
+			auto& copy = snapshot.uniform_copies.emplace_back(
+			    UniformCopy {.count = UINT32_MAX, .words = recipe.words, .formatted = recipe.formatted});
+			if ((!recipe.count.IsEmpty() && !walker.Evaluate(recipe.count, copy.count)) ||
+			    !read(walker, recipe.source, copy.source) ||
+			    !read(walker, recipe.destination, copy.destination))
+				return false;
+		}
+	}
+	snapshot.copy_group_stride = plan.group_stride;
+	return true;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete) {
@@ -1844,10 +2358,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
+	uint32_t fill_count = UINT32_MAX;
+	if (uniform_fill && !fill.count.IsEmpty()) {
+		uniform_fill = clean.Evaluate(fill.count, fill_count);
+	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
+		snapshot.uniform_fill.count = fill_count;
 	}
+	snapshot.uniform_copies.clear();
+	snapshot.uniform_copy_reads.clear();
+	snapshot.copies_proven = !program.uniform_copy.copies.empty() &&
+	                         runtime.read_specialization_memory != nullptr &&
+	                         EvaluateUniformCopies(program, runtime, snapshot);
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
