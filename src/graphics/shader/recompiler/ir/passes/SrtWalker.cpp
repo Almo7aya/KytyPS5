@@ -47,6 +47,9 @@ bool SrtReadCapture::ReadOrdinary(void* userdata, uint64_t address, std::span<ui
 		// a pointer there can be stale or garbage. No mapped memory reads as zero.
 		std::ranges::fill(values, 0u);
 		return true;
+	} else if (values.size() == 1u) {
+		// Most reads are one DWORD; a constant-size copy is a plain load instead of a call.
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), sizeof(uint32_t));
 	} else {
 		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	}
