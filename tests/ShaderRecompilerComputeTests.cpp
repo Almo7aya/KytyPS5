@@ -1010,6 +1010,14 @@ void Require(const char *shader_name, const char *stage, bool value,
   }
 }
 
+// A guest access faults only where a page watch revokes it, and the caches must claim that fault.
+// An access to an unwatched page simply succeeds.
+bool GuestAccess(RenderContext &resources, PageFaultAccess access,
+                 uint64_t address) {
+  return !resources.IsWatched(access, address) ||
+         resources.HandleFault(access, address);
+}
+
 void CheckErrorDialogLifecycle() {
   namespace ErrorDialog = Libs::Dialog::ErrorDialog;
   namespace SystemDialog = Libs::Dialog::SystemDialog;
@@ -3539,22 +3547,22 @@ public:
                               2 * sizeof(source_words), false, true);
     });
     Require("GpuCommandLane", "DMA_DATA immediate GDS readback",
-            resources.HandleFault(PageFaultAccess::Read, immediate_dst),
+            GuestAccess(resources, PageFaultAccess::Read, immediate_dst),
             "immediate-to-GDS-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA memory GDS readback",
-            resources.HandleFault(PageFaultAccess::Read, memory_dst),
+            GuestAccess(resources, PageFaultAccess::Read, memory_dst),
             "memory-to-GDS-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA immediate memory readback",
-            resources.HandleFault(PageFaultAccess::Read, immediate_memory_dst),
+            GuestAccess(resources, PageFaultAccess::Read, immediate_memory_dst),
             "immediate-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA memory copy readback",
-            resources.HandleFault(PageFaultAccess::Read, memory_copy_dst),
+            GuestAccess(resources, PageFaultAccess::Read, memory_copy_dst),
             "memory-to-memory copy did not publish GPU bytes");
     Require("GpuCommandLane", "DMA_DATA L2 readback",
-            resources.HandleFault(PageFaultAccess::Read, l2_copy_dst),
+            GuestAccess(resources, PageFaultAccess::Read, l2_copy_dst),
             "MemoryUsingL2 copy did not publish GPU bytes");
     Require("GpuCommandLane", "clean cached mirror readback",
-            resources.HandleFault(PageFaultAccess::Read, clean_cached_readback),
+            GuestAccess(resources, PageFaultAccess::Read, clean_cached_readback),
             "clean host DMA was not reflected in the cached buffer");
     std::array<uint32_t, 2> immediate_words{};
     std::array<uint32_t, 2> copied_words{};
@@ -3648,7 +3656,7 @@ public:
     block_entered.acquire();
     std::jthread clean_fault_thread([&] {
       clean_fault_handled =
-          resources.HandleFault(PageFaultAccess::Write, immediate_dst);
+          GuestAccess(resources, PageFaultAccess::Write, immediate_dst);
       clean_fault_complete.release();
     });
     const bool clean_fault_was_direct =
@@ -3666,7 +3674,7 @@ public:
     bool dirty_fault_handled = false;
     std::jthread dirty_fault_thread([&] {
       dirty_fault_handled =
-          resources.HandleFault(PageFaultAccess::Write, dirty_fault_address);
+          GuestAccess(resources, PageFaultAccess::Write, dirty_fault_address);
       dirty_fault_complete.release();
     });
     const bool dirty_fault_bypassed_lane =
@@ -4325,7 +4333,7 @@ public:
                        sizeof(ring_fault_second_value), ring_fault_second_value,
                        false);
       Require(name, "fault-ring wrapped batch",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
       // Both disjoint writes on the faulting page share one wrapped batch.
@@ -4699,7 +4707,7 @@ public:
                                       sizeof(partial_unmap_value)),
           "partial invalidation read back an unrelated mapped page");
       Require(name, "partial-invalidation survivor read fault",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + partial_unmap_survivor_offset),
               "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
@@ -5400,7 +5408,7 @@ public:
       auto &image = texture_cache.GetImage(first);
       constexpr uint32_t final_sampled_value = 0x88776655u;
       Require(name, "sampled write between discovery and acquisition",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     sampled.info.data.address),
               "sampled image did not accept a CPU update after discovery");
       std::memcpy(memory, &final_sampled_value, sizeof(final_sampled_value));
@@ -5598,7 +5606,7 @@ public:
       for (const uint32_t width : {32u, 64u, 32u}) {
         if (previous) {
           Require(name, "mip-layout CPU overwrite",
-                  resources.HandleFault(PageFaultAccess::Write,
+                  GuestAccess(resources, PageFaultAccess::Write,
                                         base + mip_layout_offset),
                   "mip-layout guest overwrite did not invalidate the old texture");
         }
@@ -6457,7 +6465,7 @@ public:
       const std::array<uint16_t, 2> refreshed_multisample_source{0x2000u,
                                                                  0xe000u};
       Require(name, "unequal-sample source CPU write",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     color_desc.info.data.address),
               "color-to-MS-depth source did not accept a CPU update");
       std::memcpy(memory + 0x2000, refreshed_multisample_source.data(),
@@ -6645,7 +6653,7 @@ public:
               "changing stencil address recreated depth or discarded an "
               "existing lightweight association");
       Require(name, "CPU write to tracked stencil association",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + second_stencil_offset) &&
                   !texture_cache.GetImage(second_stencil_association).IsTracked() &&
                   texture_cache.GetImage(second_stencil_association).IsCpuDirty() &&
@@ -6710,7 +6718,7 @@ public:
       texture_cache.MarkGpuWritten(mirror_image);
       constexpr uint32_t mirror_cpu_value = 0x0f1e2d3cu;
       Require(name, "CPU-dirty formatted mirror fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     mirror_desc.info.data.address),
               "GPU image did not accept a CPU write before Buffer mirroring");
       std::memcpy(memory + 0x5000, &mirror_cpu_value, sizeof(mirror_cpu_value));
@@ -6976,7 +6984,7 @@ public:
               partial_clean_source.first != nullptr,
               "clean same-page bytes inherited unrelated buffer ownership");
       Require(name, "partial-page remaining fault",
-              resources.HandleFault(PageFaultAccess::Read,
+              GuestAccess(resources, PageFaultAccess::Read,
                                     base + partial_buffer_offset),
               "same-page buffer ownership was lost after image transfer");
       uint32_t partial_buffer_backing = 0;
@@ -6991,7 +6999,7 @@ public:
               "same-page image/buffer readback published incorrect bytes");
       constexpr uint32_t partial_cpu_refresh_value = 0x13579bdfu;
       Require(name, "partial-page CPU write fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + partial_clean_offset),
               "same-page CPU write did not invalidate cached ownership");
       std::memcpy(memory + partial_clean_offset, &partial_cpu_refresh_value,
@@ -7070,7 +7078,7 @@ public:
               "TextureCache claimed a CPU read fault instead of preserving "
               "GPU image ownership");
       Require(name, "same-page image write invalidation",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + padding_fault_offset) &&
                   texture_cache.GetImage(fault_a_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
@@ -7100,7 +7108,7 @@ public:
                   texture_cache.GetImage(fault_b_image).IsGpuModified(),
               "copying one same-page image lost an authoritative owner");
       Require(name, "same-page survivor write fault",
-              resources.HandleFault(PageFaultAccess::Write, base + 0x8010) &&
+              GuestAccess(resources, PageFaultAccess::Write, base + 0x8010) &&
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty(),
               "the surviving image was not protected after its alias retired");
@@ -7179,7 +7187,7 @@ public:
             texture_cache.GetImage(image).IsGpuModified() &&
                 standalone_cpu_read == 0 &&
                 texture_cache.GetImage(image).IsGpuModified() &&
-                resources.HandleFault(PageFaultAccess::Write, base + offset) &&
+                GuestAccess(resources, PageFaultAccess::Write, base + offset) &&
                 texture_cache.GetImage(image).IsGpuModified() &&
                 texture_cache.GetImage(image).IsDefinitelyCpuDirty(),
             "fresh multisample target violated write-only ownership");
@@ -7561,7 +7569,7 @@ public:
       const bool replacement_changed = replacement != replacement_source_image;
       const bool replacement_gpu_before =
           texture_cache.GetImage(replacement).IsGpuModified();
-      const bool replacement_fault = resources.HandleFault(
+      const bool replacement_fault = GuestAccess(resources,
           PageFaultAccess::Write, base + replacement_offset + 0x1000);
       const bool replacement_gpu_after =
           texture_cache.GetImage(replacement).IsGpuModified();
@@ -7637,7 +7645,7 @@ public:
               mixed_owner.first != nullptr,
               "mixed CPU/GPU image source did not create a containing buffer");
       Require(name, "mixed-page CPU write fault",
-              resources.HandleFault(PageFaultAccess::Write,
+              GuestAccess(resources, PageFaultAccess::Write,
                                     base + mixed_source_offset),
               "mixed image source could not dirty its first page");
       std::memcpy(memory + mixed_source_offset, &mixed_cpu_value,
@@ -7700,7 +7708,7 @@ public:
                                             bridged_texel_size, 0, false);
       Require(
           name, "bridged CPU write fault",
-          resources.HandleFault(PageFaultAccess::Write,
+          GuestAccess(resources, PageFaultAccess::Write,
                                 base + bridged_cpu_offset),
           "bridged image source could not transfer its second owner to CPU");
       std::memcpy(memory + bridged_cpu_offset, bridged_cpu_values.data(),
@@ -18511,7 +18519,7 @@ private:
               const auto access =
                   info.access_violation_type == Exception::AccessViolationType::Write
                       ? PageFaultAccess::Write : PageFaultAccess::Read;
-              return LibKernel::Memory::HandleGpuFault(access, info.access_violation_vaddr);
+              return LibKernel::Memory::HandleMemoryFault(access, info.access_violation_vaddr);
             }),
             "failed to install the production guest-memory fault route");
     m_runtime_context.instance = m_instance;
