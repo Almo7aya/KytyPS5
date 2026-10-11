@@ -1036,6 +1036,9 @@ struct SrtTape {
 		std::vector<std::pair<uint32_t, uint32_t>> slots;
 	};
 	std::vector<Node>                          nodes;
+	// For a tape without control flow: the nodes a refresh computes, in evaluation order.
+	// Constant nodes are left out; their values are written once.
+	std::vector<uint32_t>                      order;
 	std::vector<std::pair<uint32_t, uint32_t>> slots; // flat offset, node
 	std::vector<Block>                         blocks;
 	// For a tape without control flow: per descriptor source, the node computing each DWORD as
@@ -1075,6 +1078,10 @@ public:
 				uint32_t node = 0;
 				if (!Slot(read, node)) return nullptr;
 				m_tape.slots.emplace_back(read.flat_offset, node);
+			}
+			// Nodes are emitted after their operands, so their indices are an evaluation order.
+			for (uint32_t index = 0; index < m_tape.nodes.size(); ++index) {
+				if (m_tape.nodes[index].op != Op::Const) m_tape.order.push_back(index);
 			}
 			MapDescriptors();
 			return std::make_shared<const SrtTape>(std::move(m_tape));
@@ -1145,7 +1152,7 @@ private:
 		for (size_t index = 0; index < count; ++index) {
 			ListEvaluationOrder(operands[index], listed, order);
 		}
-		order.push_back(node);
+		if (m_tape.nodes[node].op != Op::Const) order.push_back(node);
 	}
 
 	static Op BinaryOp(ValueOpcode opcode) {
@@ -1337,7 +1344,15 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 		return TapeResult::Unsupported;
 	}
 	auto& values = m_program.srt_tape_values;
-	values.resize(tape->nodes.size());
+	if (values.size() != tape->nodes.size()) {
+		// Constant nodes are written once; refreshes skip them.
+		values.assign(tape->nodes.size(), 0u);
+		for (size_t index = 0; index < tape->nodes.size(); ++index) {
+			if (tape->nodes[index].op == SrtTape::Op::Const) {
+				values[index] = tape->nodes[index].immediate;
+			}
+		}
+	}
 	// Every node's memo slot was assigned when the tape was compiled.
 	const auto memo_slots = m_program.evaluation_value_count;
 	if (m_context.values.size() < memo_slots) {
@@ -1402,7 +1417,7 @@ SrtWalker::TapeResult SrtWalker::RefreshFlatBufferTape(std::vector<uint32_t>& fl
 	if (tape->blocks.empty()) {
 		// The flat refresh opens the walkers' session and each node is listed once, so no value
 		// can be in their memos yet.
-		for (size_t index = 0; index < tape->nodes.size(); ++index) {
+		for (const auto index: tape->order) {
 			if (!compute(index)) return TapeResult::Failed;
 		}
 		flat.resize(m_program.srt_reads.size());
