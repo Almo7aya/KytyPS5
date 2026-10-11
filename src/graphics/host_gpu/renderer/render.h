@@ -113,6 +113,10 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	// Binds a graphics pipeline unless it is the one bound last. Code that binds a graphics
+	// pipeline through the native handle must call ForgetGraphicsPipeline.
+	void BindGraphicsPipeline(vk::Pipeline pipeline) const;
+	void ForgetGraphicsPipeline() const noexcept { m_graphics_pipeline = nullptr; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -142,8 +146,9 @@ private:
 	uint32_t            m_debug_arg2      = 0;
 	uint32_t            m_debug_arg3      = 0;
 	uint64_t            m_debug_arg4      = 0;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
+	mutable RenderState  m_render_state;
+	mutable bool         m_rendering         = false;
+	mutable vk::Pipeline m_graphics_pipeline = nullptr;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
