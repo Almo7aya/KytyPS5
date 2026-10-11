@@ -1108,6 +1108,18 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				image_descriptor_count += count;
 			}
 		}
+		if (program.has_address_writes) {
+			m_context.GetBufferCache().NoteAddressWrites();
+		}
+		// The draw writes its buffers from the command buffer recording now. They were obtained
+		// for writing earlier, and a submission can have come in between.
+		for (const auto& resource: program.info.buffers) {
+			if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
+			const auto& written = prepared->buffer_sources[resource.descriptor_index];
+			if (written.size != 0) {
+				m_context.GetBufferCache().NoteWrite(written.address, written.size);
+			}
+		}
 		const auto shader_stage = NativeShaderStage(program.stage);
 		push_stages |= shader_stage;
 		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&

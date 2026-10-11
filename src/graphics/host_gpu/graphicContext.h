@@ -49,6 +49,11 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// A queue for readbacks that must not wait behind the main queue: a transfer-only family's,
+	// whose copy engines run beside 3D work, else a second queue of the main family. Buffers
+	// are shared concurrently with a different readback family.
+	uint32_t  readback_family = static_cast<uint32_t>(-1);
+	vk::Queue readback_queue  = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

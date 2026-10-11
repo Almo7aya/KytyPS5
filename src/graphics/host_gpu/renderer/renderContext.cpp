@@ -145,7 +145,8 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.Finish();
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
-		m_buffer_cache.InvalidateMemory(vaddr, size);
+		// Only the unmapped range loses its backing; the rest of a buffer keeps its GPU data.
+		m_buffer_cache.InvalidateMemory(vaddr, size, true);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
