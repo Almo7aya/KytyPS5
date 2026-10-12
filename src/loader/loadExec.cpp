@@ -4,7 +4,9 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -88,12 +90,51 @@ int LoadExec(const char* path, const char* const argv[]) {
 		wide.resize(size - 1);
 		command += L" " + QuoteArgument(wide);
 	}
-	STARTUPINFOW startup {};
-	startup.cb = sizeof(startup);
+	// The new process writes where this one does: to its console, or to the files or pipes its
+	// output was redirected to. Only the standard handles are inherited.
+	HANDLE std_handles[3] = {GetStdHandle(STD_INPUT_HANDLE), GetStdHandle(STD_OUTPUT_HANDLE),
+	                         GetStdHandle(STD_ERROR_HANDLE)};
+	std::vector<HANDLE> inherited;
+	for (auto& handle: std_handles) {
+		if (handle == nullptr || handle == INVALID_HANDLE_VALUE ||
+		    !SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+			handle = nullptr;
+		} else if (std::find(inherited.begin(), inherited.end(), handle) == inherited.end()) {
+			inherited.push_back(handle);
+		}
+	}
+	SIZE_T attributes_size = 0;
+	InitializeProcThreadAttributeList(nullptr, 1, 0, &attributes_size);
+	std::vector<uint8_t> attributes_storage(attributes_size);
+	auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes_storage.data());
+	const bool inherit =
+	    !inherited.empty() && InitializeProcThreadAttributeList(attributes, 1, 0, &attributes_size);
+	const bool listed =
+	    inherit && UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+	                                         inherited.data(), inherited.size() * sizeof(HANDLE),
+	                                         nullptr, nullptr);
+	STARTUPINFOEXW startup {};
+	startup.StartupInfo.cb = sizeof(startup);
+	if (listed) {
+		startup.lpAttributeList        = attributes;
+		startup.StartupInfo.dwFlags    = STARTF_USESTDHANDLES;
+		startup.StartupInfo.hStdInput  = std_handles[0];
+		startup.StartupInfo.hStdOutput = std_handles[1];
+		startup.StartupInfo.hStdError  = std_handles[2];
+	}
+	// A process with a console shares it with the new one; without one, none is created.
+	const DWORD flags = (listed ? EXTENDED_STARTUPINFO_PRESENT : 0u) |
+	                    (GetConsoleWindow() != nullptr ? 0u : static_cast<DWORD>(CREATE_NO_WINDOW));
 	PROCESS_INFORMATION process {};
-	if (!CreateProcessW(executable, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
-	                    nullptr, nullptr, &startup, &process)) {
-		LOGF("LoadExec: process creation failed: %lu\n", GetLastError());
+	const bool          created =
+	    CreateProcessW(executable, command.data(), nullptr, nullptr, listed ? TRUE : FALSE, flags,
+	                   nullptr, nullptr, &startup.StartupInfo, &process) != 0;
+	const auto error = GetLastError();
+	if (inherit) {
+		DeleteProcThreadAttributeList(attributes);
+	}
+	if (!created) {
+		LOGF("LoadExec: process creation failed: %lu\n", error);
 		return SYSTEM_SERVICE_ERROR_INTERNAL;
 	}
 	CloseHandle(process.hThread);
