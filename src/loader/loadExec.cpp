@@ -59,7 +59,10 @@ int LoadExec(const char* path, const char* const argv[]) {
 		arguments.emplace_back(argv[i], size - 1);
 	}
 	LOGF("LoadExec: %s\n", path);
+	// The new program writes to the same outputs, so everything written so far goes out first.
+	// Neither exec nor quick_exit writes out buffered streams.
 	Log::Flush();
+	std::fflush(nullptr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	wchar_t    executable[32768] {};
 	const auto length = GetModuleFileNameW(nullptr, executable, 32768);
@@ -139,7 +142,6 @@ int LoadExec(const char* path, const char* const argv[]) {
 	}
 	CloseHandle(process.hThread);
 	CloseHandle(process.hProcess);
-	std::fflush(nullptr);
 	std::quick_exit(0);
 #else
 	std::ifstream            command("/proc/self/cmdline", std::ios::binary);
