@@ -58,7 +58,12 @@ int LoadExec(const char* path, const char* const argv[]) {
 		bytes += size;
 		arguments.emplace_back(argv[i], size - 1);
 	}
-	LOGF("LoadExec: %s\n", path);
+	// Shown on the console too: the output that follows comes from the new program.
+	auto message = fmt::format("LoadExec: switching to {}", path);
+	for (size_t i = 2; i < arguments.size(); ++i) {
+		message += fmt::format(" \"{}\"", arguments[i]);
+	}
+	Log::WriteToConsoleAndLog(message + "\n");
 	// The new program writes to the same outputs, so everything written so far goes out first.
 	// Neither exec nor quick_exit writes out buffered streams.
 	Log::Flush();
