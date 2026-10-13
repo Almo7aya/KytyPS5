@@ -128,6 +128,8 @@ int LoadExec(const char* path, const char* const argv[]) {
 	// A process with a console shares it with the new one; without one, none is created.
 	const DWORD flags = (listed ? EXTENDED_STARTUPINFO_PRESENT : 0u) |
 	                    (GetConsoleWindow() != nullptr ? 0u : static_cast<DWORD>(CREATE_NO_WINDOW));
+	// The new process continues this one's log file; it inherits the environment.
+	(void)SetEnvironmentVariableA(Log::RelaunchedVariable, "1");
 	PROCESS_INFORMATION process {};
 	const bool          created =
 	    CreateProcessW(executable, command.data(), nullptr, nullptr, listed ? TRUE : FALSE, flags,
@@ -159,8 +161,20 @@ int LoadExec(const char* path, const char* const argv[]) {
 		host_argv.push_back(argument.data());
 	}
 	host_argv.push_back(nullptr);
+	// The new program continues this one's log file. It is given its environment explicitly:
+	// setenv is not safe while other threads may read the environment.
+	const std::string  relaunched       = std::string(Log::RelaunchedVariable) + "=";
+	std::string        relaunched_entry = relaunched + "1";
+	std::vector<char*> environment;
+	for (char** variable = environ; variable != nullptr && *variable != nullptr; ++variable) {
+		if (!std::string_view(*variable).starts_with(relaunched)) {
+			environment.push_back(*variable);
+		}
+	}
+	environment.push_back(relaunched_entry.data());
+	environment.push_back(nullptr);
 	if (close_range(3, ~0u, CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) == 0) {
-		execvp(host_argv[0], host_argv.data());
+		execvpe(host_argv[0], host_argv.data(), environment.data());
 	}
 	LOGF("LoadExec failed: %s\n", std::strerror(errno));
 #endif
