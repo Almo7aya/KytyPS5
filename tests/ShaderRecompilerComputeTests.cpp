@@ -13523,6 +13523,18 @@ public:
         check_range(0x3000, "finite structured read preserves native range");
         value.dwords[2] = UINT32_MAX;
         check_range(mapped_tail, "read-only structured sentinel preserves smaller mapping");
+        // PPSA15246 writes through a sentinel whose tables precede it.
+        writer.info.buffers[0].written = true;
+        writer.info.buffers[0].read = false;
+        writer_snapshot.specialization_reads = {{address - 0x40, 0x40}};
+        reader_snapshot.specialization_reads.clear();
+        storage_limit = 0x2000;
+        check_range(storage_limit - (graphics.StorageMinAlignment() - 1),
+                    "unbounded write after its tables uses the read window");
+        Require(name, "write native range fits device", writer_bindings.buffers[0].range <= storage_limit,
+                "unbounded write exceeded the device storage range");
+        storage_limit = original_limit;
+        check_range(mapped_tail, "unbounded write after its tables preserves smaller mapping");
       }
 
       for (const auto format : {Prospero::BufferFormat::k8UNorm,
