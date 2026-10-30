@@ -11272,6 +11272,29 @@ void TestNewShaderRecompilerSetpcBranch() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerSetpcLongBranch() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSop1(0x1f, 106, 0),              // s_getpc_b64 vcc
+      EncodeSop2(0x00, 106, 106, 255), 0x14u, // s_add_u32 vcc_lo, vcc_lo, 0x14
+      EncodeSop2(0x04, 107, 107, 128),       // s_addc_u32 vcc_hi, vcc_hi, 0
+      EncodeSop1(0x21, 125, 106),            // s_swappc_b64 null, vcc
+      EncodeSMovB32(0, 129),                 // skipped
+      0xbf810000u,                           // s_endpgm at 0x18
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  const auto graph = CFG::BuildGraph(decoded);
+  const auto* jump = graph.FindBlockByPc(0u);
+  const auto* target = graph.FindBlockByPc(0x18u);
+  Check(jump != nullptr && target != nullptr &&
+            jump->terminator.kind == CFG::TerminatorKind::Branch &&
+            jump->terminator.true_block == target->id,
+        "S_GETPC/S_ADD/S_ADDC long jump through VCC missed its target");
+  CheckSpirvBinaryValidates(RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute)).spirv);
+}
+
 void TestFusedShaderHandoffPreservesRegisters() {
   using namespace ShaderRecompiler;
   uint32_t front[] = {
@@ -17365,6 +17388,7 @@ int main() {
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
+  TestNewShaderRecompilerSetpcLongBranch();
   TestGraphicsComputeGetreg();
   TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
