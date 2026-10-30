@@ -439,6 +439,16 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
              "noncontiguous descriptor DWORDs entered the table plan");
   Check(!malformed->program.resource_tracking_complete && malformed->program.descriptor_sources.empty(),
         "malformed image table tracking was not transactional");
+  auto aliased = MakeIndirectImageFixture(false, 48u, 0u, 16u, nested);
+  const auto image = std::ranges::find_if(*aliased->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetImageResource;
+  });
+  const auto *read = image->Arg(0).Resolve().TryInstruction();
+  aliased->Emit(ValueOpcode::ReferenceU32,
+                {aliased->Emit(ValueOpcode::ReadConstBuffer, {read->Arg(0), read->Arg(1)},
+                               read->Flags<uint64_t>())});
+  CheckFatal([&] { aliased->PlanAndTrack(); }, "not a valid runtime value",
+             "a descriptor read sharing its memory index entered the table plan");
 }
 
 void TestResidentImageHeap() {
