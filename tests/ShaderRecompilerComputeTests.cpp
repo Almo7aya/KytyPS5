@@ -7025,6 +7025,65 @@ public:
                   nullptr,
               "D16 uint sampling did not create an integer sampled view");
 
+      auto raw_d16_rg8_depth = raw_d16;
+      raw_d16_rg8_depth.info.data.address += 0x800;
+      const auto raw_d16_rg8_depth_image =
+          texture_cache.FindImage(raw_d16_rg8_depth);
+      (void)texture_cache.FindDepthTarget(raw_d16_rg8_depth_image,
+                                          raw_d16_rg8_depth);
+      auto &raw_d16_rg8_depth_native =
+          texture_cache.GetImage(raw_d16_rg8_depth_image);
+      raw_d16_rg8_depth_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                       vk::AccessFlagBits2::eTransferWrite, {},
+                                       scheduler.Current().Handle());
+      const vk::ClearDepthStencilValue raw_d16_rg8_clear{16384.0f / 65535.0f,
+                                                         0};
+      const vk::ImageSubresourceRange raw_d16_rg8_clear_range{
+          vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearDepthStencilImage(
+          raw_d16_rg8_depth_native.backing.image,
+          vk::ImageLayout::eTransferDstOptimal, &raw_d16_rg8_clear, 1,
+          &raw_d16_rg8_clear_range);
+      texture_cache.MarkGpuWritten(raw_d16_rg8_depth_image);
+      auto raw_d16_rg8 = raw_d16_uint;
+      raw_d16_rg8.info.data = raw_d16_rg8_depth.info.data;
+      raw_d16_rg8.info.pixel_format = vk::Format::eR8G8Unorm;
+      raw_d16_rg8.info.guest_format = Prospero::BufferFormat::k8_8UNorm;
+      raw_d16_rg8.view_info.format = vk::Format::eR8G8Unorm;
+      const auto raw_d16_rg8_image = texture_cache.FindImage(raw_d16_rg8);
+      Require(
+          name, "raw D16 8_8 texture backing",
+          raw_d16_rg8_image && raw_d16_rg8_image != raw_d16_rg8_depth_image &&
+              !TextureCacheTestAccess::Contains(texture_cache,
+                                                raw_d16_rg8_depth_image) &&
+              texture_cache.GetImage(raw_d16_rg8_image).backing.format ==
+                  vk::Format::eR8G8Unorm &&
+              texture_cache.FindTexture(raw_d16_rg8_image, raw_d16_rg8) !=
+                  nullptr,
+          "D16 sampled as 8_8 UNORM did not recreate a color backing");
+      auto raw_d16_rg8_readback =
+          CreateHostBuffer(name, sizeof(raw_d16_values),
+                           vk::BufferUsageFlagBits::eTransferDst, {0u});
+      auto &raw_d16_rg8_native = texture_cache.GetImage(raw_d16_rg8_image);
+      raw_d16_rg8_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                 vk::AccessFlagBits2::eTransferRead, {},
+                                 scheduler.Current().Handle());
+      vk::BufferImageCopy raw_d16_rg8_copy{};
+      raw_d16_rg8_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0,
+                                           0, 1};
+      raw_d16_rg8_copy.imageExtent = {2, 1, 1};
+      scheduler.Current().Handle().copyImageToBuffer(
+          raw_d16_rg8_native.backing.image,
+          vk::ImageLayout::eTransferSrcOptimal, raw_d16_rg8_readback.buffer, 1,
+          &raw_d16_rg8_copy);
+      HostReadBarrier(raw_d16_rg8_readback.buffer, raw_d16_rg8_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "raw D16 8_8 texture bytes",
+              ReadBuffer(name, raw_d16_rg8_readback, 1)[0] == 0x40004000u,
+              "D16 sampled as 8_8 UNORM lost the depth bytes");
+
       constexpr uint64_t layered_raw_d16_offset = raw_d16_offset + 0x1000;
       constexpr std::array<uint16_t, 12> layered_raw_d16_values{
           0x0102u, 0x0304u, 0x1112u, 0x1314u, 0x2122u, 0x2324u,
