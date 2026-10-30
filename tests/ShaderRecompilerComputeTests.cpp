@@ -52915,6 +52915,43 @@ void CheckPm4WaitResume(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4WaitResume");
 }
 
+void CheckPm4LodStats(RenderContext &renderer) {
+  constexpr const char *name = "Pm4LodStats";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+
+  // A 16-dword header, 256 two-dword slots and a guard the CP must leave unwritten.
+  constexpr uint32_t poison = 0xa5a5a5a5u;
+  alignas(64) std::array<uint32_t, 16 + 256 * 2 + 4> report{};
+  std::array<uint32_t, 5> packet{};
+  const auto run = [&](uint32_t size) {
+    report.fill(poison);
+    report[0] = 0;
+    CommandBufferLayout dcb{packet.data(), packet.data() + packet.size(), packet.data(),
+                            packet.data() + packet.size(), nullptr, nullptr, 0};
+    Pm4Execution execution;
+    return Gen5::AgcDcbGetLodStats(reinterpret_cast<Gen5::CommandBuffer *>(&dcb), 0,
+                                   report.data(), size, 0, 0, 0, 0) == packet.data() &&
+           processor.Process(execution, packet) == Pm4ProcessResult::Complete && report[0] != 0;
+  };
+  // Slots below the count report no samples (finest mip 15); everything after them is untouched.
+  const auto empty_slots = [&](uint32_t slots) {
+    for (uint32_t slot = 0; slot < slots; slot++) {
+      if (report[16 + slot * 2] != slot << 24u || report[17 + slot * 2] != 15u << 24u) {
+        return false;
+      }
+    }
+    return std::all_of(report.begin() + 16 + slots * 2, report.end(),
+                       [](uint32_t dw) { return dw == poison; });
+  };
+
+  Require(name, "full report", run(64 + 256 * 8 + 16) && empty_slots(256),
+          "report did not mark exactly 256 slots unsampled");
+  Require(name, "partial report", run(64 + 2 * 8 + 4) && empty_slots(2),
+          "report did not stop at the last whole slot in the buffer");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4MemSemaphore(RenderContext &renderer) {
   constexpr const char *name = "Pm4MemSemaphore";
   Loader::SymbolDatabase symbols;
@@ -54030,6 +54067,7 @@ int main(int argc, char **argv) {
     CheckPm4AcquireMemPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitPackets(vulkan.RuntimeRenderer());
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
+    CheckPm4LodStats(vulkan.RuntimeRenderer());
     CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -54341,6 +54379,7 @@ int main(int argc, char **argv) {
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
   CheckPm4IndirectControlFlow(vulkan.RuntimeRenderer());
   CheckPm4WaitResume(vulkan.RuntimeRenderer());
+  CheckPm4LodStats(vulkan.RuntimeRenderer());
   CheckPm4MemSemaphore(vulkan.RuntimeRenderer());
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
