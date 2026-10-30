@@ -319,7 +319,7 @@ void TestInvariantIndirectImageMaterialization(bool nested) {
   fixture->PlanAndTrack();
   auto plan = ExtractResourcePlan(fixture->program);
   EliminateDeadCode(fixture->program.blocks);
-  ValidateProgram(fixture->program, true);
+  ValidateProgram(fixture->program);
   const auto &source = *plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
   Check(!source.selector && fixture->program.info.buffers.size() == (nested ? 3u : 2u) &&
             std::ranges::any_of(*fixture->block, [](const Inst &inst) {
@@ -7589,7 +7589,7 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
   Check(sampler_words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
         "host descriptor selection changed the GPU Phi");
   EliminateDeadCode(fixture.program.blocks);
-  ValidateProgram(fixture.program, true);
+  ValidateProgram(fixture.program);
   return ExtractResourcePlan(fixture.program);
 }
 
@@ -7855,7 +7855,7 @@ void TestFiniteImageWaterfall() {
     fixture->PlanAndTrack();
     const auto plan = ExtractResourcePlan(fixture->program);
     EliminateDeadCode(fixture->program.blocks);
-    ValidateProgram(fixture->program, true);
+    ValidateProgram(fixture->program);
     const auto& finite = plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor;
     Check(finite && finite->sources.size() == 3u,
           "waterfall image selection mixed descriptor words or lost a candidate");

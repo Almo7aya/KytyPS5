@@ -12778,7 +12778,7 @@ void TestTypedEntryStateIsMinimal() {
     IR::RewriteToSsa(values.blocks);
     IR::RemoveIdentities(values);
     IR::EliminateDeadCode(values.blocks);
-    IR::ValidateProgram(values, true);
+    IR::ValidateProgram(values);
   };
 
   check(32u);
@@ -12799,12 +12799,41 @@ void TestFinalSsaRejectsRegisterStatePseudos() {
     } else {
       ir.Emit(ValueOpcode::ReferenceU32, {ir.GetScalarReg(ScalarReg{0})});
     }
-    ExpectFatal([&] { ValidateProgram(program, true); },
+    ExpectFatal([&] { ValidateProgram(program); },
                 "final SSA accepted a register-state pseudo operation");
   };
 
   check_rejected(false);
   check_rejected(true);
+}
+
+void TestEmitterValidatesFinalProgram() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeMubuf0(0x1c, 0, false), // buffer_store_dword v0
+      EncodeMubuf1(0, 12, 0),
+      0xbf810000u,
+  };
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  // Only emission validates, so a definition moved below its same-block user must be fatal.
+  bool moved = false;
+  for (auto *block : result.program.blocks) {
+    auto &list = block->Instructions();
+    for (auto user = list.begin(); !moved && user != list.end(); ++user) {
+      for (size_t arg = 0; !moved && arg < user->NumArgs(); ++arg) {
+        const auto *def = user->Arg(arg).TryInstruction();
+        if (def == nullptr || def->Parent() != block) continue;
+        const auto where = std::ranges::find_if(
+            list, [&](const IR::Inst &inst) { return &inst == def; });
+        list.splice(std::next(user), list, where);
+        moved = true;
+      }
+    }
+  }
+  Check(moved, "emitter fixture has no same-block definition");
+  ExpectFatal([&] { Spirv::EmitProgram(result.program, options.input_info); },
+              "SPIR-V emission accepted a use before its definition");
 }
 #endif
 
@@ -12888,7 +12917,7 @@ void TestValuePhiValidation() {
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   const auto expect_invalid = [](const Program &program, const char *text) {
-    ExpectFatal([&] { ValidateProgram(program, true); }, text);
+    ExpectFatal([&] { ValidateProgram(program); }, text);
   };
 #endif
   const auto validate = [&](InvalidPhi invalid) {
@@ -12940,7 +12969,7 @@ void TestValuePhiValidation() {
     }
 
     if (invalid == InvalidPhi::None) {
-      ValidateProgram(program, true);
+      ValidateProgram(program);
     }
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
     else {
@@ -13306,7 +13335,7 @@ void TestLaneMaskProjection() {
               gated_raw_consumer.Resolve().TryInstruction()->Arg(0).Resolve() == gated_mask.Resolve(),
           "mask projection changed a raw scalar mask consumer");
     RemoveIdentities(program);
-    ValidateProgram(program, true);
+    ValidateProgram(program);
   }
 }
 
@@ -13376,7 +13405,7 @@ void TestLateConstantPropagation() {
             "late constants did not reach Phi, nested mask patterns or new logical nodes");
       RemoveIdentities(program);
       Check(exit->condition == Value(true), "late constant lost its control-flow use");
-      ValidateProgram(program, true);
+      ValidateProgram(program);
     }
   }
 
@@ -13586,7 +13615,7 @@ void TestNativeWideValueValidation() {
     }
   };
   const auto check_rejected = [](const Program &program, const char *text) {
-    ExpectFatal([&] { ValidateProgram(program, true); }, text);
+    ExpectFatal([&] { ValidateProgram(program); }, text);
   };
 
   {
@@ -17404,6 +17433,7 @@ int main() {
   TestTypedEntryStateIsMinimal();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestFinalSsaRejectsRegisterStatePseudos();
+  TestEmitterValidatesFinalProgram();
 #endif
   TestSsaRewriteSealsFilledBlocks();
   TestValuePhiValidation();

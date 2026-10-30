@@ -788,7 +788,7 @@ void TestCompleteWaveReduction() {
       fixture.BlockAt().terminator.kind = Terminator::Branch;
       fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
     }
-    ValidateProgram(fixture.program, true);
+    ValidateProgram(fixture.program);
     // The pipeline folds full-EXEC predicates to true before eliminating reads.
     const uint32_t wave_size = test == Case::Wave32 || rows ? 32u : 64u;
     ConstantPropagationPass(fixture.program.blocks, wave_size);
@@ -812,7 +812,7 @@ void TestCompleteWaveReduction() {
       }
       Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
             "wave reduction destroyed an independently consumed prefix or kept its dead suffix");
-      ValidateProgram(fixture.program, true);
+      ValidateProgram(fixture.program);
     } else {
       Check(use.Instruction()->Arg(0).Resolve() == result,
             "rejected wave reduction proof changed its original result");
@@ -873,7 +873,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
 
   Check(entry_info.condition == Value(true),
         "folded branch condition did not survive identity removal");
-  ValidateProgram(fixture.program, true);
+  ValidateProgram(fixture.program);
 }
 
 void TestDeadPhiCyclesAndPlanningRoots() {

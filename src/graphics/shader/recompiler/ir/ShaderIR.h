@@ -751,7 +751,7 @@ uint32_t StorageBufferElementBits(const Program& program, const MemoryInfo& memo
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
-void  ValidateProgram(const Program& program, bool require_ssa);
+void  ValidateProgram(const Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 bool  EquivalentSelectorDomain(const ResourcePlan& program,
                                const DescriptorSource::IndirectDescriptor& left,
