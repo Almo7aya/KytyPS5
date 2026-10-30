@@ -12712,6 +12712,15 @@ public:
             DecodeColorDwordFill(vk::Format::eR16G16B16A16Uint, 0x22221111u, clear) &&
                 clear.uint32[2] == 0x1111u && clear.uint32[3] == 0x2222u,
             "a DWORD fill did not repeat across the 64-bit pixel");
+    std::array<TileSizeOffset, 16> chain{};
+    TileSizeAlign chain_size{};
+    Require(name, "DCC mip chain layout",
+            TileGetDccSize(512, 256, 2, 8, 5, Prospero::TileMode::kRenderTarget, chain_size, 0,
+                           chain.data()) &&
+                chain_size.size == 0x8000 && chain[0].offset == 0x3000 &&
+                chain[1].offset == 0x2000 && chain[2].offset == 0x1000 && chain[3].offset == 0 &&
+                chain[3].size == 0x1000 && chain[4].size == 0,
+            "a DCC slice did not store its mips backwards after the first tail mip's block");
     constexpr uintptr_t base = 0x0000000204100000ull;
     constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
@@ -12727,6 +12736,7 @@ public:
       bool eliminate_fast_clear = false;
       uint32_t samples_log2 = 0;
       bool goat = false;
+      bool dcc_mips = false;
     };
     constexpr std::array cases{
         FillCase{0x40404040u, {0, 0x3c000000u}},
@@ -12767,6 +12777,8 @@ public:
         FillCase{.fill = 0, .texel = {0, 0x3c000000u}, .cmask = true,
                  .eliminate_fast_clear = true, .samples_log2 = 2},
         FillCase{.fill = 0x40404040u, .texel = {0, 0x3c000000u}, .eliminate_fast_clear = true},
+        FillCase{.fill = 0x40404040u, .texel = {0, 0x3c000000u}, .reuse_mips = true,
+                 .dcc_mips = true},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -12832,13 +12844,19 @@ public:
       const auto bytes_per_pixel = TextureGetRenderTargetFormat(
           layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
-      const uint32_t selected_layer = fill_case.cmask || fill_case.eliminate_fast_clear ? 1 : 0;
+      const uint32_t selected_layer =
+          fill_case.cmask || fill_case.eliminate_fast_clear || fill_case.dcc_mips ? 1 : 0;
       TileSizeAlign dcc_size{};
-      (void)TileGetDccSize(512, 256, selected_layer + 1, bytes_per_pixel, 1,
-                          Prospero::TileMode::kRenderTarget, dcc_size, fill_case.samples_log2);
-      const uint64_t dcc_address = base + (fill_case.samples_log2 != 0 ? 0x800000 :
-                                          fill_case.eliminate_fast_clear ? 0x200000 :
-                                          fill_case.reuse_mips ? 0x160000 : 0x100000);
+      (void)TileGetDccSize(512, 256, selected_layer + 1, bytes_per_pixel,
+                          fill_case.dcc_mips ? 2 : 1, Prospero::TileMode::kRenderTarget, dcc_size,
+                          fill_case.samples_log2);
+      uint64_t dcc_offset = fill_case.reuse_mips ? 0x300000 : 0x100000;
+      if (fill_case.samples_log2 != 0) {
+        dcc_offset = 0x800000;
+      } else if (fill_case.eliminate_fast_clear) {
+        dcc_offset = 0x200000;
+      }
+      const uint64_t dcc_address = base + dcc_offset;
       const uint64_t metadata_size = fill_case.cmask ? 0x2000 : dcc_size.size;
       const std::vector<u32> expected(
           fill_case.texel.begin(), fill_case.texel.begin() + std::max(bytes_per_pixel / 4u, 1u));
@@ -12862,7 +12880,8 @@ public:
                                    .last_array_slice_index = selected_layer});
         registers.SetColorAttrib(0, {.num_samples = fill_case.samples_log2,
                                      .num_fragments = fill_case.samples_log2});
-        registers.SetColorAttrib2(0, {.height = 255, .width = 511});
+        registers.SetColorAttrib2(
+            0, {.height = 255, .width = 511, .num_mip_levels = fill_case.dcc_mips ? 1u : 0u});
         registers.SetColorAttrib3(0,
                                   {.tile_mode = Prospero::TileMode::kRenderTarget,
                                    .dimension = 1,
@@ -12909,7 +12928,7 @@ public:
             clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 0.0f};
             TextureCacheTestAccess::ClearImage(
                 texture_cache, scheduler.Current(), preexisting_id,
-                {vk::ImageAspectFlagBits::eColor, 0, 2, 0, 1}, clear);
+                {vk::ImageAspectFlagBits::eColor, 0, 2, 0, selected_layer + 1}, clear);
           }
           if (fill_case.eliminate_fast_clear) {
             vk::ClearValue stale{};
@@ -12963,7 +12982,10 @@ public:
           Require(name, "expanded metadata readback",
                   LibKernel::Memory::TryReadBacking(dcc_address, bytes.data(), bytes.size()),
                   "native color metadata could not be read back");
-          const auto selected = bytes.begin() + metadata_size * selected_layer / (selected_layer + 1);
+          // Mip 1's metadata block precedes mip 0's in each slice.
+          const auto selected = bytes.begin() +
+                                metadata_size * selected_layer / (selected_layer + 1) +
+                                (fill_case.dcc_mips ? 0x1000 : 0);
           Require(name, "selected metadata slice expansion",
                   std::all_of(bytes.begin(), selected,
                       [&](uint8_t v) { return v == static_cast<uint8_t>(fill_case.fill); }) &&
@@ -13055,12 +13077,12 @@ public:
           const auto &image = texture_cache.GetImage(color.image_id);
           Require(name, "single-mip clear reuses mip chain",
                   color.image_id == preexisting_id && image.info.resources.levels == 2 &&
-                      color.desc.info.resources.levels == 1 &&
+                      color.desc.info.resources.levels == (fill_case.dcc_mips ? 2u : 1u) &&
                       color.desc.view_info.base_level == 0 && color.desc.view_info.level_count == 1,
                   "the single-mip target did not retain its cached image and view scope");
           Require(name, "single-mip clear preserves higher mip",
                   ReadCachedTexel(name, context, color.image_id, {255, 127, 0},
-                                  {1, 1, 1}, 0, 1) ==
+                                  {1, 1, 1}, selected_layer, 1) ==
                       std::vector<u32>{0x00003c00u, 0x00003c00u},
                   "clearing mip zero changed its higher mip");
         }
@@ -13269,6 +13291,58 @@ public:
         Require(name, "native color clear after HTile reuse", read_texel() == expected,
                 "the former HTile entry swallowed the native color metadata fill");
         check_expanded_metadata();
+        if (fill_case.dcc_mips) {
+          // A layered view checks and expands each slice's mip-0 run, one slice apart.
+          registers.SetColorView(0, {.base_array_slice_index = 0, .last_array_slice_index = 1});
+          RenderExecutorTestAccess::ResetBindings(executor);
+          RenderExecutorTestAccess::ResolveRenderColorTarget(
+              executor, scheduler.Current(), color, 0);
+          fill_metadata(metadata_words);
+          bind();
+          context.GetBufferCache().ReadMemory(dcc_address, metadata_size, false);
+          std::vector<uint8_t> bytes(metadata_size);
+          bool runs = LibKernel::Memory::TryReadBacking(dcc_address, bytes.data(), bytes.size());
+          for (uint64_t i = 0; i < bytes.size(); i++) {
+            runs &= bytes[i] == ((i & 0x1000) != 0 ? 0xff : static_cast<uint8_t>(fill_case.fill));
+          }
+          Require(name, "layered mip-0 clear",
+                  runs && read_texel() == expected &&
+                      ReadCachedTexel(name, context, color.image_id, {}, {1, 1, 1}, 0) == expected,
+                  "a layered mip view missed a slice or expanded another mip's metadata");
+          // A one-mip target at mip 1's address reads its own metadata and clears that mip.
+          const auto chain_id = color.image_id;
+          const uint64_t mip_dcc = dcc_address + 0x10000;
+          registers.SetColorAttrib2(0, {.height = 127, .width = 255});
+          registers.SetColorView(0, {});
+          registers.SetColorDccAddr(0, {.addr = mip_dcc});
+          WriteMetadata(context, mip_dcc, 0x1000, fill_case.fill);
+          RenderExecutorTestAccess::ResetBindings(executor);
+          RenderExecutorTestAccess::ResolveRenderColorTarget(
+              executor, scheduler.Current(), color, 0);
+          Require(name, "one-mip clear of a cached mip",
+                  color.image_id == chain_id && color.desc.view_info.base_level == 1 &&
+                      ReadCachedTexel(name, context, chain_id, {}, {1, 1, 1}, 0, 1) == expected,
+                  "a one-mip target matched to a cached mip skipped its metadata clear");
+          // A volume's mip-1 view clears that mip's depth slices from their first tail blocks.
+          constexpr uint64_t volume_dcc = base + 0x320000;
+          auto volume = color.desc;
+          volume.type = BindingType::Texture;
+          volume.info.data = {base + 0x400000, 0};
+          volume.info.type = Prospero::ImageType::kColor3D;
+          volume.info.extent = {128, 64, 4};
+          volume.info.resources = {2, 1};
+          volume.info.UpdateSize();
+          volume.info.metadata.range = {volume_dcc, 0x8000};
+          volume.view_info.type = vk::ImageViewType::e3D;
+          volume.view_info.base_level = 1;
+          volume.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          WriteMetadata(context, volume_dcc, 0x8000, fill_case.fill);
+          const auto volume_id = texture_cache.FindImage(volume);
+          Require(name, "volume mip clear",
+                  ReadCachedTexel(name, context, volume_id, {0, 0, 1}, {1, 1, 1}, 0, 1) ==
+                      expected,
+                  "a volume mip view missed its depth slices' clear");
+        }
         RenderExecutorTestAccess::ResetBindings(executor);
         resources.UnmapMemory(base, allocation_size);
         scheduler.Finish();

@@ -630,19 +630,20 @@ TileManager::Result TileManager::TransformColor(Result input, ColorTransform tra
 	return result;
 }
 
-vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32_t keys,
-                                        bool expand) {
+vk::Buffer TileManager::CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
+                                        uint32_t keys, bool expand) {
 	struct Check {
 		uint32_t metadata_base;
 		uint32_t words;
+		uint32_t stride;
 		uint32_t keys;
 		uint32_t expand;
 	};
 	static_assert(sizeof(Check) <= sizeof(Conversion));
 	const uint32_t max_slices =
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers;
-	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % (4ull * slices) != 0 ||
-	        metadata.size / 4 > UINT32_MAX);
+	EXIT_IF(slices == 0 || slices > max_slices || metadata.size % 4 != 0 || stride % 4 != 0 ||
+	        metadata.size / 4 > UINT32_MAX || stride * (slices - 1) >= metadata.size);
 	if (m_color_clear == nullptr) {
 		m_color_clear      = CreatePipeline(GPU_TILER_COLOR_CLEAR_SPV, nullptr);
 		m_clear_predicates = std::make_unique<Buffer>(
@@ -673,8 +674,9 @@ vk::Buffer TileManager::CheckColorClear(Result metadata, uint32_t slices, uint32
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_color_clear);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
-	const Check push {source.base, static_cast<uint32_t>(metadata.size / 4 / slices), keys,
-	                  expand};
+	const Check push {source.base,
+	                  static_cast<uint32_t>((metadata.size - stride * (slices - 1)) / 4),
+	                  static_cast<uint32_t>(stride / 4), keys, expand};
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
 	command.dispatch(slices, 1, 1);
