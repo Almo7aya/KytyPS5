@@ -119,7 +119,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		// Null descriptors read zero and drop writes, with or without shader bounds checks.
+		return {nullptr, 0, vk::WholeSize};
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
@@ -1017,7 +1018,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					case BindingKind::Buffers:
 						EXIT_IF(descriptors.buffers.size() != write.descriptorCount);
 						for (const auto& view: descriptors.buffers) {
-							EXIT_IF(view.buffer == nullptr);
+							EXIT_IF(view.range == 0);
 						}
 						write.pBufferInfo = descriptors.buffers.data();
 						break;

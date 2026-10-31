@@ -11741,6 +11741,35 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // An empty binding is a null descriptor, so loads and stores without shader checks touch no memory.
+  void CheckNullStorageBufferDescriptor() {
+    constexpr const char *name = "NullStorageBufferDescriptor";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &executor = context.GetRenderExecutor();
+    ShaderModule module;
+    auto &program = module.info;
+    program.stage = ShaderType::Compute;
+    program.info.buffers.push_back({.packed_stride = 1, .written = true});
+    program.info.buffers[0].descriptor_index = 0;
+    program.bindings.descriptor_counts[0] = 1;
+    program.bindings.descriptor_mask = 1;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.buffers.emplace_back().dword_count = 4;
+    ShaderStageRuntime runtime{&module, &snapshot};
+    PreparedBindings bindings;
+    executor.PrepareBindings(runtime, bindings);
+    std::array<PreparedBindings *, 1> stages{&bindings};
+    executor.FindBuffers(stages);
+    executor.RebindBuffers(bindings);
+    const auto &view = bindings.buffers[0];
+    Require(name, "null descriptor",
+            view.buffer == nullptr && view.offset == 0 && view.range == vk::WholeSize &&
+                bindings.shader_data[program.bindings.MemorySizeDword()] == 0,
+            "an empty storage binding was not a zero-length null descriptor");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckZeroStrideBufferBinding() {
     constexpr const char *name = "ZeroStrideBufferBinding";
     constexpr uintptr_t base = 0x0000000204c00000ull;
@@ -18434,6 +18463,10 @@ public:
     pipeline_info.sType = vk::StructureType::eComputePipelineCreateInfo;
     pipeline_info.stage = stage;
     pipeline_info.layout = pipeline_layout;
+    // The device leaves out-of-range storage accesses to the shader; robust profiles drop the checks.
+    vk::PipelineRobustnessCreateInfoEXT robustness{};
+    robustness.storageBuffers = vk::PipelineRobustnessBufferBehaviorEXT::eRobustBufferAccess2;
+    if (test.profile->robust_buffer_access) pipeline_info.pNext = &robustness;
     vk::Pipeline pipeline = nullptr;
     RequireVk(test.name, "dispatch",
               m_device.createComputePipelines(nullptr, 1, &pipeline_info,
@@ -22165,14 +22198,25 @@ private:
     available_maintenance8.pNext = &available_min_lod;
     vk::PhysicalDeviceShaderClockFeaturesKHR available_clock{};
     available_clock.pNext = &available_maintenance8;
+    vk::PhysicalDevicePipelineRobustnessFeaturesEXT available_pipeline_robustness{};
+    available_pipeline_robustness.pNext = &available_clock;
     vk::PhysicalDeviceRobustness2FeaturesEXT available_robustness2{};
-    available_robustness2.pNext = &available_clock;
+    available_robustness2.pNext = &available_pipeline_robustness;
     vk::PhysicalDeviceFeatures2 available_features2{};
     available_features2.sType = vk::StructureType::ePhysicalDeviceFeatures2;
     available_features2.pNext = &available_robustness2;
     m_physical_device.getFeatures2(&available_features2);
+    vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties{};
+    vk::PhysicalDeviceProperties2 properties2{};
+    properties2.pNext = &robustness2_properties;
+    m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    Require("VulkanHarness", "dispatch",
+            available_robustness2.robustBufferAccess2 == true &&
+                available_pipeline_robustness.pipelineRobustness == true &&
+                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+            "byte-granular per-pipeline robustBufferAccess2 is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
             "shaderStorageImageWriteWithoutFormat is not supported");
@@ -22304,9 +22348,12 @@ private:
     shader_clock.shaderDeviceClock = true;
     shader_clock.pNext = &min_lod;
     maintenance8.pNext = &shader_clock;
+    vk::PhysicalDevicePipelineRobustnessFeaturesEXT pipeline_robustness{};
+    pipeline_robustness.pipelineRobustness = true;
+    pipeline_robustness.pNext = &maintenance8;
     vk::PhysicalDeviceRobustness2FeaturesEXT robustness2{};
     robustness2.nullDescriptor = true;
-    robustness2.pNext = &maintenance8;
+    robustness2.pNext = &pipeline_robustness;
     vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering{};
     conditional_rendering.conditionalRendering = true;
     conditional_rendering.pNext = &robustness2;
@@ -22333,6 +22380,7 @@ private:
         VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
         VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
         VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+        VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME,
         VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
         VK_KHR_SHADER_CLOCK_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
@@ -33949,6 +33997,162 @@ TestCase BufferSubwordStoresAtHostOffset(u32 bytes) {
   test.has_compute_info = true;
   test.opcodes = {O::V_MOV_B32, bytes == 1 ? O::BUFFER_STORE_BYTE : O::BUFFER_STORE_SHORT,
                   O::S_ENDPGM};
+  return test;
+}
+
+constexpr ShaderProfile RobustBufferProfile{.maintenance8 = true, .robust_buffer_access = true};
+
+// A 20-byte binding ends inside each access: dwords, bytes and stores past it read zero or drop,
+// whether the shader checks the bounds or the pipeline does.
+TestCase BufferTailAccesses(u32 wave_size, bool robust) {
+  using O = ShaderOpcode;
+  TestCase test;
+  constexpr const char *names[2][2] = {
+      {"CheckedBufferTailAccessesWave32", "CheckedBufferTailAccessesWave64"},
+      {"RobustBufferTailAccessesWave32", "RobustBufferTailAccessesWave64"}};
+  test.name = names[robust][wave_size == 64];
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 8);
+  code.insert(code.end(), {EncodeMubuf0(0x0eu), EncodeMubuf1(0, 0, 20),
+                           EncodeSmem0(0x0au, 24), EncodeSmem1(8, 125)});
+  for (const auto [opcode, dst, offset] : {std::array{0x0au, 4u, 18u}, std::array{0x08u, 5u, 19u},
+                                           std::array{0x0au, 6u, 20u}}) {
+    AppendVMovU32(&code, 21, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(dst, 0, 21)});
+  }
+  for (u32 i = 0; i < 4; ++i) AppendVMovLiteral(&code, 8 + i, 0x50000000u + i);
+  AppendVMovU32(&code, 22, 12);
+  code.insert(code.end(), {EncodeMubuf0(0x1eu), EncodeMubuf1(8, 0, 22)});
+  AppendVMovLiteral(&code, 12, 0x123456eeu);
+  for (const auto [opcode, offset] : {std::array{0x18u, 4u}, std::array{0x1au, 20u},
+                                      std::array{0x18u, 21u}}) {
+    AppendVMovU32(&code, 22, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(12, 0, 22)});
+  }
+  for (u32 i = 0; i < 7; ++i) AppendStoreVgpr(&code, i, i);
+  for (u32 i = 0; i < 4; ++i) AppendStoreSgpr(&code, 24 + i, 7 + i);
+  AppendEnd(&code);
+
+  test.initial = {0x10101010u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44332211u,
+                  0xc5c5c5c5u, 0xc6c6c6c6u, 0xc7c7c7c7u};
+  test.initial.resize(8 + 16);
+  test.expected = test.initial;
+  test.expected[1] = 0x111111eeu;
+  test.expected[3] = 0x50000000u;
+  test.expected[4] = 0x50000001u;
+  const std::array<u32, 11> outputs{0x22222222u, 0x33333333u, 0x44332211u, 0, 0x4433u, 0x44u, 0,
+                                     0x22222222u, 0x33333333u, 0x44332211u, 0};
+  std::copy(outputs.begin(), outputs.end(), test.expected.begin() + 8);
+  test.user_data = MakeStructuredStorageBufferData(0, 20);
+  test.user_data[50] = 64;
+  test.user_data[51] = test.user_data[3];
+  test.has_user_data = true;
+  test.storage_buffer_ranges = {{0, 20}, {32, 64}};
+  // A full wave needs no lane compare, so OpULessThan comes only from bounds checks.
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = static_cast<uint8_t>(wave_size);
+  test.has_compute_info = true;
+  // Robust pipelines bound these accesses themselves; the checked shader compares every one.
+  if (robust) {
+    test.profile = &RobustBufferProfile;
+    test.forbidden_spirv = {"OpULessThan"};
+  } else {
+    test.required_spirv = {"OpULessThan"};
+  }
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_UBYTE, O::BUFFER_STORE_DWORDX4,
+                  O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+// Robust pipelines leave out-of-range atomic results undefined, so atomics keep their checks.
+TestCase RobustBufferAtomicOutOfRange() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "RobustBufferAtomicOutOfRange";
+  auto &code = test.code;
+  AppendVMovU32(&code, 1, 5);
+  for (const auto [dst, offset] : {std::array{0u, 16u}, std::array{2u, 20u}}) {
+    AppendVMovU32(&code, 21, offset);
+    code.insert(code.end(), {EncodeVop1(0x01, dst, Vgpr(1)),
+                             EncodeMubuf0(0x32u, 0, false, true, true), EncodeMubuf1(dst, 0, 21)});
+  }
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendEnd(&code);
+  test.initial = {0x10u, 0x11u, 0x12u, 0x13u, 0x14u, 0xc5u};
+  test.initial.resize(8 + 16);
+  test.expected = test.initial;
+  test.expected[4] = 0x19u;
+  test.expected[8] = 0x14u;
+  test.expected[9] = 0;
+  test.user_data = MakeStructuredStorageBufferData(0, 20);
+  test.user_data[50] = 64;
+  test.user_data[51] = test.user_data[3];
+  test.has_user_data = true;
+  test.storage_buffer_ranges = {{0, 20}, {32, 64}};
+  // One wave32 thread needs no lane compare, so OpULessThan comes only from bounds checks.
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.profile = &RobustBufferProfile;
+  test.required_spirv = {"OpULessThan"};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// Guest offsets near 2^32 index past the end of every view: they read zero and drop stores
+// instead of wrapping onto the bytes before the descriptor offset or onto the host prefix.
+TestCase RobustBufferWrappedAddresses(u32 prefix) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = prefix == 0 ? "RobustBufferWrappedAddresses" : "RobustBufferWrappedAddressesOffset";
+  auto &code = test.code;
+  for (const auto [opcode, dst, offset] :
+       {std::array{0x0cu, 0u, 0xfffffffcu}, std::array{0x0au, 1u, 0xfffffffeu},
+        std::array{0x08u, 2u, 0xffffffffu}}) {
+    AppendVMovLiteral(&code, 20, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(dst, 0, 20)});
+  }
+  // s32 holds a runtime offset, s30 one the recompiler folds.
+  AppendSMovLiteral(&code, 30, 0xfffffffcu);
+  code.insert(code.end(), {EncodeSmem0(0x08u, 24), EncodeSmem1(0, 32), EncodeSmem0(0x08u, 25),
+                           EncodeSmem1(0, 30)});
+  AppendVMovLiteral(&code, 8, 0x5a5a5a5au);
+  for (const auto [opcode, offset] : {std::array{0x1cu, 0xfffffffcu},
+                                      std::array{0x1au, 0xfffffffeu},
+                                      std::array{0x18u, 0xffffffffu}}) {
+    AppendVMovLiteral(&code, 20, offset);
+    code.insert(code.end(), {EncodeMubuf0(opcode), EncodeMubuf1(8, 0, 20)});
+  }
+  for (u32 i = 0; i < 3; ++i) AppendStoreVgpr(&code, i, i);
+  for (u32 i = 0; i < 2; ++i) AppendStoreSgpr(&code, 24 + i, 3 + i);
+  AppendEnd(&code);
+
+  // Outputs fill dwords 0-4 and guest bytes start at dword 16, so a 32-bit wrap would land on
+  // dword 15 or 16.
+  test.initial.resize(24);
+  for (u32 i = 0; i < test.initial.size(); ++i) test.initial[i] = 0x01010101u * (i + 1);
+  test.expected = test.initial;
+  std::fill_n(test.expected.begin(), 5, 0u);
+  test.user_data = MakeStructuredStorageBufferData(0, 16);
+  test.user_data[32] = 0xfffffffcu;
+  test.user_data[50] = 32;
+  test.user_data[51] = test.user_data[3];
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {prefix};
+  test.storage_buffer_ranges = {{64, 16 + prefix}, {0, 32}};
+  test.compute_info.threads_num[0] = test.compute_info.threads_num[1] =
+      test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.profile = &RobustBufferProfile;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_LOAD_USHORT,
+                  O::BUFFER_LOAD_UBYTE, O::S_BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::BUFFER_STORE_SHORT, O::BUFFER_STORE_BYTE, O::S_ENDPGM};
   return test;
 }
 
@@ -46826,6 +47030,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordIdxenUsesDescriptorStride);
   AddCase(BufferStoreDwordAppliesHostOffset);
+  for (const u32 wave : {32u, 64u}) {
+    for (const bool robust : {false, true}) cases.push_back(BufferTailAccesses(wave, robust));
+  }
+  for (const u32 prefix : {0u, 4u}) cases.push_back(RobustBufferWrappedAddresses(prefix));
+  AddCase(RobustBufferAtomicOutOfRange);
   cases.push_back(BufferOffsetsUsePackedWords(false));
   cases.push_back(BufferOffsetsUsePackedWords(true));
   AddCase(BufferLoadVariants);
@@ -53785,6 +53994,16 @@ int main(int argc, char **argv) {
     vulkan.CheckDescriptorHeapLargeSet();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--robust-buffer-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNullStorageBufferDescriptor();
+    for (const u32 wave : {32u, 64u}) {
+      for (const bool robust : {false, true}) RunCase(&vulkan, BufferTailAccesses(wave, robust));
+    }
+    for (const u32 prefix : {0u, 4u}) RunCase(&vulkan, RobustBufferWrappedAddresses(prefix));
+    RunCase(&vulkan, RobustBufferAtomicOutOfRange());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--push-constant-bank-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGraphicsPushConstantBank();
@@ -54432,6 +54651,7 @@ int main(int argc, char **argv) {
   CheckShaderStore(vulkan);
   vulkan.CheckOrderedDispatch();
   vulkan.CheckZeroStrideBufferBinding();
+  vulkan.CheckNullStorageBufferDescriptor();
   vulkan.CheckNullTextureDescriptors();
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckBdaSyncUploads();

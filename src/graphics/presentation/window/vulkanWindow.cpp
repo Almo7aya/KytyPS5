@@ -574,8 +574,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
 	properties11.pNext = &subgroup_size_control;
 
+	vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+	robustness2_properties.pNext = &properties11;
 	vk::PhysicalDeviceFloatControlsProperties float_controls {};
-	float_controls.pNext = &properties11;
+	float_controls.pNext = &robustness2_properties;
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &float_controls;
 
@@ -605,6 +607,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled = maintenance8_extension && maintenance8.maintenance8;
+	// A coarser alignment rounds the range up past the guest's last byte.
+	graphics.robust_buffer_access_enabled =
+	    supported_robustness2.robustBufferAccess2 &&
+	    robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u;
 	// The device clock ticks at timestampPeriod nanoseconds.
 	if (shader_clock_extension && shader_clock.shaderDeviceClock) {
 		graphics.device_clock_period_ps = static_cast<uint32_t>(
@@ -703,9 +709,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
 
-	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
+	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s buffer bounds=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
-	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
+	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
 	vk::DeviceCreateInfo create_info {};
 	vk::PhysicalDeviceMeshShaderFeaturesEXT mesh_features {};
