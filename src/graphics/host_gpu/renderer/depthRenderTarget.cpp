@@ -149,8 +149,6 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	if (samples == 0) {
 		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
 	}
-	const bool htile_stencil_compat = depth_htile_stencil_acceleration_compatible(
-	    has_stencil, has_htile, z.stencil_info.htile_stencil_disabled);
 	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
 	switch (view.type) {
 		case TargetViewType::Image2D:
@@ -166,8 +164,8 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		DepthFatal("unsupported depth register state");
 	}
 	if (has_stencil) {
-		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
-		    stencil_address == 0 || (stencil_address & 0xffffu) != 0) {
+		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || stencil_address == 0 ||
+		    (stencil_address & 0xffffu) != 0) {
 			DepthFatal("unsupported stencil attachment state");
 		}
 	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {

@@ -16524,6 +16524,26 @@ public:
           "valid PS5 texture-compatibility policy changed logical depth image "
           "identity or discovery side effects");
 
+      // Without HTile, the Hi-Stencil enable has no effect and the stencil plane is uncompressed.
+      constexpr uint64_t uncompressed_depth_address = base + 0x200000;
+      constexpr uint64_t uncompressed_stencil_address = base + 0x210000;
+      auto uncompressed_stencil_target = phased_depth_target;
+      uncompressed_stencil_target.z_info.htile_acceleration = false;
+      uncompressed_stencil_target.z_read_base_addr = uncompressed_depth_address;
+      uncompressed_stencil_target.z_write_base_addr = uncompressed_depth_address;
+      uncompressed_stencil_target.stencil_read_base_addr = uncompressed_stencil_address;
+      uncompressed_stencil_target.stencil_write_base_addr = uncompressed_stencil_address;
+      registers.SetDepthRenderTarget(uncompressed_stencil_target);
+      RenderDepthInfo uncompressed_stencil_depth{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, scheduler.Current(), uncompressed_stencil_depth);
+      Require(name, "stencil plane without HTile",
+              uncompressed_stencil_depth.image_id &&
+                  uncompressed_stencil_depth.desc.info.stencil.address ==
+                      uncompressed_stencil_address &&
+                  uncompressed_stencil_depth.desc.info.metadata.kind == ImageMetadataKind::None,
+              "a stencil plane without HTile was rejected or kept HTile metadata");
+
       auto read_only_depth_target = phased_depth_target;
       read_only_depth_target.z_write_base_addr = 0;
       read_only_depth_target.stencil_write_base_addr = 0;
@@ -50977,22 +50997,6 @@ void CheckNativeMsaaState() {
   std::printf("[host]    %-32s ok\n", "NativeMsaaState");
 }
 
-void CheckDepthHtileStencilCompatibility() {
-  Require("DepthHtileStencilCompatibility", "inactive stencil plane",
-          depth_htile_stencil_acceleration_compatible(false, true, false),
-          "inactive Hi-Stencil state was treated as an attachment");
-  Require("DepthHtileStencilCompatibility", "disabled acceleration",
-          depth_htile_stencil_acceleration_compatible(true, false, true),
-          "disabled Hi-Stencil state was rejected");
-  Require("DepthHtileStencilCompatibility", "PS5 stencil plus HTile",
-          depth_htile_stencil_acceleration_compatible(true, true, false),
-          "valid PS5 Hi-Stencil attachment was rejected");
-  Require("DepthHtileStencilCompatibility", "missing HTile metadata",
-          !depth_htile_stencil_acceleration_compatible(true, false, false),
-          "active Hi-Stencil without HTile metadata was admitted");
-  std::printf("[host]    %-32s ok\n", "DepthHtileStencilCompatibility");
-}
-
 void CheckPs5DepthRegisterDecoding() {
   constexpr uint32_t captured_z = 0x22900803u;
   constexpr uint32_t captured_stencil = 0x00100801u;
@@ -54715,7 +54719,6 @@ int main(int argc, char **argv) {
   CheckStorageTextureGpuOwnedRebindState();
   CheckNativeMsaaState();
   CheckPs5DepthRegisterDecoding();
-  CheckDepthHtileStencilCompatibility();
   CheckDepthAttachmentWrites();
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
