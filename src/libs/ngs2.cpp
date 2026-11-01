@@ -1999,8 +1999,9 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		const auto& output = buffer_info[voice->output_id];
 		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
 		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x12 && output.waveform_type != 0x18);
-		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering &&
-		                     output.num_channels != voice->channels);
+		// Surround inputs mixed into fewer output channels use their own downmix levels.
+		EXIT_NOT_IMPLEMENTED(voice->rack->type == Ngs2RackType::Mastering && voice->channels > 2 &&
+		                     output.num_channels < voice->channels);
 		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels *
 		                                               (output.waveform_type == 0x12 ? sizeof(int16_t)
 		                                                                             : sizeof(float)));
@@ -2014,14 +2015,20 @@ int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBuff
 		} else {
 			pcm = static_cast<float*>(output.buffer);
 		}
+		// The stored matrix mixes 2.0ch into 2.0ch; other mastering layouts use the default levels.
+		const bool stored_matrix =
+		    !voice->output_matrix.empty() && voice->channels == 2 && output.num_channels == 2;
 		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
 			// Output channel 3 is LFE; every other channel is full band.
 			const float gain = dst == 3 ? voice->lfe_level : voice->fbw_level;
 			for (uint32_t src = 0; src < voice->channels; ++src) {
-				const float level =
-				    gain * (voice->output_matrix.empty()
-				                ? static_cast<float>(src == dst)
-				                : voice->output_matrix.at(src * output.num_channels + dst));
+				float level = static_cast<float>(src == dst);
+				if (stored_matrix) {
+					level = voice->output_matrix.at(src * output.num_channels + dst);
+				} else if (voice->rack->type == Ngs2RackType::Mastering) {
+					level = Ngs2DefaultMatrixLevel(voice->channels, src, output.num_channels, dst);
+				}
+				level *= gain;
 				if (level == 0.0f) {
 					continue;
 				}
