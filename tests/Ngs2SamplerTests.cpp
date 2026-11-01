@@ -1224,6 +1224,30 @@ void TestClearReopensClosedList() {
 	Check(f.voice.samples[0] == -0.5f, "CLEAR did not reopen a closed waveform list");
 }
 
+std::vector<uint32_t> g_block_attributes;
+
+void KYTY_SYSV_ABI RecordBlockAttributes(const Ngs2VoiceCallbackInfo* info) {
+	g_block_attributes.push_back(info->attributes);
+}
+
+void TestCancelSkipsBlocksNotStarted() {
+	Fixture f(48000);
+	f.system.option.num_grain_samples = 1;
+	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordBlockAttributes);
+	f.voice.callback_flags = 1;
+	const int16_t pcm[] = {8192, 16384, -8192, -16384};
+	f.Queue(pcm, 2, 1, 1);
+	f.Queue(pcm + 2, 1, 1);
+	f.Render(1);
+	// Cancel during the first pass of the looping block.
+	f.Queue(pcm + 3, 1, 9);
+	f.Render(4);
+	Check(f.voice.samples == std::vector<float> {0.5f, 0.25f, 0.5f, -0.5f},
+	      "CANCEL did not keep the playing block and skip the queued one");
+	Check(g_block_attributes == std::vector<uint32_t> {1, 1, 0},
+	      "block callbacks did not report the canceled blocks");
+}
+
 void TestSetupQuery() {
 	Fixture  f(48000, 2);
 	uint32_t info[2] = {99, 99};
@@ -1980,6 +2004,7 @@ int main() {
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
 	TestClearReopensClosedList();
+	TestCancelSkipsBlocksNotStarted();
 	TestSetupQuery();
 	TestPortInfo();
 	TestPlayStateBeforeRender();
